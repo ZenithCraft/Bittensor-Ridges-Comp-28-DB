@@ -1674,6 +1674,15 @@ QUERY_SIGNALS: tuple[tuple[str, float], ...] = (
 )
 
 
+# Compiled once. `re.search(pattern_string, ...)` consults the module cache on
+# every call, and score() runs this table against every line of every indexed
+# file -- 25 patterns x ~200 lines x 1,206 files is roughly six million cache
+# lookups per task, which measured as the majority of the ranking stage. The
+# strings above stay the readable source of truth; this is the hot copy.
+QUERY_PATTERNS: tuple[tuple[re.Pattern, float], ...] = tuple(
+    (re.compile(pattern), weight) for pattern, weight in QUERY_SIGNALS)
+
+
 def query_density(text: str) -> float:
     """How much a file looks like it talks to a database, per line.
 
@@ -1682,7 +1691,7 @@ def query_density(text: str) -> float:
     query than a 67-line manager whose every line is about it. Shared by the
     call graph and the problem profiler so neither rebuilds the other's work.
     """
-    raw = sum(weight * len(re.findall(pattern, text)) for pattern, weight in QUERY_SIGNALS)
+    raw = sum(weight * len(pattern.findall(text)) for pattern, weight in QUERY_PATTERNS)
     return raw / (len(text.splitlines()) ** 0.5 + 4.0)
 
 
@@ -1961,8 +1970,8 @@ class Ranker:
 
         for number, line in enumerate(lines, start=1):
             line_score = 0.0
-            for pattern, weight in QUERY_SIGNALS:
-                if re.search(pattern, line):
+            for pattern, weight in QUERY_PATTERNS:
+                if pattern.search(line):
                     line_score += weight
             lowered_line = line.lower()
             for word in self.keywords[:12]:
@@ -4198,6 +4207,21 @@ class PromptBuilder:
         return ("# What this agent found (not stated in the instruction)\n\n"
                 + "\n".join(f"- {fact}" for fact in facts))
 
+    def _imports_are_frozen(self) -> bool:
+        """Whether the instruction rules out reaching for anything not already
+        in scope.
+
+        package_map lists the target's sibling modules so the model can find
+        the class behind an object it was handed -- worth ~900 tokens when the
+        model may act on it. When the statement says to use only names the file
+        already imports and bounds the change to one method, it cannot: every
+        name in that list is unreachable, and the agent's own _undefined_names
+        gate would reject an edit that used one. Sending it is paying to offer
+        options the task forbids taking.
+        """
+        return (self.instruction.single_method
+                and "names the file does not import" in self.instruction.style_constraints)
+
     def _budget_for(self, position: int, length: int) -> int:
         """How many lines of this candidate are worth sending.
 
@@ -4223,7 +4247,7 @@ class PromptBuilder:
             if outline:
                 blocks.append(outline)
                 trace("file_outline", "out", rank=position + 1, path=relative, chars=len(outline))
-            if position == 0:
+            if position == 0 and not self._imports_are_frozen():
                 neighbours = package_map(self.repo, relative)
                 if neighbours:
                     blocks.append(neighbours)
