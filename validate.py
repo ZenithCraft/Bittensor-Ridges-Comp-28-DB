@@ -251,22 +251,33 @@ def read_result_json(job_dir: Path | None) -> dict:
     return out
 
 
-# Locally the verifier runs inside the environment container, which lacks the
-# /opt/task/* manifest files that tests/Dockerfile would have created. Those
-# checks fail for every agent -- including the task's own gold solution -- so
-# they are reported but excluded from the local verdict.
-# Each task names these checks differently (bounded_contact_group_annotation_method,
-# bounded_tag_manager_add_method, ...), so match on the cause instead: they all
-# read /opt/task/* files that only create_source_manifest.py produces, and that
-# only runs in tests/Dockerfile -- not in the environment container the local
-# verifier executes inside.
-LOCAL_ARTIFACT_NAMES = re.compile(r"source_tree_conservation|^bounded_\w+_method$")
-LOCAL_ARTIFACT_CAUSE = re.compile(r"/opt/task/(SOURCE_REVISION|original-|source-manifest)")
+# `ridges miner run-local` has no separate verifier container, so verify.py runs
+# inside the environment image. Each task's environment/Dockerfile now stages
+# /opt/task itself (a LOCAL ONLY layer mirroring tests/Dockerfile), which is what
+# lets the bounded-method check run for real.
+#
+# So bounded_*_method is deliberately NOT excluded any more. It grades the patch
+# -- byte-identity above and below the method, signature, size, AST node count,
+# forbidden constructs -- and a failure there is a real contract violation. It
+# used to be excluded by name whenever it failed, which after staging would have
+# hidden exactly the violations this harness exists to catch.
+#
+# source_tree_conservation still cannot pass locally, and no agent can fix it:
+# the harness runs `git init` in /app before the agent starts, and verify.py's
+# rglob carries no .git exclusion, so the live tree holds hundreds of entries no
+# image-time manifest can contain. In production the verifier is a separate,
+# pristine container that never sees them. Excluded by NAME, because the message
+# differs by cause -- a missing fixture before staging, source drift after.
+LOCAL_ONLY_CHECKS = re.compile(r"source_tree_conservation")
+# Still failing on a missing fixture means the image predates the staging layer.
+# Excluded too, but it means the image wants rebuilding rather than that the
+# check is impossible.
+MISSING_FIXTURE = re.compile(r"/opt/task/(SOURCE_REVISION|original-|source-manifest)")
 
 
 def is_local_artifact(name: str, message: str) -> bool:
-    return bool(LOCAL_ARTIFACT_CAUSE.search(message or "")
-                or (LOCAL_ARTIFACT_NAMES.search(name or "") and message))
+    return bool(LOCAL_ONLY_CHECKS.search(name or "")
+                or MISSING_FIXTURE.search(message or ""))
 
 
 def junit_checks(job_dir: Path | None) -> list[tuple[str, bool, str]]:
@@ -437,7 +448,8 @@ def print_clock_headroom(results: list[dict]) -> None:
     Two different clocks, and only one of them is ours. `[agent] timeout_sec`
     bounds this run; `[verifier] timeout_sec` bounds the separate container
     that re-runs the tests against our patch, and those are NOT uniform across
-    the bench (measured 2026-09-07: agent 1800 everywhere, verifier 900-1800).
+    the bench (measured 2026-09-07: task.toml asks 1800 for the agent everywhere,
+    capped to the platform's 25-minute grant; verifier 900-1800).
     A patch that makes the suite slower is graded against the tighter of the
     two, and nothing in the agent's own run would reveal that.
     """
@@ -503,10 +515,23 @@ def preflight() -> bool:
                             capture_output=True, text=True)
     ok &= status(docker.returncode == 0, "docker reachable", docker.stdout.strip()[:40])
 
-    warm = subprocess.run(["sg", "docker", "-c", "docker images -q warm-main"],
-                          capture_output=True, text=True)
-    status(bool(warm.stdout.strip()), "netbox image cached (warm-main)",
-           "" if warm.stdout.strip() else "not built -- expect a 30min build per task, likely timing out")
+    # What actually decides whether the next build is minutes or half an hour is
+    # the layer cache, not any particular image: `docker rmi` frees images and
+    # leaves the cache untouched, so a cold image list with a warm cache still
+    # rebuilds in a couple of minutes. This used to look for a tag named
+    # `warm-main` that nothing in this repo ever creates, so it reported a
+    # 30-minute build every single time, including immediately after a build.
+    listed = subprocess.run(["sg", "docker", "-c", "docker images --format '{{.Repository}}'"],
+                            capture_output=True, text=True)
+    images = [line for line in (listed.stdout or "").splitlines() if line.strip().endswith("-main")]
+    df = subprocess.run(["sg", "docker", "-c", "docker system df --format '{{.Type}}\t{{.Size}}'"],
+                        capture_output=True, text=True)
+    cache = next((row.split("\t")[-1] for row in (df.stdout or "").splitlines()
+                  if row.startswith("Build Cache")), "0B")
+    warm_cache = not cache.startswith("0")
+    status(bool(images) or warm_cache, "netbox build cache",
+           f"{len(images)} task image(s) built, {cache} of layer cache" if (images or warm_cache)
+           else "cold: expect a ~30min build on the first task")
 
     ok &= status(UV.exists(), "uv installed")
     cli = subprocess.run([str(UV), "run", "--project", str(RIDGES), "ridges", "--version"],

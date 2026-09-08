@@ -1460,9 +1460,19 @@ class InstructionParser:
             constraints.append("materialising rows in Python")
 
     # -- how the statement says to check the work -------------------------
+    # Package managers were listed but not the interpreters they wrap, so a
+    # block reading `node --test test/facets.test.js` or `ruby -Itest
+    # test/lapsed_test.rb` matched nothing and the task parsed zero commands.
+    # Measured on the 34 generated PostgreSQL tasks: 11 of them -- every Node
+    # and Ruby task in the corpus -- named their checks this way. With no
+    # command, `Candidate.verified` is false however good the patch is, so the
+    # agent ships a change nothing ever ran. That is a third of an unseen
+    # corpus, and the six NetBox samples could not show it because they are
+    # all Python.
     _RUNNER = re.compile(
         r"^\s*(python|python3|pytest|ruff|flake8|mypy|manage\.py|\./|npm|yarn|pnpm|go |cargo"
-        r"|bundle|mvn|gradle|make|psql|clickhouse|tox|nose|rspec|phpunit)",
+        r"|bundle|mvn|gradle|make|psql|clickhouse|tox|nose|rspec|phpunit"
+        r"|node|ruby|deno|bun|php|dotnet|mix\b|elixir|perl|jest|vitest|java\b|swift|dart)",
         re.IGNORECASE | re.MULTILINE)
     _LINTER = re.compile(r"^\s*(ruff|flake8|pylint|mypy|black|eslint|gofmt|rubocop)\b")
 

@@ -35,11 +35,12 @@ if pristine is None:
                      f"{selftest.CHECKOUT_CACHE}")
 task = BENCH / task_name
 
-# Pace the run the way production does. Every bench task grants the agent
-# [agent] timeout_sec = 1800, and the runner passes that through as
-# AGENT_TIMEOUT; the agent's 1500 fallback only applies when nothing sets it.
-# At 900 this harness measured the agent against half the clock it will
-# actually get, so a run that stopped early here would not have stopped there.
+# Pace the run the way production does. Bench tasks ask for [agent]
+# timeout_sec = 1800, but the platform caps every run at 25 minutes and
+# engine.py pins it to min(spec, cap) -- so the graded budget is 1500 and
+# selftest applies that cap. Pacing this harness against the 1800 the task file
+# states would let a run finish here 300s past the point where the graded run
+# is killed.
 os.environ["AGENT_TIMEOUT"] = os.getenv("AGENT_TIMEOUT") or str(selftest.PRODUCTION_AGENT_TIMEOUT)
 
 tmp = tempfile.TemporaryDirectory()
@@ -73,6 +74,19 @@ print(f"LEDGER    total_usage {before.get('total_usage')} -> {after.get('total_u
 print("=" * 72)
 print(patch if patch.strip() else "*** NO PATCH PRODUCED ***")
 print("=" * 72)
+
+# Save it. This run costs real money and produces the one artifact that can be
+# graded independently -- printing it to a terminal and throwing it away means
+# paying again to get it back. grade.py takes the file directly, which makes
+# this the cheap path to a true verdict: no Docker for the agent, no database,
+# ~$0.03, and the real verifier still passes judgement on the diff.
+if patch.strip():
+    patches = Path.home() / ".ridges/patches"
+    patches.mkdir(parents=True, exist_ok=True)
+    saved = patches / f"{task_name}__{time.strftime('%Y%m%d-%H%M%S')}.diff"
+    saved.write_text(patch)
+    print(f"\nsaved: {saved}")
+    print(f"grade it: ./grade.py {task_name} --patch {saved}")
 
 gold = task / "solution/solve.sh"
 if gold.exists():

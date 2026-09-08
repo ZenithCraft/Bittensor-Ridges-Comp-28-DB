@@ -21,8 +21,22 @@ BENCH = Path(os.getenv("RIDGES_BENCH") or "/home/ajh/Documents/ridges-bench/db-e
 CHECKOUT_CACHE = Path.home() / ".cache/ridges-db-agent/netbox"
 
 
+# The competition caps every agent run at 25 minutes. task.toml asks for 1800,
+# but the platform hands each validator a `VALIDATOR_RUNNING_AGENT_TIMEOUT_SECONDS`
+# and execution/engine.py pins the run to `min(spec_timeout, that)` -- so the
+# effective budget is 1500, not the 1800 the task file states.
+#
+# The number is not readable from the task directory, which is why this is a
+# constant rather than something parsed: task.toml states the request, the
+# platform states the grant, and only the grant is enforced. A local run paced
+# against 1800 finishes 300s past the point where a graded run is killed, and
+# reports success for a task that scores zero.
+COMPETITION_AGENT_TIMEOUT = 1500.0
+
+
 def task_budgets(bench: Path | None = None) -> dict[str, dict[str, float]]:
-    """`{task: {"agent": sec, "verifier": sec}}` read from each task.toml.
+    """`{task: {"agent": sec, "verifier": sec}}` read from each task.toml,
+    with the agent budget capped the way the platform caps it.
 
     task.toml is NOT one of the four files uploaded to the agent container
     (agent.py, _stdlib_contract.py, ridges_miner_runtime.py, instruction.md),
@@ -43,18 +57,22 @@ def task_budgets(bench: Path | None = None) -> dict[str, dict[str, float]]:
             m = re.search(rf"\[{section}\][^\[]*?timeout_sec\s*=\s*([\d.]+)", text, re.S)
             if m:
                 found[section] = float(m.group(1))
+        if "agent" in found:
+            found["agent"] = min(found["agent"], COMPETITION_AGENT_TIMEOUT)
         if found:
             budgets[toml.parent.name] = found
     return budgets
 
 
-def production_agent_timeout(bench: Path | None = None, fallback: float = 1800.0) -> float:
-    """The smallest `[agent] timeout_sec` any bench task grants.
+def production_agent_timeout(bench: Path | None = None,
+                             fallback: float = COMPETITION_AGENT_TIMEOUT) -> float:
+    """The smallest agent budget any bench task actually gets.
 
     The smallest, not the mean: a local run must not be paced against more
     clock than the tightest graded task allows. Measured 2026-09-07 -- all 56
-    tasks state 1800.0, so this is currently a constant, but it is read rather
-    than pinned because a single differing task would otherwise go unnoticed.
+    tasks state 1800.0, so the binding number is the platform's 25-minute cap,
+    but the files are still read because a task asking for *less* than the cap
+    would otherwise go unnoticed.
     """
     values = [b["agent"] for b in task_budgets(bench).values() if "agent" in b]
     return min(values) if values else fallback
