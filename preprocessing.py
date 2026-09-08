@@ -372,7 +372,7 @@ def enforcement_audit(parsed: agent.Instruction, text: str) -> list[dict]:
         r"tests|fixtures")
     add("migrations and project config need an explicit permission", "check_protected",
         bool(parsed.edit_only or parsed.lint_paths)
-        and any(agent.Verifier._NEVER_EDIT_UNLESS_PERMITTED.search(p)
+        and any(agent.Checker._NEVER_EDIT_UNLESS_PERMITTED.search(p)
                 for p in parsed.edit_only + parsed.lint_paths),
         r"migration|\.cfg|\.ini")
     return rules
