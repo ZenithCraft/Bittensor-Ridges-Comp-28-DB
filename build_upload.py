@@ -217,7 +217,12 @@ def build() -> Path:
     artifact = annotate(ast.unparse(strip(ast.parse(source))))
     DIST.mkdir(exist_ok=True)
     out = DIST / "agent.py"
+    out.unlink(missing_ok=True)            # the previous build is read-only
     out.write_text(artifact + "\n")
+    # Read-only for the same reason as the staged tools: this is what gets
+    # uploaded, and an edit made here is an edit lost on the next build. Edit
+    # agent.py.
+    out.chmod(0o444)
     before, after = len(source.encode()), len(out.read_bytes())
     print(f"agent.py      {before:>9,} bytes  {len(source.splitlines()):>6,} lines")
     print(f"dist/agent.py {after:>9,} bytes  {len(artifact.splitlines()):>6,} lines"
@@ -225,28 +230,57 @@ def build() -> Path:
     return out
 
 
-def verify(artifact: Path) -> int:
-    """Run the real suite against the artifact, not against agent.py.
+def stage_harnesses() -> list[str]:
+    """Put the validation tools beside the artifact.
 
-    A stripped file that imports is not a stripped file that works: this is the
-    only thing standing between a mechanical rewrite and a silently different
-    agent, so it runs the whole suite rather than a smoke test.
+    Every harness resolves the agent as `Path(__file__).parent / "agent.py"` and
+    inserts its own directory on sys.path, so a copy living in dist/ finds
+    dist/agent.py with no flag, no environment variable and no change to the
+    tool. Python's own import rules do the work that a --dist switch would
+    otherwise have to fake -- and faking it is awkward, because `import agent`
+    runs at module load, before argparse could have seen a flag.
+
+    What this buys is the thing static equivalence cannot give: the artifact
+    can be run. It is proved equal to the source on parsing and prompt bytes,
+    but that proof stops at the prompt -- it says nothing about the transport,
+    the JSON round trip, or patch assembly in the file actually being uploaded.
+
+    The copies are made read-only. They are build output, and an edit made here
+    is an edit lost on the next build; better to refuse the write than to
+    discard it silently later.
     """
-    with tempfile.TemporaryDirectory() as tmp:
-        staged = Path(tmp) / "check"
-        shutil.copytree(HERE, staged, ignore=shutil.ignore_patterns(
-            "dist", "__pycache__", ".git", "fast-tasks", "results"))
-        shutil.copy2(artifact, staged / "agent.py")
-        for name in ("fast-tasks",):
-            if (HERE / name).is_dir():
-                (staged / name).symlink_to(HERE / name)
-        done = subprocess.run([sys.executable, "-m", "unittest", "discover", "-p", "test_*.py", "-q"],
-                              cwd=staged, capture_output=True, text=True)
-        tail = (done.stderr or done.stdout).strip().splitlines()[-3:]
-        print("\nfull suite against dist/agent.py:")
-        for line in tail:
-            print(f"   {line}")
-        return done.returncode
+    staged: list[str] = []
+    for source in sorted(HERE.glob("*.py")) + sorted(HERE.glob("*.sh")):
+        if source.name in ("agent.py", Path(__file__).name):
+            continue                       # generated; and the builder itself
+        target = DIST / source.name
+        target.unlink(missing_ok=True)     # the previous copy is read-only
+        shutil.copy2(source, target)
+        target.chmod(0o555 if source.read_text().startswith("#!") else 0o444)
+        staged.append(source.name)
+    # The task corpora stay where they are; dist just needs to see them.
+    for name in ("fast-tasks",):
+        link = DIST / name
+        if (HERE / name).is_dir() and not link.exists():
+            link.symlink_to(HERE / name, target_is_directory=True)
+    return staged
+
+
+def verify() -> int:
+    """Run the real suite in dist/, against the artifact.
+
+    A stripped file that imports is not a stripped file that works, and this is
+    the only thing standing between a mechanical rewrite and a silently
+    different agent. It runs where you would run it by hand, so a failure is
+    reproducible with the same command.
+    """
+    done = subprocess.run([sys.executable, "-m", "unittest", "discover", "-p", "test_*.py", "-q"],
+                          cwd=DIST, capture_output=True, text=True)
+    tail = (done.stderr or done.stdout).strip().splitlines()[-3:]
+    print("\nfull suite in dist/, against dist/agent.py:")
+    for line in tail:
+        print(f"   {line}")
+    return done.returncode
 
 
 def main() -> int:
@@ -254,8 +288,16 @@ def main() -> int:
     parser.add_argument("--verify", action="store_true",
                         help="run the test suite against the artifact")
     args = parser.parse_args()
-    artifact = build()
-    return verify(artifact) if args.verify else 0
+    build()
+    staged = stage_harnesses()
+    print(f"staged {len(staged)} validation tool(s) into dist/  "
+          f"{', '.join(n for n in staged if n in ('validate.py','livetest.py','grade.py','preprocessing.py','qualify.py'))}")
+    code = verify() if args.verify else 0
+    print("\nvalidate the artifact from inside dist/ -- `import agent` resolves there:")
+    print("    cd dist && python3 livetest.py <task>          # real inference, ~$0.03")
+    print("    cd dist && ./grade.py <task> --patch <diff>    # true reward")
+    print("    cd dist && ./validate.py <task>                # full container run")
+    return code
 
 
 if __name__ == "__main__":
