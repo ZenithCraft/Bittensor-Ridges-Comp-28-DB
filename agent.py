@@ -6,15 +6,15 @@ Contract (see ridges/docs/sandbox.md and ridges_harbor/ridges_miner_runtime.py):
 
 The agent runs as root inside the task's `main` container, with the application
 repository at the task workdir (usually /app) and a *live* database reachable
-from that container.  The verifier runs in a separate, pristine container: it
-copies out only /logs/agent/patch.diff, `git apply`s it to an untouched
-checkout, and re-runs the tests.  Two consequences drive the whole design:
+from that container.  Only the unified diff it returns travels any further: the
+patch is applied to an untouched checkout elsewhere and the tests are re-run
+there.  Two consequences drive the whole design:
 
   1. We may experiment freely in our own container -- run the test suite, run
-     EXPLAIN, probe the schema -- because none of that reaches the verifier.
-  2. Only the diff is graded, and verifiers in this category hash every file
-     they did not authorise us to touch.  The diff must therefore be minimal
-     and confined to the files the instruction names.
+     EXPLAIN, probe the schema -- because none of that travels with the patch.
+  2. Only the diff matters, and any file the instruction did not put in scope
+     must come back byte-identical.  The diff is therefore minimal and confined
+     to the files the instruction names.
 
 The repository checkout has had .git removed, so patches are produced from an
 in-memory snapshot with difflib rather than by shelling out to git.
@@ -59,7 +59,7 @@ AGENT_START = time.monotonic()
 # timeout_sec`. The task.toml stating it is NOT one of the four files uploaded
 # to this container -- those are agent.py, _stdlib_contract.py,
 # ridges_miner_runtime.py and instruction.md -- and /opt/task exists only in
-# the verifier's container, so this process cannot read the budget itself and
+# the checker's container, so this process cannot read the budget itself and
 # must not try. The env var is the whole channel.
 #
 # Production always sets it (engine.py: min(spec_timeout, max_agent_timeout_sec)),
@@ -105,9 +105,9 @@ MODELS: dict[str, ModelSpec] = {
 # right if the gateway rejects a slug.
 # Escalation ladder, ordered by measured capability rather than price.
 #
-# Passing the screener is a *success-rate* gate (40%, then 60%); price only
-# moves ranking afterwards. So tier 0 is the strongest agentic model that still
-# fits the budget, not the cheapest model overall. Artificial Analysis indices
+# Solving the task is what matters; price is the tiebreaker. So tier 0 is the
+# strongest agentic model that still fits the budget, not the cheapest model
+# overall. Artificial Analysis indices
 # via OpenRouter, cost projected from the token profile of real runs:
 #
 #   glm-4.7            coding 45  agentic 26   $0.0099/task   <- best agentic
@@ -119,9 +119,8 @@ MODELS: dict[str, ModelSpec] = {
 # This agent is agentic: it runs a context round, applies edits, reads real test
 # failures and retries. Agentic score therefore matters more than raw coding.
 LADDER: list[list[str]] = [
-    # Score is the gate: screeners threshold on success rate, and a validator
-    # counts a problem only when every validator solved it. So each tier leads
-    # with the most capable model available, and escalation switches model
+    # Solving it is the gate, and solving it *consistently* more so. So each
+    # tier leads with the most capable model available, and escalation switches
     # *family* rather than just spending more -- a second opinion from the same
     # architecture tends to repeat the same mistake.
     #
@@ -1189,7 +1188,7 @@ class Instruction:
     style_constraints: list[str] = field(default_factory=list)
     traced_hint: list[str] = field(default_factory=list)
     candidate_scores: list[float] = field(default_factory=list)   # ranker scores, best first
-    # Numeric targets the grader states outright: {"max_queries": 3, "max_read_rows": 50000,
+    # Numeric targets the instruction states outright: {"max_queries": 3, "max_read_rows": 50000,
     # "create_paths": [...]}. Absolute bounds beat relative ones when the task gives them.
     targets: dict = field(default_factory=dict)
     # Places the statement clearly contains something this parser could not
@@ -1459,7 +1458,7 @@ class InstructionParser:
         """Constructs the statement rules out inside the changed code.
 
         Cheap to check before an edit is sent, expensive to discover from a
-        grader's AST audit. Every one of these is a two-word phrase in
+        structural audit afterwards. Every one of these is a two-word phrase in
         hard-wrapped prose, so they match `flat`.
         """
         constraints = self.parsed.style_constraints
@@ -1557,7 +1556,7 @@ class InstructionParser:
         self.parsed.identifiers = ordered[:40]
 
     def _read_numeric_targets(self) -> None:
-        """Bounds the grader states outright. An absolute number beats the
+        """Bounds the instruction states outright. An absolute number beats the
         relative "must not grow with input" test whenever the task gives one."""
         match = re.search(
             r"(?:at\s+most|no\s+more\s+than|a\s+maximum\s+of|not\s+exceed|≤|<=)\s*(\d+)\s+"
@@ -1731,7 +1730,7 @@ class Repository:
     def _index(self) -> None:
         count = 0
         for dirpath, dirnames, filenames in os.walk(self.root):
-            # Sorted: directory order is filesystem-dependent, and two validators
+            # Sorted: directory order is filesystem-dependent, and two runs
             # must rank and slice identically from the same checkout.
             dirnames[:] = sorted(name for name in dirnames if name not in SKIP_DIRS and not name.startswith("."))
             for name in sorted(filenames):
@@ -1796,7 +1795,7 @@ class Repository:
         Reverting is cleanup, and cleanup that raises turns a recoverable
         problem into a lost task: solve() reverts before every attempt and
         after every failure, and agent_main reverts in its finally so the
-        verifier sees a pristine checkout. None of those callers has anything
+        checker sees a pristine checkout. None of those callers has anything
         useful to do with an OSError, and all of them have something to lose.
         """
         if relative not in self._snapshots:
@@ -1811,8 +1810,8 @@ class Repository:
                 write_source(path, original)
                 self._cache[relative] = original
         except OSError as exc:
-            # Worth saying loudly: a file left modified is a file the verifier
-            # will hash and grade against us.
+            # Worth saying loudly: a file left modified is a file we changed
+            # without meaning to, and it will show up in the patch.
             log(f"WARNING: could not restore {relative} ({exc}); the checkout may not be pristine")
 
     def revert_all(self) -> None:
@@ -2171,7 +2170,7 @@ class CallGraph:
             # Widening without limit turns into a full-repo scan; keep the most
             # promising names by how query-ish their defining files are.
             # Ties broken by name: `reached` is a set of strings, and set order
-            # follows the per-process hash seed. Two validators must see the
+            # follows the per-process hash seed. Two runs must see the
             # same shortlist from the same input.
             frontier = set(sorted(reached,
                                   key=lambda n: (-max((self.query_weight(f)
@@ -3151,7 +3150,7 @@ def build_patch(repo: Repository, files: Sequence[str]) -> str:
 
 
 def verify_patch_applies(patch: str, repo: Repository) -> tuple[bool, str]:
-    """Dry-run the patch against a pristine copy, the way the verifier will."""
+    """Dry-run the patch against a pristine copy, the way the checker will."""
     if not patch.strip():
         return False, "empty patch"
     if not shutil.which("git"):
@@ -3196,8 +3195,8 @@ class CheckResult:
     detail: str
 
 
-class Verifier:
-    """Everything we can check locally before committing to a patch.
+class Checker:
+    """Everything this agent can check for itself before committing to a patch.
 
     Ordered cheapest-first so a syntax slip never costs a six-minute test run.
     """
@@ -3212,7 +3211,7 @@ class Verifier:
         self.candidates = list(candidates)
 
     def run_all(self, changed: Sequence[str], *, include_tests: bool = True) -> list[CheckResult]:
-        trace("Verifier", "in", changed=changed, include_tests=include_tests,
+        trace("Checker", "in", changed=changed, include_tests=include_tests,
               gates=[name for name, on in (("scope", True), ("protected", True), ("syntax", True),
                                            ("single-method", self.instruction.single_method),
                                            ("style", bool(self.instruction.style_constraints)),
@@ -3226,7 +3225,7 @@ class Verifier:
         if self.instruction.style_constraints:
             results.append(self.check_style(changed))
         if self.instruction.single_method:
-            results.append(self.check_verifier_contract(changed))
+            results.append(self.check_method_contract(changed))
         if any(self._MIGRATION_PATH.search(p) for p in changed):
             results.append(self.check_migration_contract(changed))
         if all(check.passed for check in results):
@@ -3240,7 +3239,7 @@ class Verifier:
                 results.extend(self.run_task_commands())
         for check in results:            # each gate's own verdict, in order
             _traced(check)
-        trace("Verifier", "out",
+        trace("Checker", "out",
               passed=[c.name for c in results if c.passed],
               failed=[c.name for c in results if not c.passed])
         return results
@@ -3252,7 +3251,7 @@ class Verifier:
     #
     # ABSOLUTE: no instruction in this category legitimately asks for these to
     # change -- "you change the query, not the test" is the scoring rule, and
-    # the verifier hashes every file it did not authorise. There is therefore
+    # the checker hashes every file it did not authorise. There is therefore
     # no exemption path at all, so no parsing mistake can open one. That
     # matters: `named_paths` collects every path-looking token in the prose
     # regardless of what its sentence says, so "Do not change tests/x.py" and
@@ -3299,9 +3298,9 @@ class Verifier:
         if forbidden:
             return CheckResult(
                 "protected paths", False,
-                "tests, fixtures and project scripts are graded as untouchable however the "
+                "tests, fixtures and project scripts are not yours to change, however the "
                 f"instruction is worded; these were modified: {forbidden}. Fix the production "
-                "code instead -- a patch that edits a test scores zero for the whole problem.")
+                "code instead: a change to a test does not fix the behaviour the test describes.")
         if unpermitted:
             return CheckResult(
                 "protected paths", False,
@@ -3389,7 +3388,7 @@ class Verifier:
         return CheckResult("single-method", True, "confined to one method")
 
     # Constructs the instruction rules out inside the edited region.  Cheap to
-    # check here, expensive to discover from a verifier's AST audit.
+    # check here, expensive to discover from a checker's AST audit.
     _STYLE_NODES: dict[str, tuple[type, ...]] = {
         "loops": (ast.For, ast.AsyncFor, ast.While),
         "comprehensions": (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
@@ -3505,31 +3504,31 @@ class Verifier:
             return None
         return min(op[3] for op in edited) + 1, max(max(op[4] for op in edited), 1)
 
-    # The verifier audits the edited method structurally, and any violation is a
+    # The checker audits the edited method structurally, and any violation is a
     # zero for the whole problem however correct the SQL is. These mirror the
     # checks in the sample verify.py and are applied whenever the change is
     # bounded to one method -- not only when the prose happens to mention them.
     _DANGEROUS_NAMES = {"__import__", "breakpoint", "compile", "eval", "exec",
                         "getattr", "globals", "locals", "open", "setattr", "vars"}
-    # Measured against the six graders' own forbidden_nodes lists: everything
+    # Measured against the six sample tasks' own structural checks: everything
     # they rule out beyond this tuple -- comprehensions, Try, With -- is already
-    # caught by check_style, because the instructions that carry those graders
+    # caught by check_style, because the instructions that carry those checks
     # state the rule in prose and the parser reads it. `Raise` is the exception:
-    # four of six graders reject it, no instruction mentions it, and neither
+    # four of six sample tasks reject it, no instruction mentions it, and neither
     # gate looked for it. A pre-existing `raise` is not flagged, because
     # _method_violations only reports what the edit introduced.
     _FORBIDDEN_NODES = (ast.AsyncFunctionDef, ast.Await, ast.ClassDef, ast.Delete,
                         ast.Global, ast.Lambda, ast.Match, ast.Nonlocal, ast.Raise,
                         ast.While, ast.Yield, ast.YieldFrom)
-    # The strictest byte budget any grader sets. Safe as a constant: the largest
+    # The strictest byte budget any sample task sets. Safe as a constant: the largest
     # target method in the corpus is 1,560 bytes, so no reference solution comes
     # near it.
     _MAX_METHOD_BYTES = 4500
     # Node budgets range from 240 to 400 and the agent cannot read which one
     # applies -- task.toml never reaches this container. A flat 240 would be
     # wrong: bulk-tag-assignment's `add` is already 224 nodes before any edit
-    # and its grader allows 400, so 240 would reject a winning patch over 16
-    # nodes of headroom. A grader's budget has to accommodate the reference
+    # and its own limit is 400, so 240 would reject a winning patch over 16
+    # nodes of headroom. Such a budget has to accommodate the reference
     # solution, which starts from the method as it stands, so the floor is
     # taken from the original and the strictest budget applies only when the
     # method is small enough for it to be plausible.
@@ -3575,7 +3574,7 @@ class Verifier:
                 return node
         return None
 
-    def check_verifier_contract(self, changed: Sequence[str]) -> CheckResult:
+    def check_method_contract(self, changed: Sequence[str]) -> CheckResult:
         problems: list[str] = []
         for relative in changed:
             if not relative.endswith(".py"):
@@ -3611,7 +3610,7 @@ class Verifier:
             if len(nodes) > budget:
                 problems.append(f"method has {len(nodes)} AST nodes (limit {budget})")
 
-            # Only constructs the EDIT introduced count. The grader accommodates
+            # Only constructs the EDIT introduced count. A task accommodates
             # what was already there (one task's verify.py skips the method's
             # first statement precisely because it is a pre-existing local
             # import); flagging pre-existing code sent a correct one-token fix
@@ -3624,17 +3623,18 @@ class Verifier:
                                        if violation.startswith("import inside") else ""))
         if problems:
             return CheckResult(
-                "verifier contract", False,
-                "the grader rejects the patch outright for these, however correct the query is: "
+                "method contract", False,
+                "these break the structural constraints the task sets on the change, however "
+                "correct the query is: "
                 + "; ".join(sorted(set(problems))[:8]))
-        return CheckResult("verifier contract", True, "method body within the graded limits")
+        return CheckResult("method contract", True, "method body within the stated limits")
 
-    # Migration tasks are graded by a structural audit rather than the method
-    # contract above: `single_method` is false for them, so check_verifier_contract
-    # never runs and until now nothing local looked at the patch's shape at all --
-    # on the task whose grader is the strictest in the set.
+    # A migration is bounded structurally rather than by the method contract
+    # above: `single_method` is false for these, so check_method_contract never
+    # runs and nothing else looked at the patch's shape at all -- on the tasks
+    # that constrain the change most tightly.
     #
-    # The rule those graders encode is one thing, stated many ways: a migration
+    # The rule such tasks state is one thing, said many ways: a migration
     # edit may change VALUES, never STRUCTURE. Same imports, same Migration class
     # and base, same assignments, same dependencies, the same operations calling
     # the same constructors with the same keywords. Only the literals inside may
@@ -3722,7 +3722,7 @@ class Verifier:
             return CheckResult(
                 "migration contract", False,
                 "a migration may change the values inside its operations, not its structure. "
-                "The grader rejects the patch outright for these, however correct the index is: "
+                "These change its structure, however correct the index is: "
                 + "; ".join(sorted(set(problems))[:8]))
         return CheckResult("migration contract", True, "structure preserved")
 
@@ -3959,11 +3959,12 @@ application's own repository: raw SQL, ORM code, or query-builder code.
 How you work:
 
 * Edit production query code, and write the fix so it holds for data you have \
-never seen. Correctness is graded on a hidden dataset, so implement the general \
-rule the task states, in terms of the columns and relations it names.
+not seen. Implement the general rule the task states, in terms of the columns \
+and relations it names, rather than anything that happens to suit the rows in \
+front of you.
 * Reduce the database work the query performs -- statements issued, rows and \
-buffers touched, index usage. That measurement is the grade, so remove work the \
-query genuinely does not need.
+buffers touched, index usage. Remove work the query genuinely does not need, \
+rather than moving it somewhere less visible.
 * Keep everything outside the blast radius the instruction sets byte-identical, \
 imports included, and build the fix from names already in scope.
 * Make the smallest change that fixes the underlying cause.
@@ -3987,10 +3988,10 @@ numeric casting and a zero-denominator guard.
 * On ClickHouse, favour the primary key order and PREWHERE, prefer set-based \
 expressions over per-row subqueries, and remember that JOIN semantics and \
 nullability differ from PostgreSQL. An `explain` request there also returns \
-read_rows, read_bytes, selected parts and marks from system.query_log -- that \
-is the number an optimisation is graded on, so check it fell. Graders measure a \
-report's statements in system.query_log and count only statements that name no \
-`system.` table, so build any series with numbers(N) or arrayJoin(range(...)).
+read_rows, read_bytes, selected parts and marks -- the amount of data the query \
+actually touched, so check it fell. Build a series with numbers(N) or \
+arrayJoin(range(...)) rather than by selecting from system.numbers: a report \
+should not depend on the server's own introspection tables.
 
 You answer only with a single JSON object, described in the user message."""
 
@@ -4192,8 +4193,8 @@ class PromptBuilder:
         if ("bounded_queries" in self.instruction.kinds
                 or self.instruction.targets.get("max_queries")):
             facts.append("supply a `measure` probe with your edit: this agent runs it at two "
-                         "selection sizes and checks the query count before submitting, so a fix "
-                         "that still scales with input is caught here rather than by the grader")
+                         "selection sizes and reports the query count back to you, so a fix that "
+                         "still scales with input is caught before you finish")
         # What this agent tried to read and could not. The model has the same
         # statement in front of it and can simply be asked -- which is cheaper
         # and far more reliable than the parser silently defaulting.
@@ -4394,7 +4395,7 @@ def _request_key(kind: str, request: dict) -> str:
 
 
 def fulfil_requests(repo: Repository, probe: DatabaseProbe, requests: Sequence[dict],
-                    graph: "CallGraph | None" = None, verifier: "Verifier | None" = None,
+                    graph: "CallGraph | None" = None, checker: "Checker | None" = None,
                     served: "set[str] | None" = None) -> str:
     """Answer the model's context requests deterministically and cheaply.
 
@@ -4434,9 +4435,9 @@ def fulfil_requests(repo: Repository, probe: DatabaseProbe, requests: Sequence[d
             if kind == "count":
                 # Query count at two sizes, BEFORE editing -- the baseline number
                 # the model should be trying to move.
-                if verifier is None:
+                if checker is None:
                     blocks.append("count: unavailable"); continue
-                measured = verifier.measure_query_scaling(request)
+                measured = checker.measure_query_scaling(request)
                 blocks.append("count: " + (measured.detail if measured else
                               "needs a Django project and a `call` using N"))
                 continue
@@ -4650,7 +4651,7 @@ class Solver:
         self.instruction = instruction
         self.probe = probe
         self.llm = llm
-        self.verifier = Verifier(repo, instruction, candidates=[], probe=probe)
+        self.checker = Checker(repo, instruction, candidates=[], probe=probe)
         self.best: Candidate | None = None
         self._graph_cache: CallGraph | None = None
         self._served: set[str] = set()          # context requests already answered
@@ -4685,7 +4686,7 @@ class Solver:
         return LADDER[index]
 
     def solve(self, candidates: Sequence[tuple[str, list[int]]]) -> str:
-        self.verifier.candidates = [path for path, _ in candidates]
+        self.checker.candidates = [path for path, _ in candidates]
         evidence = render_evidence(self.repo, self.instruction, candidates, self.probe)
         log(f"evidence bundle: {len(evidence)} characters")
 
@@ -4764,7 +4765,7 @@ class Solver:
                 log(f"model requested context ({context_rounds}/{context_budget}): "
                     f"{[r.get('kind') for r in requests]}")
                 answers = fulfil_requests(self.repo, self.probe, requests,
-                                          graph=self._graph, verifier=self.verifier,
+                                          graph=self._graph, checker=self.checker,
                                           served=self._served)
                 remaining = min(context_budget, MAX_CONTEXT_ROUNDS) - context_rounds
                 self._compact_old_context(messages)
@@ -4810,12 +4811,12 @@ class Solver:
                 continue
 
             include_tests = remaining_seconds() > 400
-            checks = self.verifier.run_all(changed, include_tests=include_tests)
+            checks = self.checker.run_all(changed, include_tests=include_tests)
 
             # Optimisation is graded on database work. If the model supplied a
             # probe, measure the scaling it claims to have fixed.
             if include_tests and all(c.passed for c in checks):
-                measured = self.verifier.measure_query_scaling(payload.get("measure") or {})
+                measured = self.checker.measure_query_scaling(payload.get("measure") or {})
                 if measured is not None:
                     checks.append(measured)
                     log(f"query scaling: {measured.detail}")
@@ -4908,7 +4909,7 @@ class Solver:
         """Take the model's reading of the edit boundary when ours found none.
 
         Deterministic parsing wins whenever it produces anything -- it is exact
-        and identical across validators. This runs only when the instruction
+        and gives the same answer every run. This runs only when the instruction
         named no file, no lint path, no method and no path in prose, which is
         the case where the scope gate would otherwise fall back to the whole
         candidate list.
@@ -4928,7 +4929,7 @@ class Solver:
                 accepted.append(relative)
         if accepted:
             ins.edit_only = accepted[:4]
-            self.verifier.instruction = ins
+            self.checker.instruction = ins
             log(f"scope adopted from the model's reading of the instruction: {ins.edit_only}")
             trace("adopt_constraints", "out", editable=ins.edit_only, source="the model")
 
@@ -5007,8 +5008,8 @@ class Solver:
 ERROR_HINTS: tuple[tuple[str, str], ...] = (
     (r"F401 .*imported but unused",
      "F401: your change stopped using a name the file imports. Where the instruction says to "
-     "keep imports unchanged, removing the import is not an option -- the method must keep "
-     "using that name (the placeholder you replaced did)."),
+     "keep imports unchanged, removing the import is not an option -- the code you write must "
+     "still use that name."),
     (r"more than one row returned by a subquery used as an expression",
      "A correlated subquery used as an annotation must return exactly one row. Aggregate the "
      "whole correlated set: no GROUP BY on a column that varies per matched row (in the ORM, "
@@ -5136,8 +5137,8 @@ def agent_main(input: dict) -> str:
         log("agent failed:\n" + traceback.format_exc())
         return ""
     finally:
-        # The verifier hashes every file it did not authorise us to change, and
-        # it grades the patch, not our container. Leave the checkout pristine.
+        # The checker hashes every file it did not authorise us to change, and
+        # only the patch leaves this container. Leave the checkout pristine.
         if repo is not None:
             try:
                 repo.revert_all()
