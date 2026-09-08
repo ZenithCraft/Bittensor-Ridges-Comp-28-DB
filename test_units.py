@@ -123,39 +123,39 @@ class TestVerifier(unittest.TestCase):
     def build(self, statement: str):
         repo = make_repo({"m.py": SOURCE})
         instruction = agent.parse_instruction(statement, repo.root)
-        return repo, agent.Verifier(repo, instruction), instruction
+        return repo, agent.Checker(repo, instruction), instruction
 
     def test_scope_rejects_stray_file(self):
-        repo, verifier, _ = self.build("You may edit only `m.py`.")
-        result = verifier.check_scope(["m.py", "other.py"])
+        repo, checker, _ = self.build("You may edit only `m.py`.")
+        result = checker.check_scope(["m.py", "other.py"])
         self.assertFalse(result.passed)
         self.assertIn("other.py", result.detail)
 
     def test_syntax_failure_detected(self):
-        repo, verifier, _ = self.build("Fix it.")
+        repo, checker, _ = self.build("Fix it.")
         repo.write("m.py", "def broken(:\n")
-        self.assertFalse(verifier.check_syntax(["m.py"]).passed)
+        self.assertFalse(checker.check_syntax(["m.py"]).passed)
 
     def test_single_method_allows_in_body_edit(self):
-        repo, verifier, ins = self.build(
+        repo, checker, ins = self.build(
             "Limit changes to `m.py`, specifically `Manager.annotate_things()`. "
             "Keep its signature and the rest of the file unchanged, including imports.")
         self.assertTrue(ins.single_method)
         repo.write("m.py", SOURCE.replace('Count("thing")', 'Count("thing", distinct=True)'))
-        self.assertTrue(verifier.check_single_method(["m.py"]).passed)
+        self.assertTrue(checker.check_single_method(["m.py"]).passed)
 
     def test_single_method_rejects_import_edit(self):
-        repo, verifier, _ = self.build(
+        repo, checker, _ = self.build(
             "Limit changes to `m.py`, specifically `Manager.annotate_things()`. "
             "Keep its signature and the rest of the file unchanged, including imports.")
         repo.write("m.py", SOURCE.replace("from django.db.models import Count",
                                           "from django.db.models import Count, Q"))
-        result = verifier.check_single_method(["m.py"])
+        result = checker.check_single_method(["m.py"])
         self.assertFalse(result.passed)
         self.assertIn("imports", result.detail)
 
     def test_style_constraint_rejects_comprehension(self):
-        repo, verifier, ins = self.build(
+        repo, checker, ins = self.build(
             "Limit changes to `m.py`, specifically `Manager.annotate_things()`. Write the method "
             "as plain ORM expressions: no Python loops, comprehensions, lambdas, exception "
             "handling, or context managers inside it.")
@@ -163,17 +163,17 @@ class TestVerifier(unittest.TestCase):
         repo.write("m.py", SOURCE.replace(
             'return self.annotate(total=Count("thing"))',
             'return self.annotate(total=sum([x for x in range(3)]))'))
-        result = verifier.check_style(["m.py"])
+        result = checker.check_style(["m.py"])
         self.assertFalse(result.passed)
         self.assertIn("ListComp", result.detail)
 
     def test_style_constraint_passes_clean_orm(self):
-        repo, verifier, _ = self.build(
+        repo, checker, _ = self.build(
             "Limit changes to `m.py`, specifically `Manager.annotate_things()`. Write the method as "
             "plain ORM expressions: no Python loops, comprehensions, lambdas, exception handling, "
             "or context managers inside it.")
         repo.write("m.py", SOURCE.replace('Count("thing")', 'Count("thing", distinct=True)'))
-        self.assertTrue(verifier.check_style(["m.py"]).passed)
+        self.assertTrue(checker.check_style(["m.py"]).passed)
 
 
 class TestContextRequests(unittest.TestCase):
@@ -258,7 +258,7 @@ class TestVerifierContract(unittest.TestCase):
 
     Any of these makes the whole problem score zero however correct the SQL is,
     so they must be caught before the patch is returned -- not discovered from
-    a verifier we cannot see.
+    a checker we cannot see.
     """
 
     SRC = ('from django.db.models import Count\n\n'
@@ -273,7 +273,7 @@ class TestVerifierContract(unittest.TestCase):
             "Keep its signature and the rest of the file unchanged.", repo.root)
         self.assertTrue(ins.single_method)
         repo.write("m.py", self.SRC.replace('        return self.annotate(total=Count("t"))\n', body))
-        return agent.Verifier(repo, ins).check_verifier_contract(["m.py"])
+        return agent.Checker(repo, ins).check_method_contract(["m.py"])
 
     def test_clean_edit_passes(self):
         self.assertTrue(self.build('        return self.annotate(total=Count("t", distinct=True))\n').passed)
@@ -327,7 +327,7 @@ class TestVerifierContractInheritsOriginal(unittest.TestCase):
             "Limit changes to `q.py`, specifically `Q.annotate_utilization()`. "
             "Keep its signature and the rest of the file unchanged.", repo.root)
         repo.write("q.py", new_src)
-        return agent.Verifier(repo, ins).check_verifier_contract(["q.py"])
+        return agent.Checker(repo, ins).check_method_contract(["q.py"])
 
     def test_pre_existing_local_import_is_not_a_violation(self):
         fixed = self.SRC.replace('* 100 /', '* 100.0 /')          # the gold fix
@@ -580,8 +580,8 @@ class TestConsolidatedUpgrades(unittest.TestCase):
 
     def test_syntax_gate_catches_compile_time_errors(self):
         repo = make_repo({"m.py": "def f():\n    return g(a=1, a=2)\n"})
-        verifier = agent.Verifier(repo, agent.Instruction(text=""))
-        result = verifier.check_syntax(["m.py"])
+        checker = agent.Checker(repo, agent.Instruction(text=""))
+        result = checker.check_syntax(["m.py"])
         self.assertFalse(result.passed)
         self.assertIn("repeated", result.detail)
 
@@ -590,7 +590,7 @@ class TestConsolidatedUpgrades(unittest.TestCase):
         ins = agent.parse_instruction("Limit changes to `m.py`, specifically `Manager.annotate_things()`. "
                                       "Keep its signature and the rest of the file unchanged.", repo.root)
         repo.write("m.py", SOURCE.replace('Count("thing")', 'Count("thing", distinct=True)') + "\nEXTRA = 1\n")
-        result = agent.Verifier(repo, ins).check_single_method(["m.py"])
+        result = agent.Checker(repo, ins).check_single_method(["m.py"])
         self.assertFalse(result.passed)
 
     def test_verified_candidate_outranks_unverified(self):
@@ -626,7 +626,7 @@ class TestConsolidatedUpgrades(unittest.TestCase):
 
     def test_discovered_commands_for_a_node_project(self):
         repo = make_repo({"package.json": '{"scripts": {"test": "node --test"}}', "src/q.js": "x"})
-        self.assertEqual(agent.Verifier(repo, agent.Instruction(text="")).discovered_commands(["src/q.js"]),
+        self.assertEqual(agent.Checker(repo, agent.Instruction(text="")).discovered_commands(["src/q.js"]),
                          ["npm test --silent"])
 
     def test_cached_and_reasoning_tokens_are_reported(self):
@@ -641,7 +641,7 @@ class TestConsolidatedUpgrades(unittest.TestCase):
     def test_query_scaling_honours_an_absolute_limit(self):
         repo = make_repo({"manage.py": "", "a.py": ""})
         ins = agent.Instruction(text=""); ins.targets = {"max_queries": 2}
-        verifier = agent.Verifier(repo, ins)
+        checker = agent.Checker(repo, ins)
         # Save and restore rather than delete-and-reload. importlib.reload
         # rebinds agent.MODELS to a fresh dict, while routing_lab still holds
         # the old one -- so running this file in the same process as
@@ -649,7 +649,7 @@ class TestConsolidatedUpgrades(unittest.TestCase):
         original = agent.run_command
         agent.run_command = lambda *a, **k: agent.subprocess.CompletedProcess(a, 0, 'RIDGES_QC{"1": 3, "10": 3}\n')
         try:
-            result = verifier.measure_query_scaling({"call": "f(N)"})
+            result = checker.measure_query_scaling({"call": "f(N)"})
         finally:
             agent.run_command = original
         self.assertFalse(result.passed)
@@ -687,12 +687,12 @@ class TestProtectedPathsNeedPermission(unittest.TestCase):
     one category that scores zero for the whole problem.
     """
 
-    def verifier(self, text: str, files: dict[str, str]):
+    def checker(self, text: str, files: dict[str, str]):
         repo = make_repo(files)
-        return agent.Verifier(repo, agent.parse_instruction(text, repo.root)), repo
+        return agent.Checker(repo, agent.parse_instruction(text, repo.root)), repo
 
     def test_a_prohibition_does_not_grant_permission(self):
-        v, _ = self.verifier(
+        v, _ = self.checker(
             "Fix the query in `app/q.py`. Do not change `app/tests/test_q.py`.",
             {"app/q.py": "x = 1\n", "app/tests/test_q.py": "y = 2\n"})
         self.assertIn("app/tests/test_q.py", v.instruction.named_paths,
@@ -704,7 +704,7 @@ class TestProtectedPathsNeedPermission(unittest.TestCase):
     def test_a_command_invocation_does_not_grant_permission(self):
         # The netbox prefix-hierarchy statement writes its checks inline rather
         # than fenced, which put netbox/manage.py into named_paths.
-        v, _ = self.verifier(
+        v, _ = self.checker(
             "Limit production changes to `app/q.py`. Run `python manage.py test app` before finishing.",
             {"app/q.py": "x = 1\n", "manage.py": "z = 3\n"})
         self.assertFalse(v.check_protected(["manage.py"]).passed)
@@ -712,14 +712,14 @@ class TestProtectedPathsNeedPermission(unittest.TestCase):
     def test_an_explicit_permission_still_allows_a_migration(self):
         # The cached-value-index sample: migrations are legitimately edited
         # when the instruction says so.
-        v, _ = self.verifier(
+        v, _ = self.checker(
             "You may edit only `app/migrations/0107_x.py`. Run `ruff check --no-cache "
             "app/migrations/0107_x.py` before finishing.",
             {"app/migrations/0107_x.py": "ops = []\n"})
         self.assertTrue(v.check_protected(["app/migrations/0107_x.py"]).passed)
 
     def test_a_migration_without_permission_is_refused(self):
-        v, _ = self.verifier("Fix the slow query in `app/q.py`.",
+        v, _ = self.checker("Fix the slow query in `app/q.py`.",
                              {"app/q.py": "x = 1\n", "app/migrations/0107_x.py": "ops = []\n"})
         self.assertFalse(v.check_protected(["app/migrations/0107_x.py"]).passed)
 
@@ -854,7 +854,7 @@ class TestErrorHints(unittest.TestCase):
                 "used as an expression")
         hints = agent.error_hints(text)
         self.assertEqual(len(hints), 2)
-        self.assertIn("keep using that name", hints[0])
+        self.assertIn("must still use that name", hints[0])
         self.assertIn("exactly one row", hints[1])
 
     def test_compiler_wording_for_repeated_keyword_is_explained(self):
@@ -1339,8 +1339,8 @@ class TestMethodContractMatchesTheGraders(unittest.TestCase):
         self.repo._snapshots["m.py"] = original
         self.repo._cache["m.py"] = current
         (self.root / "m.py").write_text(current)
-        verifier = agent.Verifier(self.repo, self.instruction)
-        return verifier.check_verifier_contract(["m.py"])
+        checker = agent.Checker(self.repo, self.instruction)
+        return checker.check_method_contract(["m.py"])
 
     def test_a_raise_the_edit_introduced_is_rejected(self):
         before = "class Q:\n    def run(self):\n        return 1\n"
@@ -1360,18 +1360,18 @@ class TestMethodContractMatchesTheGraders(unittest.TestCase):
         # bulk-tag-assignment's `add` is 224 nodes before any edit and its
         # grader allows 400. A flat 240 would reject a winning patch over 16
         # nodes of headroom, so the floor comes from the original.
-        budget = agent.Verifier._node_budget
+        budget = agent.Checker._node_budget
         self.assertEqual(budget(23), 240, "a small method gets the strictest budget")
         self.assertGreater(budget(224), 240, "a large method is not squeezed below itself")
-        self.assertLessEqual(budget(350), agent.Verifier._MAX_METHOD_NODES)
+        self.assertLessEqual(budget(350), agent.Checker._MAX_METHOD_NODES)
 
     def test_byte_limit_matches_the_strictest_grader(self):
-        self.assertEqual(agent.Verifier._MAX_METHOD_BYTES, 4500)
+        self.assertEqual(agent.Checker._MAX_METHOD_BYTES, 4500)
 
 
 class TestMigrationContract(unittest.TestCase):
     """Migration tasks get no method contract -- `single_method` is false, so
-    check_verifier_contract never runs -- yet cached-value-index has the
+    check_method_contract never runs -- yet cached-value-index has the
     strictest grader in the set. The rule those graders encode is one thing
     said many ways: an edit may change the VALUES inside the operations, never
     the structure around them.
@@ -1410,7 +1410,7 @@ class TestMigrationContract(unittest.TestCase):
         self.repo._snapshots[self.PATH] = self.ORIGINAL
         self.repo._cache[self.PATH] = current
         (self.root / self.PATH).write_text(current)
-        return agent.Verifier(self.repo, self.instruction).check_migration_contract([self.PATH])
+        return agent.Checker(self.repo, self.instruction).check_migration_contract([self.PATH])
 
     def test_widening_the_index_fields_is_allowed(self):
         # The one thing the task actually asks for.
@@ -1439,5 +1439,5 @@ class TestMigrationContract(unittest.TestCase):
 
     def test_a_non_migration_file_is_not_gated(self):
         # The gate keys on the path; ordinary source keeps its own contract.
-        self.assertTrue(agent.Verifier(self.repo, self.instruction)
+        self.assertTrue(agent.Checker(self.repo, self.instruction)
                         .check_migration_contract(["app/models.py"]).passed)

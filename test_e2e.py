@@ -86,8 +86,8 @@ class E2E(unittest.TestCase):
             (agent, "workdir"): agent.workdir,
             (agent, "LLM"): agent.LLM,
             (agent.DatabaseProbe, "_discover"): agent.DatabaseProbe._discover,
-            (agent.Verifier, "run_task_commands"): agent.Verifier.run_task_commands,
-            (agent.Verifier, "discovered_commands"): agent.Verifier.discovered_commands,
+            (agent.Checker, "run_task_commands"): agent.Checker.run_task_commands,
+            (agent.Checker, "discovered_commands"): agent.Checker.discovered_commands,
         }
         self._patch_env()
 
@@ -101,7 +101,7 @@ class E2E(unittest.TestCase):
         # No database and no Django here; the task's own commands are exercised
         # by their own test below.
         agent.DatabaseProbe._discover = lambda self: None
-        agent.Verifier.run_task_commands = lambda self: [
+        agent.Checker.run_task_commands = lambda self: [
             agent.CheckResult("$ task checks", True, "stubbed")
         ]
 
@@ -130,7 +130,7 @@ class E2E(unittest.TestCase):
         original = (self.root / TARGET).read_text()
         self.run_agent([self.edit_reply(BROKEN, FIXED)])
         self.assertEqual((self.root / TARGET).read_text(), original,
-                         "the checkout must be left pristine for the verifier")
+                         "the checkout must be left pristine for the checker")
 
     def test_need_context_round_then_edit(self):
         need = json.dumps({"action": "need_context", "why": "locate the annotation",
@@ -167,7 +167,7 @@ class E2E(unittest.TestCase):
         self.assertTrue(patch)
 
     def test_failing_checks_still_yield_best_effort_patch(self):
-        agent.Verifier.run_task_commands = lambda self: [
+        agent.Checker.run_task_commands = lambda self: [
             agent.CheckResult("$ task checks", False, "AssertionError: 3 != 5")
         ]
         patch, llm = self.run_agent([self.edit_reply(BROKEN, FIXED)] * 3)
@@ -199,7 +199,7 @@ class E2E(unittest.TestCase):
 
     def test_verified_failure_escalates_tier(self):
         # L3: the task's tests fail -> that is evidence -> next tier of the ladder.
-        agent.Verifier.run_task_commands = lambda self: [
+        agent.Checker.run_task_commands = lambda self: [
             agent.CheckResult("$ task checks", False, "AssertionError: 3 != 5")
         ]
         patch, llm = self.run_agent([self.edit_reply(BROKEN, FIXED)] * 3)
@@ -209,8 +209,8 @@ class E2E(unittest.TestCase):
     def test_unverifiable_patch_is_adopted_after_one_verify_request(self):
         # No test command anywhere: ask once for `verify`, then take the
         # statically clean patch rather than spending three more calls on it.
-        agent.Verifier.run_task_commands = lambda self: []
-        agent.Verifier.discovered_commands = lambda self, changed: []
+        agent.Checker.run_task_commands = lambda self: []
+        agent.Checker.discovered_commands = lambda self, changed: []
         patch, llm = self.run_agent([self.edit_reply(BROKEN, FIXED)] * 4)
         self.assertEqual(llm.calls, 2)
         asked = [m for m in llm.seen[1] if m["role"] == "user" and "No test command was available" in m["content"]]

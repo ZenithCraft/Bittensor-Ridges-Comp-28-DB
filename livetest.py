@@ -47,7 +47,7 @@ tmp = tempfile.TemporaryDirectory()
 root = selftest.stage(pristine, task, Path(tmp.name))
 agent.workdir = lambda: root
 agent.DatabaseProbe._discover = lambda self: None          # no live database here
-agent.Verifier.run_task_commands = lambda self: [          # no django/postgres here
+agent.Checker.run_task_commands = lambda self: [          # no django/postgres here
     agent.CheckResult("$ task checks", True, "skipped (no database in livetest)")]
 
 def account_totals():
@@ -79,7 +79,7 @@ print("=" * 72)
 # graded independently -- printing it to a terminal and throwing it away means
 # paying again to get it back. grade.py takes the file directly, which makes
 # this the cheap path to a true verdict: no Docker for the agent, no database,
-# ~$0.03, and the real verifier still passes judgement on the diff.
+# ~$0.03, and the real checker still passes judgement on the diff.
 if patch.strip():
     patches = Path.home() / ".ridges/patches"
     patches.mkdir(parents=True, exist_ok=True)
