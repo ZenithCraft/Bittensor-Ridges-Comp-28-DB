@@ -1264,3 +1264,180 @@ class TestDatabaseDiscoveryIsSecondaryAndCorrect(unittest.TestCase):
         self.assertTrue(probe.targets, "the postgres block should still be found")
         self.assertEqual(agent.target_url(probe.targets[0]),
                          "postgresql://solver@postgres:5432/netbox_dev")
+
+
+class TestSlicerPicksTheMethodTheInstructionNamed(unittest.TestCase):
+    """When a method name repeats, the class decides which one is shown.
+
+    netbox/ipam/filtersets.py defines filter_device three times. Matching the
+    bare name picked whichever came first in the file, so the model was shown
+    the right method by luck. On that task the luck held; the point is that it
+    was luck, and a task ordered the other way loses silently -- the model
+    cannot repair a fix aimed at a method it was never shown.
+    """
+
+    SOURCE = textwrap.dedent("""
+        class AlphaFilterSet:
+            def filter_device(self, qs):
+                return qs.filter(a=1)
+
+        class TargetFilterSet:
+            def filter_device(self, qs):
+                return qs.filter(b=2)
+    """) + "\n# padding\n" * 400
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "filtersets.py").write_text(self.SOURCE)
+        self.repo = agent.Repository(self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _label(self, class_hint):
+        instruction = agent.Instruction(text="x", method_hint="filter_device",
+                                        class_hint=class_hint)
+        pieces = agent.slice_around(self.repo, "filtersets.py", [], instruction,
+                                    budget_lines=20)
+        return pieces[0].label if pieces else ""
+
+    def test_the_named_class_wins_over_file_order(self):
+        self.assertIn("TargetFilterSet.filter_device", self._label("TargetFilterSet"))
+
+    def test_the_first_definition_is_still_used_without_a_class_hint(self):
+        self.assertIn("AlphaFilterSet.filter_device", self._label(None))
+
+    def test_a_class_the_file_does_not_define_falls_back_to_the_bare_name(self):
+        # A hint naming a class that lives elsewhere must still find the method
+        # rather than showing nothing at all.
+        self.assertIn("AlphaFilterSet.filter_device", self._label("SomeOtherFilterSet"))
+
+
+class TestMethodContractMatchesTheGraders(unittest.TestCase):
+    """The graded method contract, checked before the grader gets to.
+
+    Measured against all six verify.py files: everything they forbid beyond
+    _FORBIDDEN_NODES is already covered by check_style, because the instruction
+    carrying that grader states the rule in prose. `Raise` is the one exception
+    -- four of six reject it, no instruction mentions it, and until now neither
+    gate looked.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.repo = agent.Repository(self.root)
+        self.instruction = agent.parse_instruction(
+            "Fix `Q.run()`. Change only that method and keep its signature.", self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _check(self, original, current):
+        (self.root / "m.py").write_text(original)
+        self.repo._snapshots["m.py"] = original
+        self.repo._cache["m.py"] = current
+        (self.root / "m.py").write_text(current)
+        verifier = agent.Verifier(self.repo, self.instruction)
+        return verifier.check_verifier_contract(["m.py"])
+
+    def test_a_raise_the_edit_introduced_is_rejected(self):
+        before = "class Q:\n    def run(self):\n        return 1\n"
+        after = "class Q:\n    def run(self):\n        raise ValueError('x')\n"
+        result = self._check(before, after)
+        self.assertFalse(result.passed)
+        self.assertIn("Raise", result.detail)
+
+    def test_a_raise_that_was_already_there_is_not_held_against_the_edit(self):
+        # The grader accommodates what it shipped; flagging pre-existing code
+        # sends a correct fix into repair rounds it cannot win.
+        before = "class Q:\n    def run(self):\n        raise ValueError('x')\n"
+        after = "class Q:\n    def run(self):\n        raise ValueError('y')\n"
+        self.assertTrue(self._check(before, after).passed)
+
+    def test_the_node_budget_never_undercuts_the_method_it_starts_from(self):
+        # bulk-tag-assignment's `add` is 224 nodes before any edit and its
+        # grader allows 400. A flat 240 would reject a winning patch over 16
+        # nodes of headroom, so the floor comes from the original.
+        budget = agent.Verifier._node_budget
+        self.assertEqual(budget(23), 240, "a small method gets the strictest budget")
+        self.assertGreater(budget(224), 240, "a large method is not squeezed below itself")
+        self.assertLessEqual(budget(350), agent.Verifier._MAX_METHOD_NODES)
+
+    def test_byte_limit_matches_the_strictest_grader(self):
+        self.assertEqual(agent.Verifier._MAX_METHOD_BYTES, 4500)
+
+
+class TestMigrationContract(unittest.TestCase):
+    """Migration tasks get no method contract -- `single_method` is false, so
+    check_verifier_contract never runs -- yet cached-value-index has the
+    strictest grader in the set. The rule those graders encode is one thing
+    said many ways: an edit may change the VALUES inside the operations, never
+    the structure around them.
+    """
+
+    ORIGINAL = textwrap.dedent("""\
+        from django.db import migrations, models
+
+
+        class Migration(migrations.Migration):
+            dependencies = [
+                ('extras', '0106_bookmark_user_cascade_deletion'),
+            ]
+
+            operations = [
+                migrations.AddIndex(
+                    model_name='cachedvalue',
+                    index=models.Index(fields=['object_type'], name='extras_cachedvalue_object'),
+                ),
+            ]
+        """)
+    PATH = "extras/migrations/0107_cachedvalue_object.py"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / self.PATH).parent.mkdir(parents=True)
+        (self.root / self.PATH).write_text(self.ORIGINAL)
+        self.repo = agent.Repository(self.root)
+        self.instruction = agent.parse_instruction("Repair the migration.", self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _gate(self, current):
+        self.repo._snapshots[self.PATH] = self.ORIGINAL
+        self.repo._cache[self.PATH] = current
+        (self.root / self.PATH).write_text(current)
+        return agent.Verifier(self.repo, self.instruction).check_migration_contract([self.PATH])
+
+    def test_widening_the_index_fields_is_allowed(self):
+        # The one thing the task actually asks for.
+        fixed = self.ORIGINAL.replace("fields=['object_type']",
+                                      "fields=['object_type', 'object_id']")
+        self.assertTrue(self._gate(fixed).passed, self._gate(fixed).detail)
+
+    def test_a_second_operation_is_rejected(self):
+        self.assertFalse(self._gate(
+            self.ORIGINAL.replace("    ]\n", "        migrations.RunSQL('SELECT 1'),\n    ]\n", 1)
+        ).passed)
+
+    def test_swapping_the_operation_type_is_rejected(self):
+        self.assertFalse(self._gate(
+            self.ORIGINAL.replace("migrations.AddIndex", "migrations.RemoveIndex")).passed)
+
+    def test_changing_the_dependency_is_rejected(self):
+        self.assertFalse(self._gate(
+            self.ORIGINAL.replace("0106_bookmark_user_cascade_deletion", "0999_other")).passed)
+
+    def test_an_added_import_is_rejected(self):
+        self.assertFalse(self._gate("import os\n" + self.ORIGINAL).passed)
+
+    def test_an_added_helper_is_rejected(self):
+        self.assertFalse(self._gate(self.ORIGINAL + "\n\ndef helper():\n    return 1\n").passed)
+
+    def test_a_non_migration_file_is_not_gated(self):
+        # The gate keys on the path; ordinary source keeps its own contract.
+        self.assertTrue(agent.Verifier(self.repo, self.instruction)
+                        .check_migration_contract(["app/models.py"]).passed)
