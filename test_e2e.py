@@ -35,6 +35,7 @@ class ScriptedLLM(agent.LLM):
         self.max_cost = 1.0
         self.spent_estimate = 0.0
         self.unsupported = set()
+        self.blocked = set()          # solve()'s InferenceError path reads this
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.per_model = {}
@@ -88,6 +89,7 @@ class E2E(unittest.TestCase):
             (agent.DatabaseProbe, "_discover"): agent.DatabaseProbe._discover,
             (agent.Checker, "run_task_commands"): agent.Checker.run_task_commands,
             (agent.Checker, "discovered_commands"): agent.Checker.discovered_commands,
+            (agent.Checker, "unmeasured_bounded_work"): agent.Checker.unmeasured_bounded_work,
         }
         self._patch_env()
 
@@ -104,6 +106,12 @@ class E2E(unittest.TestCase):
         agent.Checker.run_task_commands = lambda self: [
             agent.CheckResult("$ task checks", True, "stubbed")
         ]
+        # This sample is a bounded-work task, so a reply carrying no `measure`
+        # probe now costs a round. That round is real and has its own test
+        # below; switching it off here keeps every other case measuring the
+        # thing it was written to measure -- the repair loop -- rather than
+        # counting one extra call each.
+        agent.Checker.unmeasured_bounded_work = lambda self, supplied: None
 
     def run_agent(self, replies):
         llm = ScriptedLLM(replies)
@@ -228,6 +236,60 @@ class E2E(unittest.TestCase):
         self.assertNotEqual(llm.tiers[1], llm.tiers[2], "an identical repeat moves to the next family")
         self.assertIn("byte-identical", llm.seen[2][-1]["content"])
         self.assertIn("cg.lft <= tenancy_contactgroup.rght", patch)
+
+
+@unittest.skipIf(PRISTINE is None, "no pinned checkout")
+class BoundedWorkMustBeMeasured(unittest.TestCase):
+    """The round a bounded-work task buys when no measurement was taken.
+
+    The other cases switch this off. Here it is on, because the whole point is
+    that a reply which never measures the statement count does not finish the
+    run -- which is what happened three times on the device-filter task, twice
+    with no probe supplied at all.
+    """
+
+    # Deliberately not a subclass of E2E: inheriting it would re-run every case
+    # in that class with the measurement switched on, and those cases script a
+    # fixed number of replies.
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = selftest.stage(PRISTINE, TASK, Path(self.tmp.name))
+        self.statement = (TASK / "instruction.md").read_text()
+        self._original = {
+            (agent, "workdir"): agent.workdir,
+            (agent, "LLM"): agent.LLM,
+            (agent.DatabaseProbe, "_discover"): agent.DatabaseProbe._discover,
+            (agent.Checker, "run_task_commands"): agent.Checker.run_task_commands,
+        }
+        agent.workdir = lambda: self.root
+        agent.DatabaseProbe._discover = lambda self: None
+        agent.Checker.run_task_commands = lambda self: [
+            agent.CheckResult("$ task checks", True, "stubbed")]
+
+    def tearDown(self):
+        for (owner, name), value in self._original.items():
+            setattr(owner, name, value)
+        self.tmp.cleanup()
+
+    edit_reply = staticmethod(E2E.edit_reply)
+    run_agent = E2E.run_agent
+
+    def test_a_reply_with_no_probe_buys_one_more_attempt(self):
+        self.assertTrue(agent.parse_instruction(self.statement, self.root).bounded_work)
+        patch, llm = self.run_agent([self.edit_reply(BROKEN, FIXED)] * 2)
+        self.assertEqual(llm.calls, 2, "no measurement means the run is not finished")
+        asked = [m for m in llm.seen[1]
+                 if m["role"] == "user" and "never measured" in m["content"]]
+        self.assertEqual(len(asked), 1, "the model is told what was not measured, once")
+        self.assertIn("`measure` probe", asked[0]["content"])
+        self.assertIn("cg.lft", patch, "and the patch is still returned")
+
+    def test_it_asks_once_and_then_adopts(self):
+        # A model that cannot produce a working probe must not loop: one
+        # request, then the statically clean patch is the answer.
+        patch, llm = self.run_agent([self.edit_reply(BROKEN, FIXED)] * 5)
+        self.assertEqual(llm.calls, 2)
+        self.assertIn("cg.lft", patch)
 
 
 if __name__ == "__main__":

@@ -245,8 +245,33 @@ class TestUnverifiedNotClean(unittest.TestCase):
         self.assertTrue(self.make(checks).clean)
 
     def test_a_skipped_task_command_does_not_count(self):
-        checks = [agent.CheckResult("$ python manage.py test x", True, "skipped: out of time")]
+        # `verified=False` is what the skip site now sets. It used to be
+        # inferred by looking for "skipped" in the detail text, which meant the
+        # signal lived in prose and only covered this one check.
+        checks = [agent.CheckResult("$ python manage.py test x", True, "skipped: out of time",
+                                    verified=False)]
         self.assertFalse(self.make(checks).clean)
+
+    def test_a_check_that_could_not_run_blocks_clean(self):
+        # The failure this exists for: a query-count probe printed nothing,
+        # `query scaling` reported success, clean went true, and the agent
+        # returned after one attempt with three quarters of its budget and two
+        # repair rounds unspent -- on a patch one redundant statement away from
+        # passing. Nothing failed; something simply was not measured.
+        checks = [agent.CheckResult("syntax", True, "parsed"),
+                  agent.CheckResult("$ python manage.py test x", True, "OK"),
+                  agent.CheckResult("query scaling", True, "the probe produced no query count",
+                                    verified=False)]
+        candidate = self.make(checks)
+        self.assertTrue(candidate.verified, "the tests did run")
+        self.assertEqual([c.name for c in candidate.unmeasured], ["query scaling"])
+        self.assertFalse(candidate.clean, "an unmeasured check must not read as done")
+
+    def test_everything_measured_is_clean(self):
+        checks = [agent.CheckResult("syntax", True, "parsed"),
+                  agent.CheckResult("$ python manage.py test x", True, "OK"),
+                  agent.CheckResult("query scaling", True, "bounded: 3 at N=1, 3 at N=10")]
+        self.assertTrue(self.make(checks).clean)
 
     def test_a_failing_task_command_is_not_clean(self):
         checks = [agent.CheckResult("$ python manage.py test x", False, "AssertionError")]
@@ -1441,3 +1466,408 @@ class TestMigrationContract(unittest.TestCase):
         # The gate keys on the path; ordinary source keeps its own contract.
         self.assertTrue(agent.Checker(self.repo, self.instruction)
                         .check_migration_contract(["app/models.py"]).passed)
+
+
+class TestQueryProbeRunsWhereTheTablesAre(unittest.TestCase):
+    """The probe measures the database work a change performs.
+
+    It had never once succeeded. `manage.py shell` opens the default database,
+    which in these projects has no tables -- migrations are applied to the one
+    Django builds for a test run -- so every probe died on `relation "..." does
+    not exist`, `query scaling` reported no count, and an optimisation task
+    could ship with the number it is judged on never taken.
+    """
+
+    def script(self, setup="from a.models import M", call="list(M.objects.all()[:N])",
+               result=""):
+        return agent.Checker._DJANGO_PROBE.format(
+            setup="\n".join(f"        {l}" for l in setup.splitlines()) or "        pass",
+            call="\n".join(f"                {l}" for l in call.splitlines()),
+            result=f"        _fp = _fingerprint({result})" if result else "        pass",
+            small=1, large=10)
+
+    def test_the_generated_script_is_valid_python(self):
+        # The blocks are nested, so setup and call sit at different depths. An
+        # off-by-one here is a SyntaxError the agent would report as "the probe
+        # produced no query count" -- indistinguishable from the bug above.
+        import ast as _ast
+        for setup, call in (("", "list(M.objects.all()[:N])"),
+                            ("x = 1", "qs = M.objects.filter(n=N)\nlist(qs)"),
+                            ("from a.models import M\nrows = [M(i) for i in range(3)]",
+                             "list(M.objects.filter(n=N))")):
+            _ast.parse(self.script(setup, call))
+
+    def test_it_repoints_at_the_test_database(self):
+        script = self.script()
+        self.assertIn('_cfg["NAME"] = (_cfg.get("TEST") or {}).get("NAME")', script)
+        self.assertIn("connection.close()", script)
+        self.assertLess(script.index('_cfg["NAME"]'), script.index("CaptureQueriesContext(connection)"),
+                        "the connection must be repointed before it is used")
+
+    def test_it_measures_inside_a_transaction_and_rolls_back(self):
+        # A Django TestCase wraps each test in a transaction, so the hidden
+        # test's count is taken under those conditions; measuring outside one
+        # would count Django's per-statement transaction management too. The
+        # rollback then leaves the database as it was found.
+        script = self.script()
+        self.assertIn("with transaction.atomic():", script)
+        self.assertIn("transaction.set_rollback(True)", script)
+
+    def test_a_reported_count_is_still_read(self):
+        repo = make_repo({"manage.py": "", "a.py": ""})
+        checker = agent.Checker(repo, agent.Instruction(text=""))
+        original = agent.run_command
+        agent.run_command = lambda *a, **k: agent.subprocess.CompletedProcess(
+            a, 0, 'RIDGES_QC{"1": 3, "10": 3}\n')
+        try:
+            result = checker.measure_query_scaling({"call": "f(N)"})
+        finally:
+            agent.run_command = original
+        self.assertTrue(result.passed)
+        self.assertTrue(result.verified, "a real count is a real measurement")
+        self.assertIn("bounded: 3 queries at N=1, 3 at N=10", result.detail)
+
+    def test_a_traceback_is_reported_as_unmeasured_with_its_cause(self):
+        repo = make_repo({"manage.py": "", "a.py": ""})
+        checker = agent.Checker(repo, agent.Instruction(text=""))
+        original = agent.run_command
+        agent.run_command = lambda *a, **k: agent.subprocess.CompletedProcess(
+            a, 0, 'Traceback (most recent call last):\npsycopg.errors.UndefinedTable: '
+                  'relation "dcim_device" does not exist\n')
+        try:
+            result = checker.measure_query_scaling({"call": "f(N)"})
+        finally:
+            agent.run_command = original
+        self.assertTrue(result.passed, "nothing about the code failed")
+        self.assertFalse(result.verified, "but nothing was measured either")
+        self.assertIn("UndefinedTable", result.detail, "the cause must reach the log")
+
+
+class TestBaselineTurnsACountIntoADelta(unittest.TestCase):
+    """"Three queries" does not say whether the change helped.
+
+    An optimisation task is graded on the difference the edit makes, and the
+    agent only ever saw the number after it. Measuring the same probe either
+    side of the change answers the question the count alone cannot: was this
+    better than what was there? These tests drive the probe off the actual file
+    contents, so a baseline that did not really revert the edit shows up as the
+    wrong number rather than passing quietly.
+    """
+
+    def fixture(self):
+        repo = make_repo({"manage.py": "", "app.py": "SLOW\n"})
+        repo.write("app.py", "FAST\n")
+        checker = agent.Checker(repo, agent.Instruction(text="", kinds={"bounded_queries"}))
+        return repo, checker
+
+    def counting_run(self, repo, calls, counts={"SLOW": 12, "FAST": 3}):
+        """A run_command that answers from whatever app.py currently says."""
+        def run(*a, **k):
+            body = (repo.root / "app.py").read_text().strip()
+            calls.append(body)
+            n = counts[body]
+            return agent.subprocess.CompletedProcess(
+                a, 0, 'RIDGES_QC{"1": %d, "10": %d}\n' % (min(n, 3), n))
+        return run
+
+    def measure(self, repo, checker, calls, **kw):
+        original = agent.run_command
+        agent.run_command = self.counting_run(repo, calls, **kw)
+        try:
+            return checker.measure_query_scaling({"call": "f(N)"})
+        finally:
+            agent.run_command = original
+
+    def test_the_baseline_is_taken_against_the_reverted_code(self):
+        repo, checker = self.fixture()
+        calls = []
+        result = self.measure(repo, checker, calls)
+        self.assertEqual(calls, ["FAST", "SLOW"],
+                         "the edit is measured first, then the code it replaced")
+        self.assertTrue(result.passed)
+        self.assertIn("12 -> 3 queries at N=10", result.detail)
+
+    def test_the_edit_is_put_back_afterwards(self):
+        # The whole patch lives on disk. A baseline that reverts and does not
+        # restore would hand build_patch an empty diff.
+        repo, checker = self.fixture()
+        self.measure(repo, checker, [])
+        self.assertEqual((repo.root / "app.py").read_text(), "FAST\n")
+        self.assertEqual(repo.changed_files(), ["app.py"])
+        self.assertEqual(repo.original("app.py"), "SLOW\n",
+                         "and the original snapshot still says what we started from")
+
+    def test_the_edit_is_put_back_even_when_the_baseline_probe_dies(self):
+        repo, checker = self.fixture()
+        original = agent.run_command
+        state = {"n": 0}
+
+        def run(*a, **k):
+            state["n"] += 1
+            if state["n"] == 1:
+                return agent.subprocess.CompletedProcess(a, 0, 'RIDGES_QC{"1": 3, "10": 3}\n')
+            raise OSError("probe died")
+
+        agent.run_command = run
+        try:
+            with self.assertRaises(OSError):
+                checker.measure_query_scaling({"call": "f(N)"})
+        finally:
+            agent.run_command = original
+        self.assertEqual((repo.root / "app.py").read_text(), "FAST\n")
+
+    def test_it_is_measured_once_and_reused(self):
+        # It costs a shell run. Three repair rounds must not cost three of them.
+        repo, checker = self.fixture()
+        calls = []
+        self.measure(repo, checker, calls)
+        self.measure(repo, checker, calls)
+        self.assertEqual(calls, ["FAST", "SLOW", "FAST"], "the second round reuses the baseline")
+
+    def test_a_baseline_that_cannot_be_taken_is_not_retaken(self):
+        repo, checker = self.fixture()
+        original = agent.run_command
+        calls = []
+
+        def run(*a, **k):
+            body = (repo.root / "app.py").read_text().strip()
+            calls.append(body)
+            out = 'RIDGES_QC{"1": 3, "10": 3}\n' if body == "FAST" else "Traceback: boom\n"
+            return agent.subprocess.CompletedProcess(a, 0, out)
+
+        agent.run_command = run
+        try:
+            first = checker.measure_query_scaling({"call": "f(N)"})
+            second = checker.measure_query_scaling({"call": "f(N)"})
+        finally:
+            agent.run_command = original
+        self.assertEqual(calls, ["FAST", "SLOW", "FAST"])
+        for result in (first, second):
+            self.assertTrue(result.passed)
+            self.assertIn("bounded: 3 queries at N=1", result.detail,
+                          "without a baseline the check reports what it did measure")
+
+    def test_a_change_that_does_more_work_fails_a_bounded_work_task(self):
+        # Bounded and worse are not the same verdict. This one scales fine and
+        # is still a regression on the one number the task is about.
+        repo, checker = self.fixture()
+        result = self.measure(repo, checker, [], counts={"SLOW": 2, "FAST": 3})
+        self.assertFalse(result.passed)
+        self.assertIn("increased the database work", result.detail)
+        self.assertIn("2 queries at N=10 before it, 3 after", result.detail)
+
+    def test_doing_more_work_is_allowed_when_the_task_never_asked_for_less(self):
+        # A correctness fix may legitimately cost a statement. Only a task whose
+        # subject is the count gets failed for raising it.
+        repo = make_repo({"manage.py": "", "app.py": "SLOW\n"})
+        repo.write("app.py", "FAST\n")
+        checker = agent.Checker(repo, agent.Instruction(text=""))
+        result = self.measure(repo, checker, [], counts={"SLOW": 2, "FAST": 3})
+        self.assertTrue(result.passed)
+        self.assertIn("2 -> 3 queries at N=10", result.detail)
+
+    def test_a_failure_carries_the_before_numbers(self):
+        # The model reads this detail to decide what to try next; "still 4, was
+        # 12" and "still 4, was 4" call for very different second attempts.
+        repo = make_repo({"manage.py": "", "app.py": "SLOW\n"})
+        repo.write("app.py", "FAST\n")
+        checker = agent.Checker(repo, agent.Instruction(text="", targets={"max_queries": 2}))
+        result = self.measure(repo, checker, [])
+        self.assertFalse(result.passed)
+        self.assertIn("at most 2 queries", result.detail)
+        self.assertIn("12 at N=10", result.detail)
+
+    def test_no_edit_means_no_baseline(self):
+        # Nothing to revert, so nothing to compare against; the check still runs.
+        repo = make_repo({"manage.py": "", "app.py": "SLOW\n"})
+        checker = agent.Checker(repo, agent.Instruction(text=""))
+        calls = []
+        result = self.measure(repo, checker, calls)
+        self.assertEqual(calls, ["SLOW"], "one probe run, and nothing to revert for a second")
+        self.assertIn("3 queries at N=1, 12 at N=10", result.detail)
+        self.assertNotIn("Before the edit", result.detail)
+
+
+class TestTheRewriteMustReturnTheSameRows(unittest.TestCase):
+    """Fewer statements returning different rows is not an optimisation.
+
+    The scaling check answers "how much work?" and nothing else, so a rewrite
+    that halves the query count by dropping half the rows passed it. The task's
+    own tests are no defence either: they passed before the edit, against the
+    code the edit replaced. The baseline run is already happening, so comparing
+    a value across it costs nothing but the expression the model supplies.
+    """
+
+    def fingerprint(self):
+        """The function as it is actually shipped, lifted out of the template."""
+        source = agent.Checker._DJANGO_PROBE
+        block = source[source.index("def _fingerprint"):source.index("counts = {{}}")]
+        namespace = {}
+        exec(block.replace("{{", "{").replace("}}", "}"), namespace)
+        return namespace["_fingerprint"]
+
+    def test_the_fingerprint_is_order_insensitive(self):
+        # A filter rewrite is not required to preserve ordering, and the task's
+        # own tests cover it when it is. Failing on order would be noise.
+        fp = self.fingerprint()
+        self.assertEqual(fp(["b", "a"]), fp(["a", "b"]))
+
+    def test_the_fingerprint_survives_values_it_cannot_iterate(self):
+        fp = self.fingerprint()
+        self.assertEqual(fp(7), ["7"])
+        self.assertEqual(fp("ab"), ["'ab'"], "a string is one value, not two")
+
+        class Hostile:
+            def __iter__(self):
+                raise RuntimeError("no")
+
+        self.assertEqual(len(fp(Hostile())), 1, "a probe must not die inside its own reporting")
+
+    def test_the_generated_script_is_valid_python_with_a_result(self):
+        import ast as _ast
+        probe = TestQueryProbeRunsWhereTheTablesAre()
+        _ast.parse(probe.script(result="sorted(x.name for x in qs)"))
+        self.assertIn("_fp = _fingerprint(sorted(x.name for x in qs))",
+                      probe.script(result="sorted(x.name for x in qs)"))
+
+    def fixture(self, **instruction):
+        repo = make_repo({"manage.py": "", "app.py": "SLOW\n"})
+        repo.write("app.py", "FAST\n")
+        return repo, agent.Checker(repo, agent.Instruction(text="", **instruction))
+
+    def measure(self, repo, checker, rows, calls=None, counts={"SLOW": 12, "FAST": 3},
+                result="names"):
+        """Answer both probe runs from whatever app.py currently says."""
+        def run(*a, **k):
+            body = (repo.root / "app.py").read_text().strip()
+            if calls is not None:
+                calls.append(body)
+            n = counts[body]
+            return agent.subprocess.CompletedProcess(
+                a, 0, 'RIDGES_QC{"1": %d, "10": %d}\nRIDGES_QR%s\n'
+                      % (min(n, 3), n, json.dumps(rows[body])))
+        original = agent.run_command
+        agent.run_command = run
+        try:
+            return checker.measure_query_scaling({"call": "f(N)", "result": result})
+        finally:
+            agent.run_command = original
+
+    def test_the_same_rows_either_side_pass_and_say_so(self):
+        repo, checker = self.fixture()
+        result = self.measure(repo, checker, {"SLOW": ["a", "b"], "FAST": ["b", "a"]})
+        self.assertTrue(result.passed)
+        self.assertIn("12 -> 3 queries at N=10", result.detail)
+        self.assertIn("`result` unchanged (2 item(s))", result.detail)
+
+    def test_dropped_rows_fail_even_though_the_count_improved(self):
+        repo, checker = self.fixture()
+        result = self.measure(repo, checker, {"SLOW": ["a", "b", "c"], "FAST": ["a", "b"]})
+        self.assertFalse(result.passed)
+        self.assertIn("`result` changed", result.detail)
+        self.assertIn("produced 3 item(s), this version produces 2", result.detail)
+        self.assertIn("only before: 'c'".replace("'", ""), result.detail.replace("'", ""))
+
+    def test_the_failure_names_its_own_benign_cause(self):
+        # The likeliest mismatch is not a bug: the two runs are separate
+        # transactions, so an expression built out of auto-assigned ids differs
+        # even when the rows are identical. Say so, or the model spends a repair
+        # round rewriting correct code.
+        repo, checker = self.fixture()
+        result = self.measure(repo, checker, {"SLOW": ["1"], "FAST": ["4"]})
+        self.assertFalse(result.passed)
+        self.assertIn("database ids", result.detail)
+        self.assertIn("does not rewind", result.detail)
+
+    def test_it_never_displaces_a_count_failure(self):
+        # The counts are certain; this comparison depends on an expression the
+        # model wrote. When both are wrong, report the one that cannot be wrong.
+        repo, checker = self.fixture(targets={"max_queries": 2})
+        result = self.measure(repo, checker, {"SLOW": ["a"], "FAST": ["b"]})
+        self.assertFalse(result.passed)
+        self.assertIn("at most 2 queries", result.detail)
+        self.assertNotIn("`result` changed", result.detail)
+
+    def test_a_corrected_expression_gets_a_fresh_baseline(self):
+        # The model's answer to a spurious mismatch is a better `result`.
+        # Comparing it against a fingerprint taken with the old expression would
+        # compare two different things, so the expression is part of the key.
+        repo, checker = self.fixture()
+        calls = []
+        first = self.measure(repo, checker, {"SLOW": ["1"], "FAST": ["4"]}, calls, result="ids")
+        self.assertFalse(first.passed)
+        second = self.measure(repo, checker, {"SLOW": ["a"], "FAST": ["a"]}, calls, result="names")
+        self.assertTrue(second.passed)
+        self.assertEqual(calls, ["FAST", "SLOW", "FAST", "SLOW"])
+
+    def test_no_result_expression_means_no_comparison(self):
+        repo, checker = self.fixture()
+        original = agent.run_command
+        scripts = []
+
+        def run(cmd, *a, **k):
+            scripts.append(cmd[-1])
+            body = (repo.root / "app.py").read_text().strip()
+            return agent.subprocess.CompletedProcess(
+                cmd, 0, 'RIDGES_QC{"1": 3, "10": %d}\n' % (12 if body == "SLOW" else 3))
+
+        agent.run_command = run
+        try:
+            result = checker.measure_query_scaling({"call": "f(N)"})
+        finally:
+            agent.run_command = original
+        self.assertTrue(result.passed)
+        self.assertNotIn("`result`", result.detail)
+        self.assertNotIn("_fp = _fingerprint(", scripts[0],
+                         "nothing to evaluate, so nothing emitted")
+
+
+class TestBoundedWorkMustBeMeasured(unittest.TestCase):
+    """On a task about statement count, supplying no probe is not "done".
+
+    measure_query_scaling returns None when there is nothing to run, so no check
+    was appended and `clean` went true. That is the same hole as a probe that
+    fails, reached by the other route -- and it is the route that actually
+    occurred: two of three runs on the device-filter task supplied no probe, so
+    the mechanism built to catch a failing one never had anything to catch.
+    """
+
+    def checker(self, text, files=None):
+        repo = make_repo(files or {"manage.py": "", "app/q.py": "x = 1\n"})
+        return agent.Checker(repo, agent.parse_instruction(text, repo.root))
+
+    BOUNDED = ("Fix `app/q.py`. The work must not grow with the number of rows: "
+               "it issues one query per row in a loop today.")
+    PLAIN = "Fix the wrong count in `app/q.py`."
+
+    def test_the_predicate_matches_statement_count_tasks_only(self):
+        self.assertTrue(self.checker(self.BOUNDED).instruction.bounded_work)
+        self.assertFalse(self.checker(self.PLAIN).instruction.bounded_work)
+        stated = self.checker("Fix `app/q.py`. Use at most 3 queries.")
+        self.assertTrue(stated.instruction.bounded_work, "an explicit ceiling counts too")
+
+    def test_no_probe_on_a_bounded_task_is_unmeasured(self):
+        result = self.checker(self.BOUNDED).unmeasured_bounded_work({})
+        self.assertIsNotNone(result)
+        self.assertTrue(result.passed, "nothing about the code failed")
+        self.assertFalse(result.verified, "but the number was never taken")
+
+    def test_a_supplied_probe_leaves_the_verdict_to_the_measurement(self):
+        self.assertIsNone(self.checker(self.BOUNDED).unmeasured_bounded_work({"call": "f(N)"}))
+
+    def test_an_ordinary_task_is_not_asked_for_a_probe(self):
+        self.assertIsNone(self.checker(self.PLAIN).unmeasured_bounded_work({}))
+
+    def test_a_project_with_no_runner_is_not_asked_for_what_it_cannot_give(self):
+        checker = self.checker(self.BOUNDED, {"src/q.js": "x", "package.json": "{}"})
+        self.assertTrue(checker.instruction.bounded_work)
+        self.assertIsNone(checker.unmeasured_bounded_work({}),
+                          "no Django runner: there is no measurement to ask for")
+
+    def test_it_blocks_clean(self):
+        checks = [agent.CheckResult("syntax", True, "parsed"),
+                  agent.CheckResult("$ manage.py test x", True, "OK"),
+                  self.checker(self.BOUNDED).unmeasured_bounded_work({})]
+        candidate = agent.Candidate(patch="diff --git a/x b/x\n", checks=checks, diagnosis="d")
+        self.assertTrue(candidate.verified, "the tests did run")
+        self.assertFalse(candidate.clean, "a bounded task with no measurement is not finished")
