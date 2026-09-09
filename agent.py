@@ -682,7 +682,13 @@ class LLM:
         # transparent proxy. A route that cannot be reached is dropped for the
         # run, so a wrong first guess costs one failed connection, not the task.
         self.dead_routes: set[str] = set()
-        self.effort = "minimal"             # reasoning effort sent with every call
+        # Reasoning effort sent with every call. "low" rather than "minimal":
+        # OpenRouter documents high/medium/low, and a 3-run comparison at
+        # "minimal" left the reasoning share of completion tokens at 81-92%,
+        # against 86-95% at "low" -- so the value either is not honoured on this
+        # route or barely moves the model. "low" is the documented one and the
+        # one every earlier measurement was taken at.
+        self.effort = "low"
 
     def routes(self) -> list[str]:
         found: list[str] = []
@@ -3190,9 +3196,23 @@ def verify_patch_applies(patch: str, repo: Repository) -> tuple[bool, str]:
 
 @dataclass
 class CheckResult:
+    """A check's verdict, in three states rather than two.
+
+    `passed` alone conflates "I looked and it was fine" with "I could not
+    look" -- and the second is the dangerous one, because it reads as success
+    while removing the only defence the agent has. A probe that fails to report
+    a query count on an optimisation task is not a passing patch; it is an
+    unmeasured one, on the very dimension the task is about.
+
+    `verified=False` says the check did not run. It is not a failure -- there
+    is nothing to tell the model to fix about the code -- but it must not count
+    towards `clean`, or the agent stops early on a claim it never tested.
+    """
+
     name: str
     passed: bool
     detail: str
+    verified: bool = True
 
 
 class Checker:
@@ -3780,18 +3800,21 @@ print("RIDGES_QS" + json.dumps([q["sql"] for q in _ctx.captured_queries[:6]]))
         match = re.search(r"RIDGES_QC(\{.*\})", result.stdout or "")
         if not match:
             return CheckResult("query scaling", True,
-                               f"probe did not report a count; treating as unmeasured. "
-                               f"{truncate(result.stdout, 600)}")
+                               f"the probe produced no query count, so the database work this "
+                               f"change performs is unmeasured. Output was:\n"
+                               f"{truncate(result.stdout, 2000)}", verified=False)
         try:
             counts = {int(k): int(v) for k, v in json.loads(match.group(1)).items()}
         except (ValueError, json.JSONDecodeError):
-            return CheckResult("query scaling", True, "probe output unreadable")
+            return CheckResult("query scaling", True, "the probe's count could not be read",
+                               verified=False)
 
         trace("measure_query_scaling", "out", counts=counts,
               limit=self.instruction.targets.get("max_queries"))
         low, high = counts.get(small), counts.get(large)
         if low is None or high is None:
-            return CheckResult("query scaling", True, f"incomplete measurement: {counts}")
+            return CheckResult("query scaling", True, f"incomplete measurement: {counts}",
+                               verified=False)
         limit = self.instruction.targets.get("max_queries")
         failure = None
         if limit and high > limit:
@@ -3899,7 +3922,8 @@ print("RIDGES_QS" + json.dumps([q["sql"] for q in _ctx.captured_queries[:6]]))
         results: list[CheckResult] = []
         for command in self.selected_commands():
             if remaining_seconds() < 180:
-                results.append(CheckResult(f"$ {command}", True, "skipped: out of time"))
+                results.append(CheckResult(f"$ {command}", True, "skipped: out of time",
+                                           verified=False))
                 continue
             log(f"running task check: {command}")
             result = run_command(command, timeout=min(600.0, max(60.0, remaining_seconds() - 120)))
@@ -3921,8 +3945,9 @@ def _traced(check: CheckResult) -> CheckResult:
 def summarise(checks: Sequence[CheckResult]) -> str:
     lines = []
     for check in checks:
-        lines.append(f"[{'PASS' if check.passed else 'FAIL'}] {check.name}")
-        if not check.passed and check.detail:
+        state = "FAIL" if not check.passed else ("PASS" if check.verified else "UNMEASURED")
+        lines.append(f"[{state}] {check.name}")
+        if (not check.passed or not check.verified) and check.detail:
             lines.append(truncate(check.detail, 5000, head_ratio=0.3))
     return "\n".join(lines)
 
@@ -4633,15 +4658,28 @@ class Candidate:
     @property
     def verified(self) -> bool:
         """Did anything actually exercise the change against the database?"""
-        return any(c.name.startswith("$ ") and c.passed and "skipped" not in c.detail
-                   for c in self.checks)
+        return any(c.name.startswith("$ ") and c.passed and c.verified for c in self.checks)
+
+    @property
+    def unmeasured(self) -> list[CheckResult]:
+        """Checks that reported no problem because they could not run.
+
+        This was the gap that lost a solvable task: a query-count probe printed
+        nothing, `query scaling` reported success, `clean` went true, and the
+        agent returned after one attempt with three quarters of its budget and
+        two repair rounds unspent -- on a patch one redundant statement away
+        from correct.
+        """
+        return [check for check in self.checks if check.passed and not check.verified]
 
     @property
     def clean(self) -> bool:
         # all([]) is True, so an empty check list would otherwise read as
-        # success. A patch nothing executed is not a verified patch.
+        # success. A patch nothing executed is not a verified patch, and
+        # neither is one whose measurement never reported.
         return (bool(self.patch.strip())
                 and all(check.passed for check in self.checks)
+                and not self.unmeasured
                 and self.verified)
 
 
@@ -4710,6 +4748,7 @@ class Solver:
         # round, every repair, and a protocol slip or two.
         slips = 0
         unverified_retries = 0
+        unmeasured_retries = 0
         stalled = 0                 # byte-identical edits in a row: the same model will not change its mind
         last_edit_sig = None
         max_rounds = MAX_REPAIR_ROUNDS + MAX_CONTEXT_ROUNDS + MAX_GATE_SLIPS + 2
@@ -4855,6 +4894,11 @@ class Solver:
             if unverified:
                 log("WARNING: the change passed every static check but nothing ran it "
                     "against the database -- no usable test command was found")
+            # Nothing failed, but something the task is judged on went
+            # unmeasured. Not a wrong diagnosis and not a rule violation, so it
+            # buys neither a repair round nor an escalation -- it buys the one
+            # thing the old code threw away, which is the rest of the budget.
+            unmeasured = candidate.unmeasured if not runtime_failed and not unverified else []
 
             self._compact_old_context(messages)
             feedback = self._failure_message(errors, checks)
@@ -4865,6 +4909,23 @@ class Solver:
                 failures += 1                       # L3
                 self.failures_seen = failures
                 context_budget += 1                 # the failure is worth investigating
+                messages.append({"role": "user", "content": feedback})
+                continue
+
+            if unmeasured:
+                unmeasured_retries += 1
+                if unmeasured_retries > 1:
+                    log("still unmeasured after one request; adopting the patch as best effort")
+                    return patch
+                names = ", ".join(check.name for check in unmeasured)
+                feedback += (
+                    f"\n\nEvery check passed, but {names} could not run, so the database work "
+                    "this change performs was never measured -- and that measurement is what "
+                    "the task is about. Reply with the same diagnosis and a `measure` probe "
+                    "that reports: `setup` creating the objects the call needs, `call` a single "
+                    "line using N as the selection size. If the count cannot be reduced further, "
+                    "look again for work the new query makes redundant -- a guard or a lookup "
+                    "the set-based form no longer needs.")
                 messages.append({"role": "user", "content": feedback})
                 continue
 

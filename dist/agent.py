@@ -182,7 +182,7 @@ class LLM:
         self._insecure_ctx.check_hostname = False
         self._insecure_ctx.verify_mode = ssl.CERT_NONE
         self.dead_routes: set[str] = set()
-        self.effort = 'minimal'
+        self.effort = 'low'
 
     def routes(self) -> list[str]:
         found: list[str] = []
@@ -1605,6 +1605,7 @@ class CheckResult:
     name: str
     passed: bool
     detail: str
+    verified: bool = True
 
 # Everything this agent can check for itself before committing to a patch: scope, syntax,
 # the constraints the instruction states, and the repository's own tests. Ordered
@@ -1962,14 +1963,14 @@ class Checker:
         result = run_command([app_python(self.repo.root), manage, 'shell', '-c', script], timeout=min(300.0, max(60.0, remaining_seconds() - 200)))
         match = re.search('RIDGES_QC(\\{.*\\})', result.stdout or '')
         if not match:
-            return CheckResult('query scaling', True, f'probe did not report a count; treating as unmeasured. {truncate(result.stdout, 600)}')
+            return CheckResult('query scaling', True, f'the probe produced no query count, so the database work this change performs is unmeasured. Output was:\n{truncate(result.stdout, 2000)}', verified=False)
         try:
             counts = {int(k): int(v) for k, v in json.loads(match.group(1)).items()}
         except (ValueError, json.JSONDecodeError):
-            return CheckResult('query scaling', True, 'probe output unreadable')
+            return CheckResult('query scaling', True, "the probe's count could not be read", verified=False)
         low, high = (counts.get(small), counts.get(large))
         if low is None or high is None:
-            return CheckResult('query scaling', True, f'incomplete measurement: {counts}')
+            return CheckResult('query scaling', True, f'incomplete measurement: {counts}', verified=False)
         limit = self.instruction.targets.get('max_queries')
         failure = None
         if limit and high > limit:
@@ -2048,7 +2049,7 @@ class Checker:
         results: list[CheckResult] = []
         for command in self.selected_commands():
             if remaining_seconds() < 180:
-                results.append(CheckResult(f'$ {command}', True, 'skipped: out of time'))
+                results.append(CheckResult(f'$ {command}', True, 'skipped: out of time', verified=False))
                 continue
             log(f'running task check: {command}')
             result = run_command(command, timeout=min(600.0, max(60.0, remaining_seconds() - 120)))
@@ -2061,8 +2062,9 @@ class Checker:
 def summarise(checks: Sequence[CheckResult]) -> str:
     lines = []
     for check in checks:
-        lines.append(f"[{('PASS' if check.passed else 'FAIL')}] {check.name}")
-        if not check.passed and check.detail:
+        state = 'FAIL' if not check.passed else 'PASS' if check.verified else 'UNMEASURED'
+        lines.append(f'[{state}] {check.name}')
+        if (not check.passed or not check.verified) and check.detail:
             lines.append(truncate(check.detail, 5000, head_ratio=0.3))
     return '\n'.join(lines)
 SYSTEM_PROMPT = "You are a database query engineer. You fix, author, and optimise the queries a real application issues against PostgreSQL or ClickHouse, working inside the application's own repository: raw SQL, ORM code, or query-builder code.\n\nHow you work:\n\n* Edit production query code, and write the fix so it holds for data you have not seen. Implement the general rule the task states, in terms of the columns and relations it names, rather than anything that happens to suit the rows in front of you.\n* Reduce the database work the query performs -- statements issued, rows and buffers touched, index usage. Remove work the query genuinely does not need, rather than moving it somewhere less visible.\n* Keep everything outside the blast radius the instruction sets byte-identical, imports included, and build the fix from names already in scope.\n* Make the smallest change that fixes the underlying cause.\n\nReasoning you should apply, by symptom:\n\n* Work that grows with input size -- a statement per element, per row, or per iteration -- becomes one set-based statement: a single bulk insert/update, one `IN`/`ANY` predicate, a join, or a CTE. Compute the set difference in the database, and keep any signal/callback contract firing exactly once with the same payload.\n* A slow or unselective plan usually means the predicate the application actually issues is not the one the index serves. Match index column order and partiality to the real predicate, including equality columns first.\n* Wrong aggregates over a hierarchy or a many-to-many usually mean fan-out: rows multiplied by a join. Fix it with DISTINCT on the counted key, a subquery/lateral, or a nested-set/recursive descendant predicate, keeping the correction in the database rather than in application code.\n* Percentages and ratios should be computed in the database with explicit numeric casting and a zero-denominator guard.\n* On ClickHouse, favour the primary key order and PREWHERE, prefer set-based expressions over per-row subqueries, and remember that JOIN semantics and nullability differ from PostgreSQL. An `explain` request there also returns read_rows, read_bytes, selected parts and marks -- the amount of data the query actually touched, so check it fell. Build a series with numbers(N) or arrayJoin(range(...)) rather than by selecting from system.numbers: a report should not depend on the server's own introspection tables.\n\nYou answer only with a single JSON object, described in the user message."
@@ -2399,11 +2401,15 @@ class Candidate:
 
     @property
     def verified(self) -> bool:
-        return any((c.name.startswith('$ ') and c.passed and ('skipped' not in c.detail) for c in self.checks))
+        return any((c.name.startswith('$ ') and c.passed and c.verified for c in self.checks))
+
+    @property
+    def unmeasured(self) -> list[CheckResult]:
+        return [check for check in self.checks if check.passed and (not check.verified)]
 
     @property
     def clean(self) -> bool:
-        return bool(self.patch.strip()) and all((check.passed for check in self.checks)) and self.verified
+        return bool(self.patch.strip()) and all((check.passed for check in self.checks)) and (not self.unmeasured) and self.verified
 
 class Solver:
 
@@ -2452,6 +2458,7 @@ class Solver:
         stalls = 0
         slips = 0
         unverified_retries = 0
+        unmeasured_retries = 0
         stalled = 0
         last_edit_sig = None
         max_rounds = MAX_REPAIR_ROUNDS + MAX_CONTEXT_ROUNDS + MAX_GATE_SLIPS + 2
@@ -2544,6 +2551,7 @@ class Solver:
             unverified = not candidate.verified and all((c.passed for c in checks))
             if unverified:
                 log('WARNING: the change passed every static check but nothing ran it against the database -- no usable test command was found')
+            unmeasured = candidate.unmeasured if not runtime_failed and (not unverified) else []
             self._compact_old_context(messages)
             feedback = self._failure_message(errors, checks)
             messages.append({'role': 'assistant', 'content': json.dumps(payload)[:4000]})
@@ -2552,6 +2560,15 @@ class Solver:
                 failures += 1
                 self.failures_seen = failures
                 context_budget += 1
+                messages.append({'role': 'user', 'content': feedback})
+                continue
+            if unmeasured:
+                unmeasured_retries += 1
+                if unmeasured_retries > 1:
+                    log('still unmeasured after one request; adopting the patch as best effort')
+                    return patch
+                names = ', '.join((check.name for check in unmeasured))
+                feedback += f'\n\nEvery check passed, but {names} could not run, so the database work this change performs was never measured -- and that measurement is what the task is about. Reply with the same diagnosis and a `measure` probe that reports: `setup` creating the objects the call needs, `call` a single line using N as the selection size. If the count cannot be reduced further, look again for work the new query makes redundant -- a guard or a lookup the set-based form no longer needs.'
                 messages.append({'role': 'user', 'content': feedback})
                 continue
             if unverified:
