@@ -133,6 +133,26 @@ LADDER: list[list[str]] = [
     ["moonshotai/kimi-k2.6", "moonshotai/kimi-k2.7-code", "qwen/qwen3.8-27b"],
 ]
 
+# Models measured to be unusable on this prompt family, whatever the platform
+# allows. This has to be enforced where the roster is built, not only where the
+# ladder is written: discover_models asks the platform what it accepts and that
+# answer is authoritative, so every allowed model was being appended to the
+# roster -- including the ones deliberately left out of LADDER. In production,
+# where discovery succeeds, that put an excluded model back at position 4 on
+# every round. Locally, where discovery usually finds nothing and the built-in
+# roster is used, it never appeared at all: invisible where it is tested and
+# live where it is graded.
+#
+# Only a model measured to return nothing belongs here. Excluding one that
+# produces no content cannot cost a solve, and each burns a whole completion
+# cap before it fails, so this is the one part of the runaway problem that is
+# not a trade.
+BLOCKED_MODELS = frozenset({
+    # Two real tasks, no content either time even with the cap removed, 551s
+    # spent producing nothing -- it loses on score, runtime and price at once.
+    "deepseek/deepseek-v4-flash",
+})
+
 MAX_REPAIR_ROUNDS = 3        # verified wrong answers (tests failed) before giving up
 MAX_GATE_SLIPS = 4           # cheap protocol slips (scope/syntax/contract) -- no tests were run
 MAX_CONTEXT_ROUNDS = 6       # absolute ceiling on investigation, whatever the dynamic budget says
@@ -752,13 +772,22 @@ class LLM:
         return []
 
     def roster(self, preferred: Sequence[str]) -> list[str]:
-        """Preferred models first, then anything else the platform allows."""
-        allowed = self.discovered
+        """Preferred models first, then anything else the platform allows.
+
+        The tail is ordered by measured capability, not alphabetically. MODELS
+        is written strongest-first, and sorting the tail by name instead put
+        the weakest entry in the table (gemma, coding 43 / agentic 14) ahead of
+        one nearly twice its score (kimi-k2.6, coding 62). Models the table
+        does not know come last, in name order so two runs agree.
+        """
+        allowed = [m for m in self.discovered if m not in BLOCKED_MODELS]
         if allowed:
-            ordered = [m for m in preferred if m in allowed]
-            ordered += sorted(m for m in allowed if m not in ordered)      # fixed order for the tail
-            return ordered or sorted(allowed)
-        return list(preferred) + [name for name in MODELS if name not in preferred]
+            ordered = [m for m in preferred if m in allowed and m not in BLOCKED_MODELS]
+            known = [m for m in MODELS if m in allowed and m not in ordered]
+            unknown = sorted(m for m in allowed if m not in ordered and m not in known)
+            return ordered + known + unknown
+        return [m for m in preferred if m not in BLOCKED_MODELS] + [
+            name for name in MODELS if name not in preferred and name not in BLOCKED_MODELS]
 
     # -- budget ----------------------------------------------------------
     def spent(self) -> float:
@@ -1216,6 +1245,24 @@ class Instruction:
         """
         return "bounded_queries" in self.kinds or bool(self.targets.get("max_queries"))
 
+    # Asking for less data to be read, in the words these statements actually
+    # use. Deliberately separate from bounded_work: that one is about how many
+    # statements are issued, which is what PostgreSQL tasks are graded on;
+    # this is about how much each statement touches, which is what ClickHouse
+    # tasks are graded on. Measured against the six ClickHouse statements in
+    # the corpus -- it fires on the two that ask the query to read less and
+    # stays silent on the four that only ask for different rows.
+    _READS_LESS = re.compile(
+        r"\b(?:far |much |)fewer rows\b|\bproportional to\b|\bfull scan\b"
+        r"|\bread(?:s|ing)?\s+(?:far |much |)(?:fewer|less)\b"
+        r"|\bstopped scaling\b|\bre-?reads?\b|\bscan(?:s|ning)?\s+the whole\b",
+        re.IGNORECASE)
+
+    @property
+    def reduces_work(self) -> bool:
+        """Whether the statement asks the query to touch less data."""
+        return self.bounded_work or bool(self._READS_LESS.search(re.sub(r"\s+", " ", self.text)))
+
 
 # Fence tags that mean "the lines in here are shell commands". Measured across
 # the 62 bench statements: every one of the 60 fenced blocks is tagged ```bash,
@@ -1462,11 +1509,23 @@ class InstructionParser:
     # so the clause scan above never reaches them. Both are graded: the first
     # is why F401 leads ERROR_HINTS, the second is what separates a
     # database-side fix from a Python-side one.
+    # "requires" as well as "imports": the JavaScript and Ruby statements say
+    # `use only names the file already requires`, one word away from the
+    # wording this matched, and so the rule parsed on none of the 21
+    # non-Python tasks in the corpus.
     _NO_NEW_NAMES = re.compile(
-        r"use only names (?:the file|it) already imports"
-        r"|only names .{0,24}already imports"
-        r"|without adding (?:any )?(?:new )?imports"
-        r"|do not add (?:any )?(?:new )?imports", re.IGNORECASE)
+        r"use only names (?:the file|it) already (?:imports|requires)"
+        r"|only names .{0,24}already (?:imports|requires)"
+        r"|without adding (?:any )?(?:new )?(?:imports|requires)"
+        r"|do not add (?:any )?(?:new )?(?:imports|requires)", re.IGNORECASE)
+    # And the opposite, stated just as plainly. One task reads "unchanged apart
+    # from imports it genuinely needs", and its reference solution adds two --
+    # so a permission has to override the prohibition, or the gate rejects the
+    # correct answer.
+    _IMPORTS_PERMITTED = re.compile(
+        r"apart from (?:any )?imports|except (?:for )?(?:any )?imports"
+        r"|imports it (?:genuinely )?needs|add(?:ing)? (?:only )?the imports",
+        re.IGNORECASE)
     _NO_MATERIALISE = re.compile(
         r"do not materiali[sz]e|keep .{0,40}database-backed"
         r"|must not (?:be )?(?:fetch|load|materiali[sz]e)", re.IGNORECASE)
@@ -1486,7 +1545,7 @@ class InstructionParser:
             for label, pattern in self._FORBIDDEN_CONSTRUCTS.items():
                 if re.search(pattern, haystack, re.IGNORECASE):
                     constraints.append(label)
-        if self._NO_NEW_NAMES.search(self.flat):
+        if self._NO_NEW_NAMES.search(self.flat) and not self._IMPORTS_PERMITTED.search(self.flat):
             constraints.append("names the file does not import")
         if self._NO_MATERIALISE.search(self.flat):
             constraints.append("materialising rows in Python")
@@ -2341,6 +2400,39 @@ def generic_blocks(text: str) -> list[tuple[str, int, int, str]]:
     return blocks
 
 
+_RUBY_OPEN = re.compile(r"^(\s*)(?:def|class|module)\s+([A-Za-z_][\w.:?!=]*)")
+
+
+def ruby_definitions(text: str) -> list[tuple[str, int, int, str]]:
+    """`def`/`class`/`module` ... `end`, matched by indentation.
+
+    Ruby closes with `end`, not `}`, so the brace-counter that stands in for a
+    parser everywhere else finds nothing at all in a Ruby file -- not one
+    definition in any of the four Ruby tasks in the corpus, including the very
+    method their solutions change. That left both structural gates with nothing
+    to judge and the file outline empty.
+
+    Matching `end` at the opening line's indentation is the conventional
+    heuristic and holds for conventionally formatted source. It is deliberately
+    the whole of it: a definition this misses is simply not found, and every
+    caller treats "not found" as "cannot judge" rather than as a violation.
+    """
+    lines = text.splitlines()
+    found: list[tuple[str, int, int, str]] = []
+    for index, line in enumerate(lines):
+        opening = _RUBY_OPEN.match(line)
+        if not opening:
+            continue
+        indent, name = opening.group(1), opening.group(2)
+        kind = "class" if line.lstrip().startswith(("class", "module")) else "function"
+        closer = indent + "end"
+        for end_index in range(index + 1, len(lines)):
+            if lines[end_index].rstrip() == closer:
+                found.append((name, index + 1, end_index + 1, kind))
+                break
+    return found
+
+
 def slice_around(repo: Repository, relative: str, hot_lines: Sequence[int],
                  instruction: Instruction, *, budget_lines: int = 320) -> list[Slice]:
     """Pick the enclosing definitions of the interesting lines, or a window."""
@@ -2351,10 +2443,7 @@ def slice_around(repo: Repository, relative: str, hot_lines: Sequence[int],
     if total <= budget_lines:
         return [Slice(relative, 1, total, "whole file")]
 
-    if relative.endswith(".py"):
-        definitions = python_definitions(text)
-    else:
-        definitions = generic_blocks(text)
+    definitions = Checker._definitions(relative, text)
 
     chosen: list[Slice] = []
     used: set[tuple[int, int]] = set()
@@ -2463,10 +2552,7 @@ def file_outline(repo: Repository, relative: str, limit: int = 80) -> str:
     text = repo.read(relative)
     if text is None:
         return ""
-    if relative.endswith(".py"):
-        definitions = python_definitions(text)
-    else:
-        definitions = generic_blocks(text)
+    definitions = Checker._definitions(relative, text)
     if not definitions:
         return ""
     rows = [f"  L{start:<5} {kind:8} {name}" for name, start, _, kind in definitions[:limit]]
@@ -2523,7 +2609,15 @@ class DatabaseProbe:
         self.instruction = instruction
         self.targets: list[DatabaseTarget] = []
         self.notes: list[str] = []
+        # (host, port) -> when it last refused a connection. A host that just
+        # refused will refuse the next call too, and schema_for alone makes
+        # four; re-probing each of them costs the bound again for nothing.
+        # Remembered for a window rather than for the run, so a database that
+        # restarts mid-task comes back on its own.
+        self._refused: dict[tuple[str, str], float] = {}
         self._discover()
+
+    _REFUSAL_WINDOW = 30.0
 
     # -- discovery -------------------------------------------------------
     # A database is guaranteed to exist for every task, so "nothing found" is
@@ -2947,6 +3041,27 @@ class DatabaseProbe:
         if chosen is None:
             trace("DatabaseProbe.sql", "out", query=query, rows=0, note="no target")
             return "[no database target discovered]"
+        # Knock before speaking. Neither client below bounds name resolution:
+        # psql and urlopen both start their timeout after the host resolves, so
+        # an unresolvable hostname costs the resolver's own timeout -- measured
+        # at ~21s per call, and schema_for makes four of them, which turned a
+        # 1ms stage into 85 seconds of a 1500-second budget. _tcp_open is
+        # bounded through DNS and costs a millisecond when the host is there,
+        # so only an unreachable target ever pays for this.
+        door = (chosen.host, chosen.port)
+        refused_at = self._refused.get(door)
+        if refused_at is not None and time.monotonic() - refused_at < self._REFUSAL_WINDOW:
+            return f"[database unreachable: {chosen.host}:{chosen.port}]"
+        try:
+            reachable = self._tcp_open(chosen.host, int(chosen.port or 0), timeout=3.0)
+        except (TypeError, ValueError):
+            reachable = True                     # a port we cannot parse is not evidence
+        if not reachable:
+            self._refused[door] = time.monotonic()
+            trace("DatabaseProbe.sql", "out", query=query, target=target_url(chosen),
+                  note="host did not accept a connection")
+            return f"[database unreachable: {chosen.host}:{chosen.port}]"
+        self._refused.pop(door, None)
         started = time.monotonic()
         out = (self._clickhouse(chosen, query, timeout) if chosen.engine == "clickhouse"
                else self._postgres(chosen, query, timeout))
@@ -3023,7 +3138,8 @@ for row in rows[:200]:
     # Those are truthy, so they used to be rendered under a "Live schema
     # (columns and existing indexes)" header -- the prompt asserting it had
     # read the database when it had not.
-    _QUERY_ERROR = re.compile(r"^\s*\[(?:no |psql |clickhouse |could not )", re.IGNORECASE)
+    _QUERY_ERROR = re.compile(
+        r"^\s*\[(?:no |psql |clickhouse |could not |database unreachable)", re.IGNORECASE)
 
     @classmethod
     def _usable(cls, output: str) -> bool:
@@ -3247,7 +3363,7 @@ class Checker:
         self.candidates = list(candidates)
         # Probe signature -> (counts, fingerprint) for the unedited code, so
         # the baseline costs one shell run per run, not one per repair round.
-        self._baselines: dict[str, tuple[dict[int, int], list | None] | None] = {}
+        self._baselines: dict[str, tuple | None] = {}
 
     def run_all(self, changed: Sequence[str], *, include_tests: bool = True) -> list[CheckResult]:
         trace("Checker", "in", changed=changed, include_tests=include_tests,
@@ -3381,19 +3497,48 @@ class Checker:
             return CheckResult("syntax", False, "; ".join(problems))
         return CheckResult("syntax", True, "parsed")
 
+    @staticmethod
+    def _definitions(relative: str, text: str) -> list[tuple[str, int, int, str]]:
+        """Definitions in any language this agent can find them in.
+
+        Python gets a real parser; everything else gets the brace-counter,
+        which is approximate. Callers must treat an empty list as "cannot
+        judge", never as "nothing is defined here".
+        """
+        try:
+            if relative.endswith(".py"):
+                return python_definitions(text)
+            if relative.endswith((".rb", ".rake")):
+                return ruby_definitions(text)
+            return generic_blocks(text)
+        except Exception:
+            return []
+
     def check_single_method(self, changed: Sequence[str]) -> CheckResult:
-        """Enforce 'change only that method': everything else byte-identical."""
+        """Enforce 'change only that method': everything else byte-identical.
+
+        This used to skip every file that was not Python, which meant it fired
+        on none of the 21 JavaScript, Go and Ruby tasks in the corpus -- all 21
+        of which state the rule, and every one of whose graders enforces it
+        with a source digest and a signature check. Those tasks ran with four
+        checks where a Python task runs eight.
+
+        The brace-counter that stands in for a parser outside Python is
+        approximate, so the rule here is asymmetric on purpose. Finding no
+        enclosing block is treated as "cannot judge" and passes, because an
+        arrow function or a wrapped signature the counter cannot see would
+        otherwise fail a correct patch. Text changing *outside* a block the
+        counter did find is a real violation and still fails.
+        """
         for relative in changed:
-            if not relative.endswith(".py"):
-                continue
             original = self.repo.original(relative)
             current = self.repo.read(relative)
             if original is None or current is None:
                 continue
-            try:
-                current_defs = python_definitions(current)
-            except Exception:
-                continue
+            current_defs = self._definitions(relative, current)
+            python = relative.endswith(".py")
+            if not python and not current_defs:
+                continue                    # no definitions found: nothing to judge against
 
             original_lines = original.splitlines(keepends=True)
             current_lines = current.splitlines(keepends=True)
@@ -3408,6 +3553,34 @@ class Checker:
                 (name, start, end) for name, start, end, kind in current_defs
                 if kind != "class" and start <= first_line and last_line <= end
             ]
+            if not enclosing and not python:
+                # The finder outside Python is approximate, so "no enclosing
+                # definition" has two causes: the edit really is at top level,
+                # or it sits in a function the finder could not see (an arrow
+                # function, a wrapped signature). Indentation separates them.
+                # A require, an import block, an export list -- every top-level
+                # statement in these languages starts at column 0, and adding
+                # one is the most common way to fail these tasks. A line inside
+                # a function the finder missed is indented, and is left alone.
+                # Gated on the instruction actually forbidding new names. One
+                # task in the corpus permits imports outright -- "unchanged
+                # apart from imports it genuinely needs" -- and its reference
+                # solution adds two, so enforcing this everywhere would reject
+                # the correct answer. Only what the statement says is enforced.
+                if "names the file does not import" not in self.instruction.style_constraints:
+                    continue
+                top_level = [n for n in self._changed_lines(original, current)
+                             if n <= len(current_lines)
+                             and current_lines[n - 1].strip()
+                             and not current_lines[n - 1][:1].isspace()]
+                if not top_level:
+                    continue
+                return CheckResult(
+                    "single-method", False,
+                    f"{relative}: line {top_level[0]} is outside any function and was changed. "
+                    "The instruction bounds this change to one function, so imports, exports "
+                    "and every other top-level line must stay byte-identical -- build the fix "
+                    "from names the file already has.")
             if not enclosing:
                 return CheckResult(
                     "single-method", False,
@@ -3419,7 +3592,7 @@ class Checker:
             if original_lines[: start - 1] != current_lines[: start - 1]:
                 return CheckResult("single-method", False,
                                    f"{relative}: source above {name} changed")
-            before = next(((s0, e0) for n0, s0, e0, k0 in python_definitions(original)
+            before = next(((s0, e0) for n0, s0, e0, k0 in self._definitions(relative, original)
                            if n0 == name and k0 != "class"), None)
             if before and original_lines[before[1]:] != current_lines[end:]:
                 return CheckResult("single-method", False,
@@ -3532,6 +3705,22 @@ class Checker:
                 if message not in missing:
                     missing.append(message)
         return missing
+
+    @staticmethod
+    def _changed_lines(original: str, current: str) -> list[int]:
+        """1-indexed lines of `current` that the edit introduced.
+
+        _edited_line_range spans first-to-last, which merges two separate edits
+        into one region covering every untouched line between them. One
+        reference solution adds an import near the top and rewrites a function
+        near the bottom; judged as a single span it appeared to have rewritten
+        the declarations in between, which it does not touch.
+        """
+        matcher = difflib.SequenceMatcher(
+            None, original.splitlines(keepends=True), current.splitlines(keepends=True),
+            autojunk=False)
+        return [n + 1 for tag, _, _, j1, j2 in matcher.get_opcodes() if tag != "equal"
+                for n in range(j1, j2)]
 
     @staticmethod
     def _edited_line_range(original: str, current: str) -> tuple[int, int] | None:
@@ -3855,9 +4044,21 @@ else:
             call="\n".join(f"                {line}" for line in call.splitlines()),
             result=f"        _fp = _fingerprint({result})" if result else "        pass",
             small=small, large=large)
-        run = run_command([app_python(self.repo.root), manage, "shell", "-c", script],
+        interpreter = app_python(self.repo.root)
+        run = run_command([interpreter, manage, "shell", "-c", script],
                           timeout=min(300.0, max(60.0, remaining_seconds() - 200)))
         stdout = run.stdout or ""
+        # A probe that says nothing at all is the one failure with no evidence
+        # in it. Every path through the script prints something -- the counts,
+        # or the traceback -- and run_command labels its own timeouts and
+        # exec failures, so silence means the process died without writing:
+        # killed by a signal, or a shell that never ran the code. Reporting
+        # only "the probe produced no query count" left a real run with
+        # nothing to diagnose from, so say what little there is to say.
+        if not stdout.strip():
+            stdout = (f"[the probe wrote nothing and exited {run.returncode}; "
+                      f"a negative status is a signal, and 127 or 126 means "
+                      f"{interpreter} could not run {manage}]")
         fingerprint = None
         found = re.search(r"RIDGES_QR(\[.*\])", stdout)
         if found:
@@ -3908,21 +4109,44 @@ else:
         # that the delta is a luxury and the time belongs to the fix.
         if remaining_seconds() < 420:
             return None
+        ran, measured = self._with_original_source(
+            lambda: self._probe_run(manage, setup, call, result, small, large))
+        if not ran:
+            return None
+        # Remember the attempt even if it failed, so a baseline that cannot be
+        # taken is not re-taken on every subsequent round.
+        self._baselines[signature] = None
+        counts, fingerprint, _ = measured
+        if counts is None:
+            return None
+        self._baselines[signature] = (counts, fingerprint)
+        return self._baselines[signature]
+
+    def _with_original_source(self, action):
+        """Run `action()` against the code as it was before the edit.
+
+        Revert, act, put the edit back. Safe because the edit is read off disk
+        first and because everything measured this way only reads. Restoring
+        happens in a `finally`, so an action that times out or raises cannot
+        cost us the patch.
+
+        Returns `(False, None)` when there is nothing to revert or the edit
+        could not be read back -- never a partial restore. The caller has to
+        distinguish that from an action that ran and produced nothing, because
+        only the second is worth remembering as attempted.
+        """
         edited: dict[str, str | None] = {}
         for relative in self.repo.changed_files():
             path = self.repo.root / relative
             try:
                 edited[relative] = read_source(path) if path.exists() else None
             except (OSError, UnicodeDecodeError):
-                return None          # cannot put it back, so do not take it away
+                return False, None   # cannot put it back, so do not take it away
         if not edited:
-            return None
-        # Remember the attempt even if it fails, so a baseline that cannot be
-        # taken is not re-taken on every subsequent round.
-        self._baselines[signature] = None
+            return False, None
         try:
             self.repo.revert_all()
-            counts, fingerprint, _ = self._probe_run(manage, setup, call, result, small, large)
+            value = action()
         finally:
             for relative, text in edited.items():
                 try:
@@ -3932,14 +4156,23 @@ else:
                     else:
                         self.repo.write(relative, text)
                 except OSError as exc:
-                    log(f"WARNING: could not restore {relative} after the baseline "
-                        f"probe ({exc}); the patch may be incomplete")
-        if counts is None:
-            return None
-        self._baselines[signature] = (counts, fingerprint)
-        return self._baselines[signature]
+                    log(f"WARNING: could not restore {relative} after measuring the "
+                        f"original ({exc}); the patch may be incomplete")
+        return True, value
 
     def measure_query_scaling(self, probe: dict) -> CheckResult | None:
+        """Measure the database work this change performs, on either engine.
+
+        The two engines are graded on different numbers and expose them in
+        different places, so there are two measurements rather than one with
+        branches inside it. Both answer the same question and both report under
+        the same check name, because `solve` treats a failure here as evidence
+        the fix is wrong -- worth a repair round and a change of model family --
+        and that is true whichever engine produced it.
+        """
+        return self._measure_django_queries(probe) or self._measure_clickhouse_work(probe)
+
+    def _measure_django_queries(self, probe: dict) -> CheckResult | None:
         """Run the model's probe at two sizes and compare query counts."""
         setup = (probe.get("setup") or "").strip()
         call = (probe.get("call") or "").strip()
@@ -3960,9 +4193,7 @@ else:
             manage, setup, call, result_expr, small, large)
         if counts is None:
             return CheckResult("query scaling", True,
-                               f"the probe produced no query count, so the database work this "
-                               f"change performs is unmeasured. Output was:\n"
-                               f"{truncate(stdout, 2000)}", verified=False)
+                               self._probe_failed(stdout), verified=False)
 
         trace("measure_query_scaling", "out", counts=counts,
               limit=self.instruction.targets.get("max_queries"))
@@ -3970,6 +4201,23 @@ else:
         if low is None or high is None:
             return CheckResult("query scaling", True, f"incomplete measurement: {counts}",
                                verified=False)
+        # A probe whose call selected nothing counted a path the task does not
+        # take. Measured: a probe matching no rows made the guard at the top of
+        # the method return early, so it issued three statements where the real
+        # selection issues four -- under the stated limit of three, reported as
+        # bounded, and the run stopped at 43% of its budget on a patch that
+        # fails. Two empty results also compare equal, so the differential
+        # below would have confirmed "unchanged" on nothing at all.
+        if fingerprint is not None and not fingerprint:
+            return CheckResult(
+                "query scaling", True,
+                f"the probe ran but `result` came back empty, so `call` selected no rows. The "
+                f"counts it produced ({low} at N={small}, {high} at N={large}) are of a "
+                f"short-circuit path, not the one the task exercises, and two empty results "
+                f"prove nothing about whether the rows still match. Build fixtures in `setup` "
+                f"that the code actually selects, exercise it the way the task's own tests do "
+                f"-- through the same entry point, with the same kind of argument -- and make "
+                f"sure `result` comes back non-empty.", verified=False)
 
         # Now the same measurement on the code we started from.
         baseline = self._baseline_probe(manage, setup, call, result_expr, small, large)
@@ -4015,6 +4263,36 @@ else:
             detail += f"; `result` unchanged ({len(fingerprint)} item(s))"
         return CheckResult("query scaling", True, detail + (f" (limit {limit})" if limit else ""))
 
+    _EXCEPTION = re.compile(r"^(?:[\w.]+(?:Error|Exception|Warning)|\w+Error)\b.*$", re.MULTILINE)
+
+    @classmethod
+    def _probe_failed(cls, stdout: str) -> str:
+        """Why nothing was measured, phrased as something the model can fix.
+
+        This used to open with "the probe produced no query count" and then
+        paste the output -- which reads as "the harness could not run your
+        probe" when what actually happened is that the probe itself raised.
+        Measured on three runs of one task: the model was told the number was
+        missing, was asked for a probe it had already supplied, and sent the
+        same broken one back. The exception was in the text the whole time,
+        under a 2,000-character traceback whose middle gets elided.
+
+        So lead with the exception line and name the field the model has to
+        correct. The traceback still follows for anyone who needs it.
+        """
+        raised = cls._EXCEPTION.findall(stdout or "")
+        if raised:
+            return ("the `measure` probe itself raised, so the database work this change "
+                    "performs was never measured -- this says nothing about whether the edit "
+                    f"is right. Fix the probe, not the patch:\n\n    {truncate(raised[-1], 600)}"
+                    "\n\nCheck that `call` passes arguments the code actually accepts: a field "
+                    "name must be one the model defines, and a filterset method takes the "
+                    "field it filters on, not its own parameter name. Reply with the same "
+                    "edit and a corrected `measure`.\n\nFull output:\n"
+                    + truncate(stdout, 1500))
+        return (f"the probe produced no query count, so the database work this change performs "
+                f"is unmeasured. Output was:\n{truncate(stdout, 2000)}")
+
     @staticmethod
     def _differential_failure(before: list, after: list) -> str:
         """Say what the two `result` values disagree about, not just that they do.
@@ -4040,6 +4318,154 @@ else:
                    "does not rewind. Supply a `result` expression that does not depend on ids.")
         return detail
 
+    # -- measuring database work on ClickHouse ---------------------------
+    # ClickHouse is graded on the data a query reads, not on how many
+    # statements it issues, and its hidden tests read exactly that out of
+    # system.query_log: statements, read_rows and result_rows for the queries
+    # the application issued. There is no CaptureQueriesContext to borrow and
+    # the application need not be Python at all -- every ClickHouse app in the
+    # corpus is Node -- so the measurement is taken from the server side,
+    # around a shell command that exercises the change once.
+    #
+    # Two details this gets right that the obvious version does not.
+    #
+    # The watermark is read from the server (`now64(3)`), never from this
+    # container's clock. The two need not agree, and a skewed watermark either
+    # drops the queries being measured or picks up somebody else's.
+    #
+    # And it excludes this agent's own statements twice over. `SYSTEM FLUSH
+    # LOGS` is issued after the watermark and is itself logged, so without
+    # `NOT ILIKE 'SYSTEM %'` every measurement would count one statement that
+    # the application never made; the `system.` test then drops the summary
+    # query and anything else reading the server's own tables.
+    _CH_WORK = (
+        "SELECT count(), sum(read_rows), sum(result_rows) FROM system.query_log "
+        "WHERE type = 'QueryFinish' "
+        "AND event_time_microseconds >= toDateTime64('{marker}', 3) "
+        "AND query NOT ILIKE 'SYSTEM %' "
+        "AND positionCaseInsensitive(query, 'system.') = 0{user}")
+
+    def _clickhouse_ready(self) -> bool:
+        return bool(self.probe and self.probe.available()
+                    and self.probe.targets[0].engine == "clickhouse")
+
+    def _clickhouse_measure(self, command: str) -> tuple[dict | None, str]:
+        """Run the command once and read what ClickHouse did for it.
+
+        Returns (work, output). `work` carries statements, read_rows and
+        result_rows, or is None when the command failed or the log could not be
+        read -- in which case `output` says why, in words the model can act on.
+        """
+        marker = ((self.probe.sql("SELECT now64(3)") or "").strip().splitlines() or [""])[0].strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?", marker):
+            return None, f"the server's clock could not be read: {truncate(marker, 200)}"
+        run = run_command(command, timeout=min(300.0, max(60.0, remaining_seconds() - 200)))
+        if run.returncode != 0:
+            return None, (f"the command exited {run.returncode}:\n"
+                          f"{truncate(run.stdout, 1500)}")
+        self.probe.sql("SYSTEM FLUSH LOGS")
+        user = self.probe.targets[0].user or ""
+        summary = self.probe.sql(self._CH_WORK.format(
+            marker=marker,
+            user=f" AND user = '{user}'" if re.fullmatch(r"[\w.$-]+", user) else ""))
+        first = ((summary or "").strip().splitlines() or [""])[0]
+        numbers = re.findall(r"\d+", first)
+        if len(numbers) < 3 or numbers[0] == "0":
+            return None, ("ClickHouse logged no queries for that command, so it may not have "
+                          "reached the database at all. The command's own output was:\n"
+                          + truncate(run.stdout, 1000))
+        work = dict(zip(("statements", "read_rows", "result_rows"),
+                        (int(value) for value in numbers[:3])))
+        trace("clickhouse_work", "out", command=command, **work)
+        return work, run.stdout or ""
+
+    def _clickhouse_baseline(self, command: str) -> tuple[dict, str] | None:
+        """The same command, run against the code as it was before the edit."""
+        signature = "clickhouse:" + hashlib.sha1(command.encode()).hexdigest()
+        if signature in self._baselines:
+            return self._baselines[signature]
+        if remaining_seconds() < 420:
+            return None
+        ran, measured = self._with_original_source(lambda: self._clickhouse_measure(command))
+        if not ran:
+            return None
+        self._baselines[signature] = None
+        work, output = measured
+        if work is None:
+            return None
+        self._baselines[signature] = (work, output)
+        return self._baselines[signature]
+
+    # Part merges move granule boundaries, so two runs of an unchanged query
+    # need not read byte-identical row counts. A tenth is far below any real
+    # regression and far above that noise.
+    _CH_NOISE = 1.1
+
+    def _measure_clickhouse_work(self, probe: dict) -> CheckResult | None:
+        """Compare the data ClickHouse reads either side of the change.
+
+        The failure this catches is the one the counts cannot: a rewrite whose
+        rows are right and whose reads went up is strictly worse than the code
+        it replaced, and a rewrite whose reads went down but whose rows changed
+        is not an optimisation at all. Neither needs the task classified, and
+        neither needs a budget this agent has no way to know -- both follow
+        from comparing the command against itself before the edit.
+        """
+        command = " ".join((probe.get("command") or "").split())
+        if not command or not self._clickhouse_ready():
+            return None
+        work, output = self._clickhouse_measure(command)
+        if work is None:
+            return CheckResult("query scaling", True,
+                               "the data this change reads was not measured, so the work it "
+                               "performs is unknown: " + output, verified=False)
+        # The same hole on this side: a command that prints nothing compares
+        # equal to itself before and after, and would confirm the rows are
+        # unchanged without ever having seen one.
+        if not self._flatten(output):
+            return CheckResult(
+                "query scaling", True,
+                f"the command ran and printed nothing, so there is no result to compare across "
+                f"the change and the {work['read_rows']:,} rows it read are of a path that "
+                f"returned no output. Exercise the change the way the task's own tests do and "
+                f"have the command print what it returns.", verified=False)
+
+        baseline = self._clickhouse_baseline(command)
+        before, before_output = baseline if baseline else (None, None)
+        if before is None:
+            return CheckResult("query scaling", True,
+                               f"{work['statements']} statement(s), {work['read_rows']:,} rows "
+                               f"read, {work['result_rows']:,} returned")
+
+        delta = (f"{before['read_rows']:,} -> {work['read_rows']:,} rows read, "
+                 f"{before['statements']} -> {work['statements']} statement(s), "
+                 f"{work['result_rows']:,} rows returned")
+        if self._flatten(before_output) != self._flatten(output):
+            return CheckResult("query scaling", False,
+                               self._output_changed(before_output, output) + f" ({delta})")
+        # Same answer, more work. No correctness argument can justify that, so
+        # this needs no view on what kind of task it is.
+        if work["read_rows"] > before["read_rows"] * self._CH_NOISE:
+            return CheckResult(
+                "query scaling", False,
+                f"this change returns exactly what the code it replaced returned, and reads "
+                f"more data to do it: {delta}. Read the plan of the new statement and find "
+                f"what it scans that the old one did not -- a missing PREWHERE, a predicate "
+                f"that no longer matches the primary key order, or a table it now reads whole.")
+        return CheckResult("query scaling", True, delta)
+
+    @staticmethod
+    def _flatten(text: str) -> str:
+        return " ".join((text or "").split())
+
+    @staticmethod
+    def _output_changed(before: str, after: str) -> str:
+        """What the command printed either side of the edit, when they differ."""
+        return (f"this change altered what the command returns. Reducing the work is only "
+                f"correct if the rows come back the same.\n  before: "
+                f"{truncate(Checker._flatten(before), 600)}\n  after:  "
+                f"{truncate(Checker._flatten(after), 600)}")
+
     def unmeasured_bounded_work(self, supplied: dict) -> CheckResult | None:
         """A bounded-work task with no probe is unmeasured, not finished.
 
@@ -4054,7 +4480,18 @@ else:
         Silent when the project has no Django runner: there is no measurement to
         ask for, and asking would spend a call on something the model cannot give.
         """
-        if not self.instruction.bounded_work or (supplied or {}).get("call"):
+        supplied = supplied or {}
+        # On ClickHouse the unmeasured number is how much each statement reads,
+        # not how many are issued, and the guard has to ask for the thing that
+        # engine can actually be asked for.
+        if self._clickhouse_ready():
+            if supplied.get("command") or not self.instruction.reduces_work:
+                return None
+            return CheckResult(
+                "query scaling", True,
+                "this task asks the query to read less data, and no `measure` command was "
+                "supplied, so the amount it reads was never taken", verified=False)
+        if not self.instruction.bounded_work or supplied.get("call"):
             return None
         if not any(Path(p).name == "manage.py" and p.count("/") <= 2 for p in self.repo.files):
             return None
@@ -4363,6 +4800,14 @@ code without removing work.
 both versions and compared, which is the only evidence that fewer statements \
 still return the same rows. Make it independent of database ids -- the two \
 runs are separate transactions, so ids do not repeat.
+  On ClickHouse, and in any project without a Django shell, give a shell \
+command instead:
+    "measure": {"command": "<one command that exercises the change and prints its result>"}
+  The agent runs it on your edit and again on the code it replaced, reads from \
+the server how many statements each version issued and how many rows each one \
+read, and compares what the command printed. Fewer rows read with the same \
+output is the improvement; more rows read with the same output is a \
+regression, and different output is a broken rewrite.
 * To create a new file instead, use {"path": ..., "new_file": true, \
 "content": "<full text>"}.
 * Escape newlines properly -- the whole reply must parse as JSON."""
@@ -4454,13 +4899,25 @@ class PromptBuilder:
             facts.append("the instruction names no file to edit: the candidates below are this "
                          "agent's ranking, not the task's -- identify which one actually issues "
                          "the query, and fill `constraints` with what the instruction does permit")
-        if ("bounded_queries" in self.instruction.kinds
-                or self.instruction.targets.get("max_queries")):
+        # Which probe to ask for is decided by the engine, not by the shape of
+        # the task. A ClickHouse task that happens to read as bounded_queries
+        # would otherwise be asked for a Django `call` it has no shell to run,
+        # and the ask would be unanswerable rather than merely unnecessary.
+        clickhouse = (self.probe.available()
+                      and self.probe.targets[0].engine == "clickhouse")
+        if not clickhouse and ("bounded_queries" in self.instruction.kinds
+                               or self.instruction.targets.get("max_queries")):
             facts.append("supply a `measure` probe with your edit: this agent runs it at two "
                          "selection sizes, before and after your change, and reports both counts "
                          "back to you -- so a fix that still scales with input, or that does not "
                          "actually issue fewer statements than the code it replaced, is caught "
                          "before you finish")
+        elif clickhouse and self.instruction.reduces_work:
+            facts.append("supply `measure.command` with your edit -- one shell command that "
+                         "exercises the change and prints its result. This agent runs it on your "
+                         "edit and on the code it replaced, and reports how many rows ClickHouse "
+                         "read for each, so a rewrite that reads more than what it replaced, or "
+                         "returns something different, is caught before you finish")
         # What this agent tried to read and could not. The model has the same
         # statement in front of it and can simply be asked -- which is cheaper
         # and far more reliable than the parser silently defaulting.
@@ -4631,7 +5088,16 @@ _READ_ONLY_START = re.compile(
 _MUTATING = re.compile(
     r"\b(INSERT|UPDATE|DELETE|MERGE|UPSERT|REPLACE|CREATE|ALTER|DROP|TRUNCATE|RENAME|GRANT|REVOKE"
     r"|COPY|VACUUM|ANALYZE\s+\w|REINDEX|CLUSTER|LOCK|SET\s+(?!TRANSACTION)|RESET|DO|CALL|EXECUTE"
-    r"|OPTIMIZE|ATTACH|DETACH|KILL|SYSTEM|INTO\s+OUTFILE|pg_terminate|pg_cancel|lo_)\b",
+    # `SYSTEM` must not match the `system.` database. ClickHouse keeps its
+    # introspection there -- system.tables, system.parts, system.query_log --
+    # which is exactly where a ClickHouse engineer looks and exactly what this
+    # agent measures work with, and reading it mutates nothing. Without the
+    # lookahead the word boundary lands on the dot and every one of those
+    # SELECTs was refused, while PostgreSQL's pg_indexes and information_schema
+    # were readable throughout. The `SYSTEM ...` command itself is still denied:
+    # it is followed by a verb, not a dot.
+    r"|OPTIMIZE|ATTACH|DETACH|KILL|SYSTEM\b(?!\s*\.)|INTO\s+OUTFILE"
+    r"|pg_terminate|pg_cancel|lo_)\b",
     re.IGNORECASE)
 
 
@@ -5161,14 +5627,19 @@ class Solver:
                     log("still unmeasured after one request; adopting the patch as best effort")
                     return patch
                 names = ", ".join(check.name for check in unmeasured)
+                raised = any("probe itself raised" in check.detail for check in unmeasured)
                 feedback += (
                     f"\n\nEvery check passed, but {names} could not run, so the database work "
                     "this change performs was never measured -- and that measurement is what "
-                    "the task is about. Reply with the same diagnosis and a `measure` probe "
-                    "that reports: `setup` creating the objects the call needs, `call` a single "
-                    "line using N as the selection size. If the count cannot be reduced further, "
-                    "look again for work the new query makes redundant -- a guard or a lookup "
-                    "the set-based form no longer needs.")
+                    "the task is about. " + (
+                        "The probe you supplied is the thing that failed; the detail above "
+                        "names the exception. Send the same edit again with `measure` corrected."
+                        if raised else
+                        "Reply with the same diagnosis and a `measure` probe that reports: "
+                        "`setup` creating the objects the call needs, `call` a single line "
+                        "using N as the selection size.") +
+                    " If the count cannot be reduced further, look again for work the new query "
+                    "makes redundant -- a guard or a lookup the set-based form no longer needs.")
                 messages.append({"role": "user", "content": feedback})
                 continue
 

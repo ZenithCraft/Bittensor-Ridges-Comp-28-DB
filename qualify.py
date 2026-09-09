@@ -339,17 +339,43 @@ def run_live_sweep(model: str | None, tasks: list[str]) -> None:
 
 
 def layer_db_work() -> Layer:
+    """What the agent can find out about the database work a patch performs.
+
+    Read as a parity table. The bench is two engines, graded on two different
+    numbers -- statements issued on PostgreSQL, rows read on ClickHouse -- and
+    for a long time only the PostgreSQL column existed, so every ClickHouse
+    task shipped with the number it is judged on never taken. Each row here
+    names a capability and asserts it on both sides, so a gap shows up as a
+    missing half rather than as an absence nobody notices.
+    """
     layer = Layer(6, "Database-work measurement")
     source = AGENT.read_text()
-    layer.add("EXPLAIN (ANALYZE, BUFFERS" in source, "can EXPLAIN with buffers (PostgreSQL)")
-    layer.add("EXPLAIN indexes = 1" in source, "can EXPLAIN on ClickHouse")
-    layer.add("information_schema.columns" in source, "reads live column metadata")
+
+    def both(name, postgres, clickhouse, detail=""):
+        layer.add(postgres in source, f"{name} -- PostgreSQL", detail)
+        layer.add(clickhouse in source, f"{name} -- ClickHouse", detail)
+
+    both("reads the query plan", "EXPLAIN (ANALYZE, BUFFERS", "EXPLAIN indexes = 1")
+    both("reads live schema", "information_schema.columns", "SHOW CREATE TABLE")
+    both("measures the work a change performs",
+         "_measure_django_queries", "_measure_clickhouse_work",
+         "statements issued; rows read")
+    both("measures the code it replaced, not just the edit",
+         "_baseline_probe", "_clickhouse_baseline")
+    both("checks the rewrite still returns the same rows",
+         "_differential_failure", "_output_changed")
+    both("says so when it could not measure at all",
+         "this task is about the number of statements",
+         "this task asks the query to read less data")
+    layer.add("_with_original_source" in source,
+              "reverts and restores around every baseline", "shared by both engines")
     layer.add("pg_indexes" in source, "reads existing indexes")
-    layer.add("SHOW CREATE TABLE" in source, "reads ClickHouse DDL")
     layer.add("clickhouse" in source.lower() and "8123" in source, "reaches ClickHouse over HTTP")
-    layer.add("measure_query_scaling" in source, "measures query-count scaling itself",
-              "CaptureQueriesContext at two selection sizes")
     layer.add("system.query_log" in source, "reads ClickHouse read_rows/read_bytes")
+    # Neither client bounds name resolution, so an unreachable host used to
+    # cost the resolver's timeout on every call -- 85s of a 1500s budget.
+    layer.add("database unreachable" in source,
+              "bounds an unreachable database instead of waiting on DNS")
     layer.add("check_protected" in source, "refuses to edit tests, fixtures and migrations")
     return layer
 

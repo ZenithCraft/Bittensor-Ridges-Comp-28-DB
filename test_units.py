@@ -1822,6 +1822,784 @@ class TestTheRewriteMustReturnTheSameRows(unittest.TestCase):
                          "nothing to evaluate, so nothing emitted")
 
 
+class TestTheGraderStartsWhateverTheTaskShips(unittest.TestCase):
+    """grade.py could not grade a ClickHouse task at all.
+
+    Its compose overlay named postgres and redis outright, so on a task whose
+    stack is a single clickhouse service it wrote a file referring to services
+    that do not exist -- and the true grader, the one harness that reports the
+    real reward, was unavailable on a third of the corpus. Reading the names
+    out of the task's own compose file needs no list to keep up to date.
+    """
+
+    def setUp(self):
+        import grade
+        self.grade = grade
+
+    def write(self, body):
+        path = Path(tempfile.mkdtemp()) / "docker-compose.yaml"
+        path.write_text(textwrap.dedent(body))
+        return path
+
+    def test_it_reads_a_postgres_stack(self):
+        compose = self.write("""
+            services:
+              postgres:
+                image: postgres:16
+                healthcheck:
+                  test: ["CMD", "pg_isready"]
+              redis:
+                image: redis
+                healthcheck:
+                  test: ["CMD", "redis-cli", "ping"]
+        """)
+        self.assertEqual(self.grade.sidecars(compose), {"postgres": True, "redis": True})
+
+    def test_it_reads_a_clickhouse_stack(self):
+        compose = self.write("""
+            services:
+              clickhouse:
+                build:
+                  context: .
+                healthcheck:
+                  test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
+        """)
+        self.assertEqual(self.grade.sidecars(compose), {"clickhouse": True})
+
+    def test_the_verifier_is_not_its_own_sidecar(self):
+        compose = self.write("""
+            services:
+              verifier:
+                build:
+                  context: .
+              clickhouse:
+                image: clickhouse
+        """)
+        self.assertEqual(self.grade.sidecars(compose), {"clickhouse": False})
+
+    def test_a_service_without_a_healthcheck_is_only_waited_on_for_start(self):
+        # depends_on: service_healthy on a service that never reports health
+        # hangs until the timeout, which reads as a broken task rather than a
+        # broken overlay.
+        overlay = self.grade.overlay_for({"clickhouse": False, "postgres": True})
+        self.assertIn("clickhouse:\n        condition: service_started", overlay)
+        self.assertIn("postgres:\n        condition: service_healthy", overlay)
+
+    def test_a_stack_with_no_sidecars_declares_no_dependencies(self):
+        self.assertNotIn("depends_on", self.grade.overlay_for({}))
+
+    def test_the_real_tasks_resolve(self):
+        for task, expected in (("fast-tasks/pg-netbox-ipaddress-device-filter-001",
+                                {"postgres", "redis"}),
+                               ("local-tasks/ch-metrics-rollup-008-test", {"clickhouse"})):
+            compose = Path(task) / "tests" / "docker-compose.yaml"
+            if not compose.is_file():
+                continue                      # the corpus is not always checked out
+            self.assertEqual(set(self.grade.sidecars(compose)), expected, task)
+
+
+class TestAnUnreachableDatabaseIsCheapToDiscover(unittest.TestCase):
+    """Neither client bounds name resolution, and it cost 85 seconds.
+
+    psql and urlopen both start their timeout after the hostname resolves, so
+    an unresolvable host costs the resolver's own timeout -- ~21s per call.
+    schema_for makes four, which turned a one-millisecond stage into 85 seconds
+    of a 1500-second budget. Every ClickHouse task reaches its database over
+    HTTP, so this was the ClickHouse side of a hazard the TCP probe had already
+    been hardened against.
+    """
+
+    def probe(self, *, open_port):
+        probe = agent.DatabaseProbe.__new__(agent.DatabaseProbe)
+        probe.targets = [agent.DatabaseTarget(engine="clickhouse", host="nowhere",
+                                              port="8123", database="metrics")]
+        probe._refused = {}
+        probe.knocks = []
+        probe._tcp_open = lambda host, port, timeout=1.0: (
+            probe.knocks.append((host, port)) or open_port)
+        return probe
+
+    def test_a_closed_port_is_reported_rather_than_waited_on(self):
+        probe = self.probe(open_port=False)
+        answer = probe.sql("SHOW CREATE TABLE request_events")
+        self.assertIn("unreachable", answer)
+        self.assertFalse(agent.DatabaseProbe._usable(answer),
+                         "and it must never be rendered as if it were schema")
+
+    def test_a_host_that_just_refused_is_not_knocked_on_again(self):
+        # schema_for alone makes four calls; each one paying the bound again
+        # buys nothing, because a host that just refused will refuse the next.
+        probe = self.probe(open_port=False)
+        for _ in range(4):
+            probe.sql("SHOW CREATE TABLE request_events")
+        self.assertEqual(len(probe.knocks), 1)
+
+    def test_a_database_that_comes_back_is_used_again(self):
+        # Remembered for a window, not for the run: a sidecar that restarts
+        # mid-task must not be written off for the rest of it.
+        probe = self.probe(open_port=False)
+        probe.sql("SELECT 1")
+        probe._refused[("nowhere", "8123")] -= agent.DatabaseProbe._REFUSAL_WINDOW + 1
+        probe._tcp_open = lambda host, port, timeout=1.0: True
+        probe._clickhouse = lambda target, query, timeout: "back\n"
+        self.assertEqual(probe.sql("SELECT 1"), "back\n")
+        self.assertEqual(probe._refused, {}, "and the refusal is forgotten")
+
+    def test_an_open_port_is_queried_normally(self):
+        probe = self.probe(open_port=True)
+        probe._clickhouse = lambda target, query, timeout: "metrics\n"
+        self.assertEqual(probe.sql("SHOW TABLES"), "metrics\n")
+
+
+class TestDiscoveryCannotResurrectAnExcludedModel(unittest.TestCase):
+    """The roster put a model back that measurement had thrown out.
+
+    LADDER leaves deepseek-v4-flash out on evidence: two real tasks, no content
+    either time even with the cap removed, 551s spent producing nothing. But
+    roster() appends every model the platform allows, and in production
+    discover_models succeeds -- so the excluded model came back at position 4
+    on every round, each appearance burning a whole completion cap to return
+    nothing. Locally discovery usually finds nothing and the built-in roster is
+    used, so it never appeared: invisible where it is tested, live where it is
+    graded.
+    """
+
+    def llm(self, discovered):
+        llm = agent.LLM.__new__(agent.LLM)
+        llm.discovered = list(discovered)
+        llm.unsupported = set()
+        return llm
+
+    def test_an_excluded_model_is_not_tried_even_when_the_platform_allows_it(self):
+        allowed = sorted(list(agent.MODELS) + ["deepseek/deepseek-v4-flash"])
+        self.assertNotIn("deepseek/deepseek-v4-flash",
+                         self.llm(allowed).roster(agent.LADDER[0]))
+
+    def test_it_is_not_tried_when_discovery_finds_nothing_either(self):
+        self.assertNotIn("deepseek/deepseek-v4-flash",
+                         self.llm([]).roster(agent.LADDER[0]))
+
+    def test_an_excluded_model_named_in_a_tier_is_still_dropped(self):
+        # Belt and braces: the filter is on the roster, so a tier that named
+        # one could not smuggle it back in either.
+        roster = self.llm([]).roster(["deepseek/deepseek-v4-flash",
+                                      "deepseek/deepseek-v4-pro-0813"])
+        self.assertNotIn("deepseek/deepseek-v4-flash", roster)
+        self.assertEqual(roster[0], "deepseek/deepseek-v4-pro-0813")
+
+    def test_the_tail_is_ordered_by_capability_not_by_name(self):
+        # MODELS is written strongest-first. Sorting by name put gemma
+        # (coding 43, agentic 14) ahead of kimi-k2.6 (coding 62).
+        roster = self.llm(sorted(agent.MODELS)).roster(agent.LADDER[0])
+        self.assertLess(roster.index("moonshotai/kimi-k2.6"),
+                        roster.index("google/gemma-4-31b-it"))
+
+    def test_a_model_the_table_does_not_know_is_tried_last(self):
+        # Discovery exists so a newly allowed model can be used; it just does
+        # not get to outrank one whose capability has been measured.
+        roster = self.llm(list(agent.MODELS) + ["aaa/brand-new"]).roster(agent.LADDER[0])
+        self.assertEqual(roster[-1], "aaa/brand-new")
+
+    def test_every_allowed_model_still_reaches_the_roster(self):
+        allowed = list(agent.MODELS) + ["aaa/brand-new", "zzz/other"]
+        self.assertEqual(set(self.llm(allowed).roster(agent.LADDER[0])), set(allowed))
+
+
+class TestSingleMethodGatesEveryLanguage(unittest.TestCase):
+    """21 of 21 non-Python tasks state the rule; the gate fired on none of them.
+
+    `single_method` parses true on every JavaScript, Go and Ruby task in the
+    corpus, and every one of their graders enforces it with a source digest and
+    a signature check. But check_single_method skipped any file that was not
+    Python, so those tasks ran with four checks where a Python task runs eight.
+
+    Validated against all 21 reference solutions: accepted 21, rejected 0, with
+    definitions actually resolved for all 21 -- so it cannot reject a correct
+    patch on this corpus, and it is not passing them vacuously either.
+    """
+
+    JS = ("const db = require('./db');\n"
+          "\n"
+          "async function report(a, b) {\n"
+          "  const rows = await db.query('SELECT 1');\n"
+          "  return rows;\n"
+          "}\n"
+          "\n"
+          "module.exports = { report };\n")
+    GO = ("package feed\n"
+          "\n"
+          "import \"database/sql\"\n"
+          "\n"
+          "func Recent(db *sql.DB) ([]Entry, error) {\n"
+          "\trows, err := db.Query(\"SELECT 1\")\n"
+          "\treturn nil, err\n"
+          "}\n")
+    RB = ("module Reports\n"
+          "  module_function\n"
+          "\n"
+          "  def rows(on:)\n"
+          "    Member.where(day: on).pluck(:id)\n"
+          "  end\n"
+          "end\n")
+
+    def gate(self, name, text, edited, *, frozen_imports=True):
+        repo = make_repo({name: text})
+        repo.write(name, edited)
+        checker = agent.Checker(repo, agent.Instruction(
+            text="", single_method=True,
+            style_constraints=["names the file does not import"] if frozen_imports else []))
+        return checker.check_single_method([name])
+
+    # -- the edit the task asks for ---------------------------------------
+    def test_an_edit_inside_the_function_passes(self):
+        for name, text, old, new in (
+                ("app.js", self.JS, "SELECT 1", "SELECT 2"),
+                ("feed.go", self.GO, "SELECT 1", "SELECT 2"),
+                ("rows.rb", self.RB, "pluck(:id)", "distinct.pluck(:id)")):
+            self.assertTrue(self.gate(name, text, text.replace(old, new)).passed, name)
+
+    # -- the edit the grader fails you for --------------------------------
+    def test_touching_the_imports_is_caught_in_every_language(self):
+        # "use only names the file already requires" -- adding one is the
+        # single most common way to lose these tasks.
+        for name, text, old, new in (
+                ("app.js", self.JS, "const db = require('./db');",
+                 "const db = require('./db');\nconst util = require('util');"),
+                ("feed.go", self.GO, 'import "database/sql"',
+                 'import (\n\t"database/sql"\n\t"fmt"\n)'),
+                ("rows.rb", self.RB, "module Reports", "require 'date'\nmodule Reports")):
+            result = self.gate(name, text, text.replace(old, new))
+            self.assertFalse(result.passed, f"{name} should have been caught")
+
+    def test_a_task_that_permits_imports_is_left_alone(self):
+        # One task reads "unchanged apart from imports it genuinely needs" and
+        # its reference solution adds two. Enforcing the rule everywhere would
+        # reject the correct answer, so only what the statement says is
+        # enforced -- this is the case that caught the over-reach.
+        edited = self.JS.replace("const db = require('./db');",
+                                 "const db = require('./db');\nconst util = require('util');")
+        self.assertTrue(self.gate("app.js", self.JS, edited, frozen_imports=False).passed)
+
+    def test_changing_code_below_the_function_is_caught(self):
+        result = self.gate("app.js", self.JS,
+                           self.JS.replace("module.exports = { report };",
+                                           "module.exports = { report, extra: 1 };"))
+        self.assertFalse(result.passed)
+
+    # -- and it never guesses ---------------------------------------------
+    def test_a_file_it_cannot_read_is_skipped_rather_than_failed(self):
+        # The finder outside Python is approximate. An arrow function or a
+        # wrapped signature it cannot see must not fail a correct patch, so
+        # finding nothing means "cannot judge", never "violation".
+        opaque = "const f = (a) => a + 1;\nconst g = (b) => b * 2;\n"
+        self.assertEqual(agent.Checker._definitions("x.js", opaque), [])
+        self.assertTrue(self.gate("x.js", opaque, opaque.replace("+ 1", "+ 2")).passed)
+
+    def test_ruby_definitions_find_the_method_by_indentation(self):
+        found = agent.ruby_definitions(self.RB)
+        self.assertIn(("rows", 4, 6, "function"), found)
+
+    def test_ruby_definitions_survive_a_file_it_cannot_match(self):
+        self.assertEqual(agent.ruby_definitions("def broken(\n"), [])
+
+
+class TestAFailingProbeSaysWhatToFix(unittest.TestCase):
+    """Three runs of one task shipped unmeasured for the same avoidable reason.
+
+    The probe was never silent -- it raised, every time, with the cause in the
+    text. But the agent opened with "the probe produced no query count", which
+    reads as "the harness could not run it", and the repair message then asked
+    for a probe the model had already supplied. So it sent the same broken one
+    back. The exception was buried under a traceback whose middle gets elided.
+
+    Diagnosed from a real run: the model passed the filterset's own parameter
+    name where the model field was wanted.
+    """
+
+    REAL = ("158 objects imported automatically (use -v 2 for details).\n"
+            "\nTraceback (most recent call last):\n"
+            '  File "<string>", line 28, in <module>\n'
+            '  File "/app/netbox/ipam/filtersets.py", line 795, in filter_device\n'
+            "    devices = Device.objects.filter(**{'{}__in'.format(name): value})\n"
+            "django.core.exceptions.FieldError: Cannot resolve keyword 'device_id' "
+            "into field. Choices are: airflow, asset_tag, id, name, site, virtual_chassis\n")
+
+    def test_it_leads_with_the_exception_not_the_traceback(self):
+        detail = agent.Checker._probe_failed(self.REAL)
+        self.assertLess(detail.index("FieldError"), 300,
+                        "the cause must be readable before the traceback")
+        self.assertIn("Cannot resolve keyword 'device_id'", detail)
+
+    def test_it_says_the_probe_is_wrong_not_the_patch(self):
+        # The distinction the agent kept failing to draw. A raised probe is no
+        # evidence at all about the edit, and telling the model otherwise sent
+        # it off to rewrite correct code.
+        detail = agent.Checker._probe_failed(self.REAL)
+        self.assertIn("Fix the probe, not the patch", detail)
+        self.assertIn("says nothing about whether the edit", detail)
+
+    def test_the_full_output_still_follows(self):
+        self.assertIn("158 objects imported", agent.Checker._probe_failed(self.REAL))
+
+    def test_a_chained_traceback_reports_the_final_exception(self):
+        chained = ("Traceback (most recent call last):\n"
+                   "ValueError: bad input\n"
+                   "\nThe above exception was the direct cause of:\n"
+                   "django.db.utils.ProgrammingError: relation does not exist\n")
+        detail = agent.Checker._probe_failed(chained)
+        self.assertIn("ProgrammingError", detail[:300])
+        self.assertNotIn("ValueError", detail[:300], "the final cause, not the first")
+
+    def test_output_with_no_exception_keeps_the_plain_wording(self):
+        detail = agent.Checker._probe_failed("nothing useful here\n")
+        self.assertIn("produced no query count", detail)
+        self.assertNotIn("Fix the probe", detail)
+
+    def test_silence_still_reports_the_exit_status(self):
+        # The other half of the same problem: when there really is no output,
+        # the exit status is all there is, and it must survive.
+        detail = agent.Checker._probe_failed("[the probe wrote nothing and exited -9; "
+                                             "a negative status is a signal]")
+        self.assertIn("exited -9", detail)
+
+
+class TestAnEmptyResultIsNotEvidence(unittest.TestCase):
+    """The differential confirmed "unchanged" on two empty results.
+
+    Caught by a live run, not by reading. The model's probe selected no rows,
+    so the guard at the top of the method returned early and it counted three
+    statements where the real selection issues four -- under the stated limit,
+    reported as bounded. The fingerprint was empty on both sides, `[] == []`,
+    so the differential agreed the rows were unchanged without having seen one.
+    Every check passed, the run declared itself clean and stopped at 43% of its
+    budget, and the patch failed the hidden query-count test.
+
+    Two empty results prove nothing, and a count taken down a short-circuit
+    path is not the count the task is graded on.
+    """
+
+    def measure(self, repo, checker, fingerprint, counts=(3, 3)):
+        payload = 'RIDGES_QC{"1": %d, "10": %d}\nRIDGES_QR%s\n' % (
+            counts[0], counts[1], json.dumps(fingerprint))
+        original = agent.run_command
+        agent.run_command = lambda *a, **k: agent.subprocess.CompletedProcess(a, 0, payload)
+        try:
+            return checker.measure_query_scaling({"call": "f(N)", "result": "rows"})
+        finally:
+            agent.run_command = original
+
+    def checker(self, **targets):
+        repo = make_repo({"manage.py": "", "app.py": "x\n"})
+        return repo, agent.Checker(repo, agent.Instruction(text="", targets=targets))
+
+    def test_an_empty_result_is_reported_as_unmeasured(self):
+        repo, checker = self.checker(max_queries=3)
+        result = self.measure(repo, checker, [])
+        self.assertTrue(result.passed, "nothing about the code failed")
+        self.assertFalse(result.verified, "but nothing was measured either")
+        self.assertIn("selected no rows", result.detail)
+
+    def test_it_never_claims_the_rows_are_unchanged(self):
+        # The exact sentence the failing run printed: "`result` unchanged
+        # (0 item(s))". It must not be possible to say that of nothing.
+        repo, checker = self.checker()
+        self.assertNotIn("unchanged", self.measure(repo, checker, []).detail)
+
+    def test_a_count_under_the_limit_does_not_rescue_an_empty_probe(self):
+        # This is what made the run stop early: 3 <= 3 read as success.
+        repo, checker = self.checker(max_queries=3)
+        self.assertFalse(self.measure(repo, checker, [], counts=(3, 3)).verified)
+
+    def test_it_says_to_exercise_the_task_s_own_entry_point(self):
+        repo, checker = self.checker()
+        detail = self.measure(repo, checker, []).detail
+        self.assertIn("the way the task's own tests do", detail)
+
+    def test_a_probe_that_selected_rows_is_measured_normally(self):
+        repo, checker = self.checker(max_queries=3)
+        result = self.measure(repo, checker, ["<IPAddress: 10.0.0.1/24>"])
+        self.assertTrue(result.passed)
+        self.assertTrue(result.verified)
+
+    def test_a_probe_with_no_result_expression_is_unaffected(self):
+        # `result` is optional; absent is not the same as empty.
+        repo, checker = self.checker(max_queries=3)
+        original = agent.run_command
+        agent.run_command = lambda *a, **k: agent.subprocess.CompletedProcess(
+            a, 0, 'RIDGES_QC{"1": 3, "10": 3}\n')
+        try:
+            result = checker.measure_query_scaling({"call": "f(N)"})
+        finally:
+            agent.run_command = original
+        self.assertTrue(result.verified)
+
+    def test_clickhouse_has_the_same_guard(self):
+        repo = make_repo({"package.json": "{}", "app.js": "x\n"})
+
+        class Probe:
+            targets = [agent.DatabaseTarget(engine="clickhouse", host="ch", port="8123")]
+            def available(self): return True
+            def sql(self, query, **kw):
+                return "2026-09-09 07:45:12.345\n" if "now64" in query else "1\t900\t0\n"
+
+        checker = agent.Checker(repo, agent.Instruction(text=""))
+        checker.probe = Probe()
+        original = agent.run_command
+        agent.run_command = lambda *a, **k: agent.subprocess.CompletedProcess(a, 0, "   \n")
+        try:
+            result = checker.measure_query_scaling({"command": "node run.js"})
+        finally:
+            agent.run_command = original
+        self.assertFalse(result.verified)
+        self.assertIn("printed nothing", result.detail)
+
+
+class TestClickHouseIntrospectionIsReadable(unittest.TestCase):
+    """The read-only gate refused every ClickHouse introspection query.
+
+    `\\bSYSTEM\\b` in the mutation denylist put its word boundary on the dot in
+    `system.query_log`, so every SELECT against ClickHouse's own tables was
+    refused as if it were the `SYSTEM` admin command. Those tables are where a
+    ClickHouse engineer looks and where this agent reads work from, and reading
+    them mutates nothing -- while PostgreSQL's pg_indexes and
+    information_schema were readable the whole time.
+    """
+
+    def test_the_introspection_tables_can_be_read(self):
+        for query in ("SELECT count() FROM system.query_log",
+                      "SELECT name, engine FROM system.tables WHERE database = 'metrics'",
+                      "SELECT * FROM system.parts WHERE active",
+                      "SELECT sum(read_rows) FROM system . query_log",
+                      "EXPLAIN indexes = 1 SELECT * FROM system.tables"):
+            self.assertTrue(agent.is_read_only_sql(query), query)
+
+    def test_the_system_command_is_still_refused(self):
+        # It is followed by a verb, not a dot, so the lookahead lets it through
+        # to the denylist exactly as before.
+        for query in ("SYSTEM FLUSH LOGS", "SYSTEM DROP REPLICA 'r'",
+                      "SYSTEM SHUTDOWN", "SYSTEM RESTART REPLICA t"):
+            self.assertFalse(agent.is_read_only_sql(query), query)
+
+    def test_nothing_else_about_the_gate_moved(self):
+        for query in ("SELECT 1; SYSTEM SHUTDOWN",
+                      "WITH x AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM x",
+                      "DROP TABLE t", "UPDATE t SET a = 1", "OPTIMIZE TABLE t FINAL",
+                      "TRUNCATE TABLE t", "ATTACH TABLE t"):
+            self.assertFalse(agent.is_read_only_sql(query), query)
+
+
+class TestClickHouseWorkIsMeasuredLikePostgres(unittest.TestCase):
+    """ClickHouse tasks were graded on a number nothing measured.
+
+    The agent could read a ClickHouse schema and EXPLAIN against one, but the
+    only work measurement it had was Django's CaptureQueriesContext -- so on
+    every ClickHouse task, which in this corpus is a Node application with no
+    manage.py, the check that catches a rewrite doing more work than the code
+    it replaced simply did not exist. ClickHouse publishes the same evidence in
+    system.query_log; these tests drive it from the server side, around a shell
+    command, and off the actual file contents, so a baseline that did not
+    really revert shows up as the wrong number.
+    """
+
+    MARKER = "2026-09-09 07:45:12.345"
+
+    def fixture(self, *, statement="", reads=(9_000_000, 12_000), out=("rows", "rows"),
+                user="metrics_app"):
+        repo = make_repo({"package.json": "{}", "app.js": "SLOW\n"})
+        repo.write("app.js", "FAST\n")
+        checker = agent.Checker(repo, agent.Instruction(text=statement))
+        checker.probe = self.probe(repo, reads, out, user)
+        return repo, checker
+
+    def probe(self, repo, reads, out, user):
+        """A ClickHouse probe whose query_log answers from what is on disk."""
+        test = self
+
+        class Probe:
+            def __init__(self):
+                self.targets = [agent.DatabaseTarget(
+                    engine="clickhouse", host="clickhouse", port="8123",
+                    user=user, database="metrics")]
+                self.asked = []
+
+            def available(self):
+                return True
+
+            def sql(self, query, **kw):
+                self.asked.append(query)
+                if "now64" in query:
+                    return test.MARKER + "\n"
+                if query.startswith("SYSTEM"):
+                    return ""
+                body = (repo.root / "app.js").read_text().strip()
+                rows = reads[0] if body == "SLOW" else reads[1]
+                return f"1\t{rows}\t30\n"
+
+        return Probe()
+
+    def run_command(self, repo, out, calls=None):
+        def run(command, **kw):
+            body = (repo.root / "app.js").read_text().strip()
+            if calls is not None:
+                calls.append(body)
+            return agent.subprocess.CompletedProcess(
+                command, 0, out[0] if body == "SLOW" else out[1])
+        return run
+
+    def measure(self, repo, checker, out=("rows", "rows"), calls=None, command="node run.js"):
+        original = agent.run_command
+        agent.run_command = self.run_command(repo, out, calls)
+        try:
+            return checker.measure_query_scaling({"command": command})
+        finally:
+            agent.run_command = original
+
+    # -- the query that reads the measurement ----------------------------
+    def test_it_excludes_the_agents_own_statements(self):
+        # SYSTEM FLUSH LOGS is issued after the watermark and is itself logged,
+        # so without this every measurement counts one statement the
+        # application never made.
+        query = agent.Checker._CH_WORK
+        self.assertIn("query NOT ILIKE 'SYSTEM %'", query)
+        self.assertIn("positionCaseInsensitive(query, 'system.') = 0", query)
+        self.assertIn("type = 'QueryFinish'", query)
+
+    def test_the_watermark_comes_from_the_server_not_this_container(self):
+        # The agent's clock and the database's need not agree, and a skewed
+        # watermark either drops the queries being measured or picks up
+        # somebody else's.
+        repo, checker = self.fixture()
+        self.measure(repo, checker)
+        self.assertIn("now64", checker.probe.asked[0])
+        self.assertIn(f"toDateTime64('{self.MARKER}', 3)", checker.probe.asked[2])
+
+    def test_it_scopes_the_measurement_to_the_application_user(self):
+        repo, checker = self.fixture(user="metrics_app")
+        self.measure(repo, checker)
+        self.assertIn("AND user = 'metrics_app'", checker.probe.asked[2])
+
+    def test_a_user_that_is_not_a_plain_name_is_left_out_rather_than_injected(self):
+        repo, checker = self.fixture(user="bob'; DROP")
+        self.measure(repo, checker)
+        self.assertNotIn("DROP", checker.probe.asked[2])
+
+    # -- the verdicts ----------------------------------------------------
+    def test_fewer_rows_for_the_same_output_passes_and_reports_the_delta(self):
+        repo, checker = self.fixture()
+        result = self.measure(repo, checker)
+        self.assertTrue(result.passed)
+        self.assertIn("9,000,000 -> 12,000 rows read", result.detail)
+
+    def test_more_rows_for_the_same_output_fails_without_classifying_the_task(self):
+        # No correctness argument can justify returning exactly what the old
+        # code returned while reading more to do it, so this needs no view on
+        # what kind of task it is -- and the instruction here says nothing.
+        repo, checker = self.fixture(reads=(12_000, 9_000_000))
+        result = self.measure(repo, checker)
+        self.assertFalse(result.passed)
+        self.assertIn("reads more data", result.detail)
+        self.assertIn("12,000 -> 9,000,000 rows read", result.detail)
+
+    def test_a_few_percent_more_is_noise_and_is_not_a_failure(self):
+        # Part merges move granule boundaries; two runs of an unchanged query
+        # need not read byte-identical row counts.
+        repo, checker = self.fixture(reads=(100_000, 105_000))
+        self.assertTrue(self.measure(repo, checker).passed)
+
+    def test_changed_output_fails_even_though_the_work_fell(self):
+        repo, checker = self.fixture()
+        result = self.measure(repo, checker, out=("a b c", "a b"))
+        self.assertFalse(result.passed)
+        self.assertIn("altered what the command returns", result.detail)
+        self.assertIn("before: a b c", result.detail)
+        self.assertIn("after:  a b", result.detail)
+        self.assertIn("9,000,000 -> 12,000 rows read", result.detail,
+                      "and the numbers still travel with it")
+
+    def test_whitespace_alone_is_not_a_changed_result(self):
+        repo, checker = self.fixture()
+        self.assertTrue(self.measure(repo, checker, out=("a b\n", "  a   b  ")).passed)
+
+    # -- the baseline ----------------------------------------------------
+    def test_the_baseline_runs_the_command_against_the_reverted_code(self):
+        repo, checker = self.fixture()
+        calls = []
+        self.measure(repo, checker, calls=calls)
+        self.assertEqual(calls, ["FAST", "SLOW"])
+
+    def test_the_edit_is_put_back_afterwards(self):
+        repo, checker = self.fixture()
+        self.measure(repo, checker)
+        self.assertEqual((repo.root / "app.js").read_text(), "FAST\n")
+        self.assertEqual(repo.changed_files(), ["app.js"])
+
+    def test_it_is_measured_once_and_reused(self):
+        repo, checker = self.fixture()
+        calls = []
+        self.measure(repo, checker, calls=calls)
+        self.measure(repo, checker, calls=calls)
+        self.assertEqual(calls, ["FAST", "SLOW", "FAST"])
+
+    # -- when it cannot measure ------------------------------------------
+    def test_a_command_that_fails_is_unmeasured_not_a_failing_patch(self):
+        repo, checker = self.fixture()
+        original = agent.run_command
+        agent.run_command = lambda command, **kw: agent.subprocess.CompletedProcess(
+            command, 1, "MODULE_NOT_FOUND")
+        try:
+            result = checker.measure_query_scaling({"command": "node run.js"})
+        finally:
+            agent.run_command = original
+        self.assertTrue(result.passed, "nothing about the code failed")
+        self.assertFalse(result.verified, "but nothing was measured either")
+        self.assertIn("MODULE_NOT_FOUND", result.detail)
+
+    def test_a_command_that_never_reached_the_database_says_so(self):
+        repo, checker = self.fixture()
+        checker.probe.sql = lambda query, **kw: (
+            self.MARKER if "now64" in query else "0\t0\t0\n")
+        result = self.measure(repo, checker, out=("x", "x"))
+        self.assertFalse(result.verified)
+        self.assertIn("logged no queries", result.detail)
+
+    # -- dispatch --------------------------------------------------------
+    def test_a_django_project_still_takes_the_django_path(self):
+        repo = make_repo({"manage.py": "", "a.py": ""})
+        checker = agent.Checker(repo, agent.Instruction(text=""))
+        original = agent.run_command
+        agent.run_command = lambda *a, **k: agent.subprocess.CompletedProcess(
+            a, 0, 'RIDGES_QC{"1": 3, "10": 3}\n')
+        try:
+            result = checker.measure_query_scaling({"call": "f(N)"})
+        finally:
+            agent.run_command = original
+        self.assertIn("bounded: 3 queries", result.detail)
+
+    def test_a_command_is_ignored_when_the_database_is_not_clickhouse(self):
+        repo = make_repo({"package.json": "{}"})
+        checker = agent.Checker(repo, agent.Instruction(text=""))
+        self.assertIsNone(checker.measure_query_scaling({"command": "node run.js"}),
+                          "no ClickHouse means no query_log to read this from")
+
+
+class TestThePromptAsksForTheProbeTheEngineCanRun(unittest.TestCase):
+    """Which probe to ask for is the engine's business, not the task shape's.
+
+    A ClickHouse task that happens to read as bounded_queries would otherwise
+    be asked for a Django `call`, and there is no shell in a Node application
+    to run one -- an ask that cannot be answered, rather than one that merely
+    was not needed.
+    """
+
+    def findings(self, statement, engine):
+        repo = make_repo({"a.py": ""})
+        instruction = agent.parse_instruction(statement, repo.root)
+
+        class Probe:
+            targets = [agent.DatabaseTarget(engine=engine, host="db", port="5432")]
+
+            def available(self):
+                return True
+
+        builder = agent.PromptBuilder(repo, instruction, [], Probe())
+        return builder._agent_findings()
+
+    BOUNDED = ("The importer issues one statement per row in a loop; the query count "
+               "must not grow with the number of rows.")
+
+    def test_postgres_is_asked_for_the_django_probe(self):
+        found = self.findings(self.BOUNDED, "postgresql")
+        self.assertIn("selection sizes", found)
+        self.assertNotIn("measure.command", found)
+
+    def test_clickhouse_is_never_asked_for_a_shell_it_does_not_have(self):
+        found = self.findings(self.BOUNDED, "clickhouse")
+        self.assertNotIn("selection sizes", found)
+
+    def test_clickhouse_is_asked_for_a_command_when_the_task_wants_less_read(self):
+        found = self.findings("Answer from the rollup so the rows it reads stay "
+                              "proportional to the days on screen.", "clickhouse")
+        self.assertIn("measure.command", found)
+
+
+class TestClickHouseWorkMustBeMeasured(unittest.TestCase):
+    """The ClickHouse arm of the same guard: asking for the right thing.
+
+    On PostgreSQL the unmeasured number is how many statements are issued; on
+    ClickHouse it is how much each one reads. Asking a Node application for a
+    Django `call` would be asking for something it cannot give.
+    """
+
+    def checker(self, statement, *, clickhouse=True):
+        repo = make_repo({"package.json": "{}"})
+        checker = agent.Checker(repo, agent.Instruction(text=statement))
+
+        class Probe:
+            targets = [agent.DatabaseTarget(engine="clickhouse" if clickhouse else "postgresql",
+                                            host="db", port="8123")]
+
+            def available(self):
+                return True
+
+        checker.probe = Probe()
+        return checker
+
+    def test_it_asks_when_the_task_wants_the_query_to_read_less(self):
+        checker = self.checker("Answer from the rollup so the rows it reads stay "
+                               "proportional to the days on screen.")
+        result = checker.unmeasured_bounded_work({})
+        self.assertIsNotNone(result)
+        self.assertFalse(result.verified)
+        self.assertIn("`measure` command", result.detail)
+
+    def test_it_is_silent_once_a_command_is_supplied(self):
+        checker = self.checker("the rows it reads stay proportional to the days on screen")
+        self.assertIsNone(checker.unmeasured_bounded_work({"command": "node run.js"}))
+
+    def test_it_is_silent_on_a_task_that_only_wants_different_rows(self):
+        # Four of the six ClickHouse statements in the corpus are like this.
+        # Asking them for a work probe spends a round on a number nobody grades.
+        checker = self.checker("Return one row per cohort with the retention percentage.")
+        self.assertIsNone(checker.unmeasured_bounded_work({}))
+
+
+class TestASilentProbeStillReportsWhatItCan(unittest.TestCase):
+    """A probe that says nothing was the one failure carrying no evidence.
+
+    Every path through the script prints something -- the counts, or the
+    traceback the script catches -- and run_command labels its own timeouts and
+    exec failures. So empty output means the process died without writing, and
+    a real run reported "the probe produced no query count. Output was:"
+    followed by nothing at all. The exit status is the only thing left, and it
+    separates a signal from an interpreter that could not start.
+    """
+
+    def probe_with(self, returncode, stdout):
+        repo = make_repo({"manage.py": "", "a.py": ""})
+        checker = agent.Checker(repo, agent.Instruction(text=""))
+        original = agent.run_command
+        agent.run_command = lambda cmd, **k: agent.subprocess.CompletedProcess(
+            cmd, returncode, stdout)
+        try:
+            return checker.measure_query_scaling({"call": "f(N)"})
+        finally:
+            agent.run_command = original
+
+    def test_silence_reports_the_exit_status(self):
+        result = self.probe_with(-9, "")
+        self.assertFalse(result.verified)
+        self.assertIn("exited -9", result.detail)
+        self.assertIn("signal", result.detail)
+
+    def test_it_names_the_interpreter_when_the_command_could_not_run(self):
+        self.assertIn("could not run", self.probe_with(127, "").detail)
+
+    def test_output_that_exists_is_still_what_gets_reported(self):
+        result = self.probe_with(1, "Traceback: UndefinedTable")
+        self.assertIn("UndefinedTable", result.detail)
+        self.assertNotIn("wrote nothing", result.detail)
+
+
 class TestBoundedWorkMustBeMeasured(unittest.TestCase):
     """On a task about statement count, supplying no probe is not "done".
 

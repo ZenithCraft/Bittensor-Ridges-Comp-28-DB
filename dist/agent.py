@@ -55,6 +55,7 @@ MODELS: dict[str, ModelSpec] = {'deepseek/deepseek-v4-pro-0813': ModelSpec('deep
 # rung up and switches model family: a second opinion from the same architecture tends
 # to repeat the same mistake.
 LADDER: list[list[str]] = [['deepseek/deepseek-v4-pro-0813', 'qwen/qwen3.8-27b', 'minimax/minimax-m3'], ['qwen/qwen3.8-27b', 'moonshotai/kimi-k2.6', 'deepseek/deepseek-v4-pro-0813'], ['moonshotai/kimi-k2.6', 'moonshotai/kimi-k2.7-code', 'qwen/qwen3.8-27b']]
+BLOCKED_MODELS = frozenset({'deepseek/deepseek-v4-flash'})
 MAX_REPAIR_ROUNDS = 3
 MAX_GATE_SLIPS = 4
 MAX_CONTEXT_ROUNDS = 6
@@ -229,12 +230,13 @@ class LLM:
         return []
 
     def roster(self, preferred: Sequence[str]) -> list[str]:
-        allowed = self.discovered
+        allowed = [m for m in self.discovered if m not in BLOCKED_MODELS]
         if allowed:
-            ordered = [m for m in preferred if m in allowed]
-            ordered += sorted((m for m in allowed if m not in ordered))
-            return ordered or sorted(allowed)
-        return list(preferred) + [name for name in MODELS if name not in preferred]
+            ordered = [m for m in preferred if m in allowed and m not in BLOCKED_MODELS]
+            known = [m for m in MODELS if m in allowed and m not in ordered]
+            unknown = sorted((m for m in allowed if m not in ordered and m not in known))
+            return ordered + known + unknown
+        return [m for m in preferred if m not in BLOCKED_MODELS] + [name for name in MODELS if name not in preferred and name not in BLOCKED_MODELS]
 
     def spent(self) -> float:
         reported = self._usage()
@@ -472,6 +474,11 @@ class Instruction:
     @property
     def bounded_work(self) -> bool:
         return 'bounded_queries' in self.kinds or bool(self.targets.get('max_queries'))
+    _READS_LESS = re.compile('\\b(?:far |much |)fewer rows\\b|\\bproportional to\\b|\\bfull scan\\b|\\bread(?:s|ing)?\\s+(?:far |much |)(?:fewer|less)\\b|\\bstopped scaling\\b|\\bre-?reads?\\b|\\bscan(?:s|ning)?\\s+the whole\\b', re.IGNORECASE)
+
+    @property
+    def reduces_work(self) -> bool:
+        return self.bounded_work or bool(self._READS_LESS.search(re.sub('\\s+', ' ', self.text)))
 SHELL_FENCES = frozenset({'bash', 'sh', 'shell', 'zsh', 'console', 'shell-session', 'terminal'})
 
 def _fenced_blocks(text: str, *, tagged: bool=False):
@@ -580,7 +587,8 @@ class InstructionParser:
                 self.parsed.class_hint = qualifier
                 self.parsed.method_hint = name
     _FORBIDDEN_CONSTRUCTS = {'loops': 'loops?', 'comprehensions': 'comprehensions?', 'lambdas': 'lambdas?', 'exception handling': 'exception handling|try/except', 'context managers': 'context managers?', 'raw SQL': 'raw SQL'}
-    _NO_NEW_NAMES = re.compile('use only names (?:the file|it) already imports|only names .{0,24}already imports|without adding (?:any )?(?:new )?imports|do not add (?:any )?(?:new )?imports', re.IGNORECASE)
+    _NO_NEW_NAMES = re.compile('use only names (?:the file|it) already (?:imports|requires)|only names .{0,24}already (?:imports|requires)|without adding (?:any )?(?:new )?(?:imports|requires)|do not add (?:any )?(?:new )?(?:imports|requires)', re.IGNORECASE)
+    _IMPORTS_PERMITTED = re.compile('apart from (?:any )?imports|except (?:for )?(?:any )?imports|imports it (?:genuinely )?needs|add(?:ing)? (?:only )?the imports', re.IGNORECASE)
     _NO_MATERIALISE = re.compile('do not materiali[sz]e|keep .{0,40}database-backed|must not (?:be )?(?:fetch|load|materiali[sz]e)', re.IGNORECASE)
 
     def _read_style_rules(self) -> None:
@@ -591,7 +599,7 @@ class InstructionParser:
             for label, pattern in self._FORBIDDEN_CONSTRUCTS.items():
                 if re.search(pattern, haystack, re.IGNORECASE):
                     constraints.append(label)
-        if self._NO_NEW_NAMES.search(self.flat):
+        if self._NO_NEW_NAMES.search(self.flat) and (not self._IMPORTS_PERMITTED.search(self.flat)):
             constraints.append('names the file does not import')
         if self._NO_MATERIALISE.search(self.flat):
             constraints.append('materialising rows in Python')
@@ -1029,6 +1037,23 @@ def generic_blocks(text: str) -> list[tuple[str, int, int, str]]:
                 blocks.append((name, index + 1, end_index + 1, 'block'))
                 break
     return blocks
+_RUBY_OPEN = re.compile('^(\\s*)(?:def|class|module)\\s+([A-Za-z_][\\w.:?!=]*)')
+
+def ruby_definitions(text: str) -> list[tuple[str, int, int, str]]:
+    lines = text.splitlines()
+    found: list[tuple[str, int, int, str]] = []
+    for index, line in enumerate(lines):
+        opening = _RUBY_OPEN.match(line)
+        if not opening:
+            continue
+        indent, name = (opening.group(1), opening.group(2))
+        kind = 'class' if line.lstrip().startswith(('class', 'module')) else 'function'
+        closer = indent + 'end'
+        for end_index in range(index + 1, len(lines)):
+            if lines[end_index].rstrip() == closer:
+                found.append((name, index + 1, end_index + 1, kind))
+                break
+    return found
 
 def slice_around(repo: Repository, relative: str, hot_lines: Sequence[int], instruction: Instruction, *, budget_lines: int=320) -> list[Slice]:
     text = repo.read(relative)
@@ -1037,10 +1062,7 @@ def slice_around(repo: Repository, relative: str, hot_lines: Sequence[int], inst
     total = len(text.splitlines())
     if total <= budget_lines:
         return [Slice(relative, 1, total, 'whole file')]
-    if relative.endswith('.py'):
-        definitions = python_definitions(text)
-    else:
-        definitions = generic_blocks(text)
+    definitions = Checker._definitions(relative, text)
     chosen: list[Slice] = []
     used: set[tuple[int, int]] = set()
     if instruction.method_hint:
@@ -1109,10 +1131,7 @@ def file_outline(repo: Repository, relative: str, limit: int=80) -> str:
     text = repo.read(relative)
     if text is None:
         return ''
-    if relative.endswith('.py'):
-        definitions = python_definitions(text)
-    else:
-        definitions = generic_blocks(text)
+    definitions = Checker._definitions(relative, text)
     if not definitions:
         return ''
     rows = [f'  L{start:<5} {kind:8} {name}' for name, start, _, kind in definitions[:limit]]
@@ -1147,7 +1166,9 @@ class DatabaseProbe:
         self.instruction = instruction
         self.targets: list[DatabaseTarget] = []
         self.notes: list[str] = []
+        self._refused: dict[tuple[str, str], float] = {}
         self._discover()
+    _REFUSAL_WINDOW = 30.0
 
     def _discover(self) -> None:
         self.attempts: list[tuple[str, bool]] = []
@@ -1437,6 +1458,18 @@ class DatabaseProbe:
         chosen = target or (self.targets[0] if self.targets else None)
         if chosen is None:
             return '[no database target discovered]'
+        door = (chosen.host, chosen.port)
+        refused_at = self._refused.get(door)
+        if refused_at is not None and time.monotonic() - refused_at < self._REFUSAL_WINDOW:
+            return f'[database unreachable: {chosen.host}:{chosen.port}]'
+        try:
+            reachable = self._tcp_open(chosen.host, int(chosen.port or 0), timeout=3.0)
+        except (TypeError, ValueError):
+            reachable = True
+        if not reachable:
+            self._refused[door] = time.monotonic()
+            return f'[database unreachable: {chosen.host}:{chosen.port}]'
+        self._refused.pop(door, None)
         started = time.monotonic()
         out = self._clickhouse(chosen, query, timeout) if chosen.engine == 'clickhouse' else self._postgres(chosen, query, timeout)
         return out
@@ -1483,7 +1516,7 @@ class DatabaseProbe:
                 return response.read().decode('utf-8', 'replace')
         except Exception as exc:
             return f'[clickhouse query failed: {exc}]'
-    _QUERY_ERROR = re.compile('^\\s*\\[(?:no |psql |clickhouse |could not )', re.IGNORECASE)
+    _QUERY_ERROR = re.compile('^\\s*\\[(?:no |psql |clickhouse |could not |database unreachable)', re.IGNORECASE)
 
     @classmethod
     def _usable(cls, output: str) -> bool:
@@ -1624,7 +1657,7 @@ class Checker:
         self.instruction = instruction
         self.probe = probe
         self.candidates = list(candidates)
-        self._baselines: dict[str, tuple[dict[int, int], list | None] | None] = {}
+        self._baselines: dict[str, tuple | None] = {}
 
     def run_all(self, changed: Sequence[str], *, include_tests: bool=True) -> list[CheckResult]:
         results = [self.check_scope(changed)]
@@ -1697,17 +1730,26 @@ class Checker:
             return CheckResult('syntax', False, '; '.join(problems))
         return CheckResult('syntax', True, 'parsed')
 
+    @staticmethod
+    def _definitions(relative: str, text: str) -> list[tuple[str, int, int, str]]:
+        try:
+            if relative.endswith('.py'):
+                return python_definitions(text)
+            if relative.endswith(('.rb', '.rake')):
+                return ruby_definitions(text)
+            return generic_blocks(text)
+        except Exception:
+            return []
+
     def check_single_method(self, changed: Sequence[str]) -> CheckResult:
         for relative in changed:
-            if not relative.endswith('.py'):
-                continue
             original = self.repo.original(relative)
             current = self.repo.read(relative)
             if original is None or current is None:
                 continue
-            try:
-                current_defs = python_definitions(current)
-            except Exception:
+            current_defs = self._definitions(relative, current)
+            python = relative.endswith('.py')
+            if not python and (not current_defs):
                 continue
             original_lines = original.splitlines(keepends=True)
             current_lines = current.splitlines(keepends=True)
@@ -1718,12 +1760,19 @@ class Checker:
             first_line = min((op[3] for op in edited)) + 1
             last_line = max((op[4] for op in edited))
             enclosing = [(name, start, end) for name, start, end, kind in current_defs if kind != 'class' and start <= first_line and (last_line <= end)]
+            if not enclosing and (not python):
+                if 'names the file does not import' not in self.instruction.style_constraints:
+                    continue
+                top_level = [n for n in self._changed_lines(original, current) if n <= len(current_lines) and current_lines[n - 1].strip() and (not current_lines[n - 1][:1].isspace())]
+                if not top_level:
+                    continue
+                return CheckResult('single-method', False, f'{relative}: line {top_level[0]} is outside any function and was changed. The instruction bounds this change to one function, so imports, exports and every other top-level line must stay byte-identical -- build the fix from names the file already has.')
             if not enclosing:
                 return CheckResult('single-method', False, f'{relative}: edits at lines {first_line}-{last_line} fall outside a single function body; the instruction bounds the change to one method, so imports and every other line in the file must stay byte-identical')
             name, start, end = min(enclosing, key=lambda item: item[2] - item[1])
             if original_lines[:start - 1] != current_lines[:start - 1]:
                 return CheckResult('single-method', False, f'{relative}: source above {name} changed')
-            before = next(((s0, e0) for n0, s0, e0, k0 in python_definitions(original) if n0 == name and k0 != 'class'), None)
+            before = next(((s0, e0) for n0, s0, e0, k0 in self._definitions(relative, original) if n0 == name and k0 != 'class'), None)
             if before and original_lines[before[1]:] != current_lines[end:]:
                 return CheckResult('single-method', False, f'{relative}: source below {name} changed')
         return CheckResult('single-method', True, 'confined to one method')
@@ -1795,6 +1844,11 @@ class Checker:
                 if message not in missing:
                     missing.append(message)
         return missing
+
+    @staticmethod
+    def _changed_lines(original: str, current: str) -> list[int]:
+        matcher = difflib.SequenceMatcher(None, original.splitlines(keepends=True), current.splitlines(keepends=True), autojunk=False)
+        return [n + 1 for tag, _, _, j1, j2 in matcher.get_opcodes() if tag != 'equal' for n in range(j1, j2)]
 
     @staticmethod
     def _edited_line_range(original: str, current: str) -> tuple[int, int] | None:
@@ -1956,8 +2010,11 @@ class Checker:
 
     def _probe_run(self, manage: str, setup: str, call: str, result: str, small: int, large: int) -> tuple[dict[int, int] | None, list | None, str]:
         script = self._DJANGO_PROBE.format(setup='\n'.join((f'        {line}' for line in setup.splitlines())) or '        pass', call='\n'.join((f'                {line}' for line in call.splitlines())), result=f'        _fp = _fingerprint({result})' if result else '        pass', small=small, large=large)
-        run = run_command([app_python(self.repo.root), manage, 'shell', '-c', script], timeout=min(300.0, max(60.0, remaining_seconds() - 200)))
+        interpreter = app_python(self.repo.root)
+        run = run_command([interpreter, manage, 'shell', '-c', script], timeout=min(300.0, max(60.0, remaining_seconds() - 200)))
         stdout = run.stdout or ''
+        if not stdout.strip():
+            stdout = f'[the probe wrote nothing and exited {run.returncode}; a negative status is a signal, and 127 or 126 means {interpreter} could not run {manage}]'
         fingerprint = None
         found = re.search('RIDGES_QR(\\[.*\\])', stdout)
         if found:
@@ -1980,19 +2037,29 @@ class Checker:
             return self._baselines[signature]
         if remaining_seconds() < 420:
             return None
+        ran, measured = self._with_original_source(lambda: self._probe_run(manage, setup, call, result, small, large))
+        if not ran:
+            return None
+        self._baselines[signature] = None
+        counts, fingerprint, _ = measured
+        if counts is None:
+            return None
+        self._baselines[signature] = (counts, fingerprint)
+        return self._baselines[signature]
+
+    def _with_original_source(self, action):
         edited: dict[str, str | None] = {}
         for relative in self.repo.changed_files():
             path = self.repo.root / relative
             try:
                 edited[relative] = read_source(path) if path.exists() else None
             except (OSError, UnicodeDecodeError):
-                return None
+                return (False, None)
         if not edited:
-            return None
-        self._baselines[signature] = None
+            return (False, None)
         try:
             self.repo.revert_all()
-            counts, fingerprint, _ = self._probe_run(manage, setup, call, result, small, large)
+            value = action()
         finally:
             for relative, text in edited.items():
                 try:
@@ -2002,13 +2069,13 @@ class Checker:
                     else:
                         self.repo.write(relative, text)
                 except OSError as exc:
-                    log(f'WARNING: could not restore {relative} after the baseline probe ({exc}); the patch may be incomplete')
-        if counts is None:
-            return None
-        self._baselines[signature] = (counts, fingerprint)
-        return self._baselines[signature]
+                    log(f'WARNING: could not restore {relative} after measuring the original ({exc}); the patch may be incomplete')
+        return (True, value)
 
     def measure_query_scaling(self, probe: dict) -> CheckResult | None:
+        return self._measure_django_queries(probe) or self._measure_clickhouse_work(probe)
+
+    def _measure_django_queries(self, probe: dict) -> CheckResult | None:
         setup = (probe.get('setup') or '').strip()
         call = (probe.get('call') or '').strip()
         result_expr = ' '.join((probe.get('result') or '').split())
@@ -2024,10 +2091,12 @@ class Checker:
             small, large = (1, 10)
         counts, fingerprint, stdout = self._probe_run(manage, setup, call, result_expr, small, large)
         if counts is None:
-            return CheckResult('query scaling', True, f'the probe produced no query count, so the database work this change performs is unmeasured. Output was:\n{truncate(stdout, 2000)}', verified=False)
+            return CheckResult('query scaling', True, self._probe_failed(stdout), verified=False)
         low, high = (counts.get(small), counts.get(large))
         if low is None or high is None:
             return CheckResult('query scaling', True, f'incomplete measurement: {counts}', verified=False)
+        if fingerprint is not None and (not fingerprint):
+            return CheckResult('query scaling', True, f"the probe ran but `result` came back empty, so `call` selected no rows. The counts it produced ({low} at N={small}, {high} at N={large}) are of a short-circuit path, not the one the task exercises, and two empty results prove nothing about whether the rows still match. Build fixtures in `setup` that the code actually selects, exercise it the way the task's own tests do -- through the same entry point, with the same kind of argument -- and make sure `result` comes back non-empty.", verified=False)
         baseline = self._baseline_probe(manage, setup, call, result_expr, small, large)
         base, base_fp = baseline if baseline else (None, None)
         base_low = base.get(small) if base else None
@@ -2052,6 +2121,14 @@ class Checker:
         if base_fp is not None and fingerprint is not None:
             detail += f'; `result` unchanged ({len(fingerprint)} item(s))'
         return CheckResult('query scaling', True, detail + (f' (limit {limit})' if limit else ''))
+    _EXCEPTION = re.compile('^(?:[\\w.]+(?:Error|Exception|Warning)|\\w+Error)\\b.*$', re.MULTILINE)
+
+    @classmethod
+    def _probe_failed(cls, stdout: str) -> str:
+        raised = cls._EXCEPTION.findall(stdout or '')
+        if raised:
+            return f'the `measure` probe itself raised, so the database work this change performs was never measured -- this says nothing about whether the edit is right. Fix the probe, not the patch:\n\n    {truncate(raised[-1], 600)}\n\nCheck that `call` passes arguments the code actually accepts: a field name must be one the model defines, and a filterset method takes the field it filters on, not its own parameter name. Reply with the same edit and a corrected `measure`.\n\nFull output:\n' + truncate(stdout, 1500)
+        return f'the probe produced no query count, so the database work this change performs is unmeasured. Output was:\n{truncate(stdout, 2000)}'
 
     @staticmethod
     def _differential_failure(before: list, after: list) -> str:
@@ -2064,9 +2141,80 @@ class Checker:
             detail += '\n  only after:  ' + truncate(', '.join(added), 400)
         detail += "\n  If the values differ only by database ids, that is this measurement's own artefact -- the two runs are separate transactions and the id sequence does not rewind. Supply a `result` expression that does not depend on ids."
         return detail
+    _CH_WORK = "SELECT count(), sum(read_rows), sum(result_rows) FROM system.query_log WHERE type = 'QueryFinish' AND event_time_microseconds >= toDateTime64('{marker}', 3) AND query NOT ILIKE 'SYSTEM %' AND positionCaseInsensitive(query, 'system.') = 0{user}"
+
+    def _clickhouse_ready(self) -> bool:
+        return bool(self.probe and self.probe.available() and (self.probe.targets[0].engine == 'clickhouse'))
+
+    def _clickhouse_measure(self, command: str) -> tuple[dict | None, str]:
+        marker = ((self.probe.sql('SELECT now64(3)') or '').strip().splitlines() or [''])[0].strip()
+        if not re.fullmatch('\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?', marker):
+            return (None, f"the server's clock could not be read: {truncate(marker, 200)}")
+        run = run_command(command, timeout=min(300.0, max(60.0, remaining_seconds() - 200)))
+        if run.returncode != 0:
+            return (None, f'the command exited {run.returncode}:\n{truncate(run.stdout, 1500)}')
+        self.probe.sql('SYSTEM FLUSH LOGS')
+        user = self.probe.targets[0].user or ''
+        summary = self.probe.sql(self._CH_WORK.format(marker=marker, user=f" AND user = '{user}'" if re.fullmatch('[\\w.$-]+', user) else ''))
+        first = ((summary or '').strip().splitlines() or [''])[0]
+        numbers = re.findall('\\d+', first)
+        if len(numbers) < 3 or numbers[0] == '0':
+            return (None, "ClickHouse logged no queries for that command, so it may not have reached the database at all. The command's own output was:\n" + truncate(run.stdout, 1000))
+        work = dict(zip(('statements', 'read_rows', 'result_rows'), (int(value) for value in numbers[:3])))
+        return (work, run.stdout or '')
+
+    def _clickhouse_baseline(self, command: str) -> tuple[dict, str] | None:
+        signature = 'clickhouse:' + hashlib.sha1(command.encode()).hexdigest()
+        if signature in self._baselines:
+            return self._baselines[signature]
+        if remaining_seconds() < 420:
+            return None
+        ran, measured = self._with_original_source(lambda: self._clickhouse_measure(command))
+        if not ran:
+            return None
+        self._baselines[signature] = None
+        work, output = measured
+        if work is None:
+            return None
+        self._baselines[signature] = (work, output)
+        return self._baselines[signature]
+    _CH_NOISE = 1.1
+
+    def _measure_clickhouse_work(self, probe: dict) -> CheckResult | None:
+        command = ' '.join((probe.get('command') or '').split())
+        if not command or not self._clickhouse_ready():
+            return None
+        work, output = self._clickhouse_measure(command)
+        if work is None:
+            return CheckResult('query scaling', True, 'the data this change reads was not measured, so the work it performs is unknown: ' + output, verified=False)
+        if not self._flatten(output):
+            return CheckResult('query scaling', True, f"the command ran and printed nothing, so there is no result to compare across the change and the {work['read_rows']:,} rows it read are of a path that returned no output. Exercise the change the way the task's own tests do and have the command print what it returns.", verified=False)
+        baseline = self._clickhouse_baseline(command)
+        before, before_output = baseline if baseline else (None, None)
+        if before is None:
+            return CheckResult('query scaling', True, f"{work['statements']} statement(s), {work['read_rows']:,} rows read, {work['result_rows']:,} returned")
+        delta = f"{before['read_rows']:,} -> {work['read_rows']:,} rows read, {before['statements']} -> {work['statements']} statement(s), {work['result_rows']:,} rows returned"
+        if self._flatten(before_output) != self._flatten(output):
+            return CheckResult('query scaling', False, self._output_changed(before_output, output) + f' ({delta})')
+        if work['read_rows'] > before['read_rows'] * self._CH_NOISE:
+            return CheckResult('query scaling', False, f'this change returns exactly what the code it replaced returned, and reads more data to do it: {delta}. Read the plan of the new statement and find what it scans that the old one did not -- a missing PREWHERE, a predicate that no longer matches the primary key order, or a table it now reads whole.')
+        return CheckResult('query scaling', True, delta)
+
+    @staticmethod
+    def _flatten(text: str) -> str:
+        return ' '.join((text or '').split())
+
+    @staticmethod
+    def _output_changed(before: str, after: str) -> str:
+        return f'this change altered what the command returns. Reducing the work is only correct if the rows come back the same.\n  before: {truncate(Checker._flatten(before), 600)}\n  after:  {truncate(Checker._flatten(after), 600)}'
 
     def unmeasured_bounded_work(self, supplied: dict) -> CheckResult | None:
-        if not self.instruction.bounded_work or (supplied or {}).get('call'):
+        supplied = supplied or {}
+        if self._clickhouse_ready():
+            if supplied.get('command') or not self.instruction.reduces_work:
+                return None
+            return CheckResult('query scaling', True, 'this task asks the query to read less data, and no `measure` command was supplied, so the amount it reads was never taken', verified=False)
+        if not self.instruction.bounded_work or supplied.get('call'):
             return None
         if not any((Path(p).name == 'manage.py' and p.count('/') <= 2 for p in self.repo.files)):
             return None
@@ -2160,7 +2308,7 @@ def summarise(checks: Sequence[CheckResult]) -> str:
     return '\n'.join(lines)
 SYSTEM_PROMPT = "You are a database query engineer. You fix, author, and optimise the queries a real application issues against PostgreSQL or ClickHouse, working inside the application's own repository: raw SQL, ORM code, or query-builder code.\n\nHow you work:\n\n* Edit production query code, and write the fix so it holds for data you have not seen. Implement the general rule the task states, in terms of the columns and relations it names, rather than anything that happens to suit the rows in front of you.\n* Reduce the database work the query performs -- statements issued, rows and buffers touched, index usage. Remove work the query genuinely does not need, rather than moving it somewhere less visible.\n* Keep everything outside the blast radius the instruction sets byte-identical, imports included, and build the fix from names already in scope.\n* Make the smallest change that fixes the underlying cause.\n\nReasoning you should apply, by symptom:\n\n* Work that grows with input size -- a statement per element, per row, or per iteration -- becomes one set-based statement: a single bulk insert/update, one `IN`/`ANY` predicate, a join, or a CTE. Compute the set difference in the database, and keep any signal/callback contract firing exactly once with the same payload.\n* A slow or unselective plan usually means the predicate the application actually issues is not the one the index serves. Match index column order and partiality to the real predicate, including equality columns first.\n* Wrong aggregates over a hierarchy or a many-to-many usually mean fan-out: rows multiplied by a join. Fix it with DISTINCT on the counted key, a subquery/lateral, or a nested-set/recursive descendant predicate, keeping the correction in the database rather than in application code.\n* Percentages and ratios should be computed in the database with explicit numeric casting and a zero-denominator guard.\n* On ClickHouse, favour the primary key order and PREWHERE, prefer set-based expressions over per-row subqueries, and remember that JOIN semantics and nullability differ from PostgreSQL. An `explain` request there also returns read_rows, read_bytes, selected parts and marks -- the amount of data the query actually touched, so check it fell. Build a series with numbers(N) or arrayJoin(range(...)) rather than by selecting from system.numbers: a report should not depend on the server's own introspection tables.\n\nYou answer only with a single JSON object, described in the user message."
 DIRECTIVE = '# Instructions\n\nDiagnose the database defect described in the task statement below, then reply with one JSON object in the format given at the end of this message.\n\nWork in this order:\n\n1. Read the task statement. It is the authority on what to change, which files you may edit, and which checks to run.\n2. Locate the code that issues the query in question, using the source provided below.\n3. Name the database-level cause in at most two sentences.\n4. Write the smallest edit that fixes that cause.\n5. Reply with the JSON object.\n\nWhen the statement does not name the file to edit and the provided source does not settle which file issues the query, reply with the `need_context` object and request what would settle it. Request context whenever you are unsure rather than editing a file you have not read.'
-EDIT_PROTOCOL = 'Reply with ONE JSON object and nothing else. Begin the reply with `{` and end it with `}`. Two shapes are allowed.\n\nTo gather more evidence before deciding (the agent tells you how many rounds remain; an unnamed target allows more than a named one, and each failed attempt grants another):\n\n{"action": "need_context",\n "why": "<one sentence>",\n "requests": [\n   {"kind": "read_file", "path": "<repo-relative path>", "start": 1, "end": 200},\n   {"kind": "grep", "pattern": "<python regex>", "path_filter": "<optional substring>"},\n   {"kind": "sql", "query": "<read-only statement to run against the live database>"},\n   {"kind": "explain", "query": "<SELECT ... to EXPLAIN on the live database>"},\n   {"kind": "read_file", "path": "<repo-relative path>", "symbol": "<def or class name: returns that definition whole>"},\n   {"kind": "schema", "tables": ["<table name>", "..."]},\n   {"kind": "callers", "symbol": "<function or class name: who defines and who references it>"},\n   {"kind": "count", "setup": "<Django shell setup>", "call": "<one line using N>", "small": 1, "large": 10}\n ]}\n`count` measures the query count at two sizes BEFORE you edit -- use it on bounded-work tasks so you know the number you are trying to change.\n\nTo make the change:\n\n{"action": "edit",\n "diagnosis": "<the database-level cause, one or two sentences>",\n "verify": ["<any shell command the instruction says to run before finishing, copied verbatim; [] if it names none>"],\n "constraints": {"editable_files": ["<repo-relative paths the instruction allows you to change>"],\n                 "bounded_to_method": "<Class.method the instruction restricts the change to, or null>"},\n "edits": [\n   {"path": "<repo-relative path>",\n    "search": "<exact contiguous text from the current file, unique within it>",\n    "replace": "<replacement text>"}\n ]}\n\nA complete `edit` reply, to copy the shape of:\n\n{"action": "edit",\n "diagnosis": "share_pct divides two integer columns, so the fraction is truncated before Round() runs.",\n "verify": ["python manage.py test shop.tests.test_reports --keepdb --noinput"],\n "constraints": {"editable_files": ["shop/reports/querysets.py"],\n                 "bounded_to_method": "OrderQuerySet.annotate_share"},\n "edits": [\n   {"path": "shop/reports/querysets.py",\n    "search": "        return self.annotate(\\n            share_pct=Round(F(\'paid\') * 100 / F(\'total\'), 2),",\n    "replace": "        return self.annotate(\\n            share_pct=Round(F(\'paid\') * 100.0 / F(\'total\'), 2),"}\n ]}\n\nRules for edits:\n* `search` must reproduce the existing file byte for byte, including indentation. Include 2 to 5 surrounding lines, enough to appear exactly once in the file.\n* Give the smallest `search`/`replace` pair that expresses the change -- one edit per distinct change, each covering the lines that change plus that much context.\n* Change only what the fix requires. Leave docstrings, comments, formatting, blank lines and import order exactly as they are unless the task asks for them to change -- an unnecessary edit is a way to fail a scope check, never a way to pass one.\n* Keep `diagnosis` to at most 2 sentences and the whole reply under 2000 characters unless the edit itself is longer. Reason as far as naming the cause and writing the edit; deliberation past that point is billed and is not read.\n* `constraints` is read only when the instruction named no file and no method: state what it DOES allow, exactly as written. The agent enforces it against your own edits, so claim only what the instruction grants.\n* After a failed attempt you may request context again -- the failure output usually points at something worth reading before the next edit.\n* `verify` matters: those commands are run against the live database and their output comes back to you if they fail. Copy every check the instruction names, wherever it states them -- fenced block, inline text, or prose.\n* When the task is about work that must not grow with input size, add a probe so the agent can measure it before submitting:\n    "measure": {"setup": "<imports and fixture creation, Django shell>",\n                "call": "<one line exercising the change, using N as the size>",\n                "result": "<expression the change must NOT alter, e.g. sorted(x.name for x in qs)>",\n                "small": 1, "large": 10}\n  Use `N` as the selection size in `call`. The agent runs it at both sizes, on your edit and again on the code it replaced, and reports both counts. If they grow with N the fix is not bounded; if they did not drop, the rewrite moved code without removing work.\n  `result` is optional but worth supplying: it is evaluated after `call` on both versions and compared, which is the only evidence that fewer statements still return the same rows. Make it independent of database ids -- the two runs are separate transactions, so ids do not repeat.\n* To create a new file instead, use {"path": ..., "new_file": true, "content": "<full text>"}.\n* Escape newlines properly -- the whole reply must parse as JSON.'
+EDIT_PROTOCOL = 'Reply with ONE JSON object and nothing else. Begin the reply with `{` and end it with `}`. Two shapes are allowed.\n\nTo gather more evidence before deciding (the agent tells you how many rounds remain; an unnamed target allows more than a named one, and each failed attempt grants another):\n\n{"action": "need_context",\n "why": "<one sentence>",\n "requests": [\n   {"kind": "read_file", "path": "<repo-relative path>", "start": 1, "end": 200},\n   {"kind": "grep", "pattern": "<python regex>", "path_filter": "<optional substring>"},\n   {"kind": "sql", "query": "<read-only statement to run against the live database>"},\n   {"kind": "explain", "query": "<SELECT ... to EXPLAIN on the live database>"},\n   {"kind": "read_file", "path": "<repo-relative path>", "symbol": "<def or class name: returns that definition whole>"},\n   {"kind": "schema", "tables": ["<table name>", "..."]},\n   {"kind": "callers", "symbol": "<function or class name: who defines and who references it>"},\n   {"kind": "count", "setup": "<Django shell setup>", "call": "<one line using N>", "small": 1, "large": 10}\n ]}\n`count` measures the query count at two sizes BEFORE you edit -- use it on bounded-work tasks so you know the number you are trying to change.\n\nTo make the change:\n\n{"action": "edit",\n "diagnosis": "<the database-level cause, one or two sentences>",\n "verify": ["<any shell command the instruction says to run before finishing, copied verbatim; [] if it names none>"],\n "constraints": {"editable_files": ["<repo-relative paths the instruction allows you to change>"],\n                 "bounded_to_method": "<Class.method the instruction restricts the change to, or null>"},\n "edits": [\n   {"path": "<repo-relative path>",\n    "search": "<exact contiguous text from the current file, unique within it>",\n    "replace": "<replacement text>"}\n ]}\n\nA complete `edit` reply, to copy the shape of:\n\n{"action": "edit",\n "diagnosis": "share_pct divides two integer columns, so the fraction is truncated before Round() runs.",\n "verify": ["python manage.py test shop.tests.test_reports --keepdb --noinput"],\n "constraints": {"editable_files": ["shop/reports/querysets.py"],\n                 "bounded_to_method": "OrderQuerySet.annotate_share"},\n "edits": [\n   {"path": "shop/reports/querysets.py",\n    "search": "        return self.annotate(\\n            share_pct=Round(F(\'paid\') * 100 / F(\'total\'), 2),",\n    "replace": "        return self.annotate(\\n            share_pct=Round(F(\'paid\') * 100.0 / F(\'total\'), 2),"}\n ]}\n\nRules for edits:\n* `search` must reproduce the existing file byte for byte, including indentation. Include 2 to 5 surrounding lines, enough to appear exactly once in the file.\n* Give the smallest `search`/`replace` pair that expresses the change -- one edit per distinct change, each covering the lines that change plus that much context.\n* Change only what the fix requires. Leave docstrings, comments, formatting, blank lines and import order exactly as they are unless the task asks for them to change -- an unnecessary edit is a way to fail a scope check, never a way to pass one.\n* Keep `diagnosis` to at most 2 sentences and the whole reply under 2000 characters unless the edit itself is longer. Reason as far as naming the cause and writing the edit; deliberation past that point is billed and is not read.\n* `constraints` is read only when the instruction named no file and no method: state what it DOES allow, exactly as written. The agent enforces it against your own edits, so claim only what the instruction grants.\n* After a failed attempt you may request context again -- the failure output usually points at something worth reading before the next edit.\n* `verify` matters: those commands are run against the live database and their output comes back to you if they fail. Copy every check the instruction names, wherever it states them -- fenced block, inline text, or prose.\n* When the task is about work that must not grow with input size, add a probe so the agent can measure it before submitting:\n    "measure": {"setup": "<imports and fixture creation, Django shell>",\n                "call": "<one line exercising the change, using N as the size>",\n                "result": "<expression the change must NOT alter, e.g. sorted(x.name for x in qs)>",\n                "small": 1, "large": 10}\n  Use `N` as the selection size in `call`. The agent runs it at both sizes, on your edit and again on the code it replaced, and reports both counts. If they grow with N the fix is not bounded; if they did not drop, the rewrite moved code without removing work.\n  `result` is optional but worth supplying: it is evaluated after `call` on both versions and compared, which is the only evidence that fewer statements still return the same rows. Make it independent of database ids -- the two runs are separate transactions, so ids do not repeat.\n  On ClickHouse, and in any project without a Django shell, give a shell command instead:\n    "measure": {"command": "<one command that exercises the change and prints its result>"}\n  The agent runs it on your edit and again on the code it replaced, reads from the server how many statements each version issued and how many rows each one read, and compares what the command printed. Fewer rows read with the same output is the improvement; more rows read with the same output is a regression, and different output is a broken rewrite.\n* To create a new file instead, use {"path": ..., "new_file": true, "content": "<full text>"}.\n* Escape newlines properly -- the whole reply must parse as JSON.'
 
 class PromptBuilder:
 
@@ -2188,8 +2336,11 @@ class PromptBuilder:
             facts.append(f'live database (this agent connected to it and it answered SELECT 1): {target_url(self.probe.targets[0])}')
         if not (self.instruction.edit_only or self.instruction.lint_paths or self.instruction.named_paths):
             facts.append("the instruction names no file to edit: the candidates below are this agent's ranking, not the task's -- identify which one actually issues the query, and fill `constraints` with what the instruction does permit")
-        if 'bounded_queries' in self.instruction.kinds or self.instruction.targets.get('max_queries'):
+        clickhouse = self.probe.available() and self.probe.targets[0].engine == 'clickhouse'
+        if not clickhouse and ('bounded_queries' in self.instruction.kinds or self.instruction.targets.get('max_queries')):
             facts.append('supply a `measure` probe with your edit: this agent runs it at two selection sizes, before and after your change, and reports both counts back to you -- so a fix that still scales with input, or that does not actually issue fewer statements than the code it replaced, is caught before you finish')
+        elif clickhouse and self.instruction.reduces_work:
+            facts.append('supply `measure.command` with your edit -- one shell command that exercises the change and prints its result. This agent runs it on your edit and on the code it replaced, and reports how many rows ClickHouse read for each, so a rewrite that reads more than what it replaced, or returns something different, is caught before you finish')
         facts.extend(self.instruction.unparsed)
         if self.instruction.targets.get('create_paths'):
             facts.append(f"these paths named by the instruction do not exist yet: {self.instruction.targets['create_paths']} -- create them with a new_file edit")
@@ -2292,7 +2443,7 @@ def extract_json(content: str) -> dict | None:
                         break
     return None
 _READ_ONLY_START = re.compile('^\\s*(?:\\(\\s*)*(SELECT|WITH|EXPLAIN|SHOW|DESCRIBE|DESC|TABLE|VALUES)\\b', re.IGNORECASE)
-_MUTATING = re.compile('\\b(INSERT|UPDATE|DELETE|MERGE|UPSERT|REPLACE|CREATE|ALTER|DROP|TRUNCATE|RENAME|GRANT|REVOKE|COPY|VACUUM|ANALYZE\\s+\\w|REINDEX|CLUSTER|LOCK|SET\\s+(?!TRANSACTION)|RESET|DO|CALL|EXECUTE|OPTIMIZE|ATTACH|DETACH|KILL|SYSTEM|INTO\\s+OUTFILE|pg_terminate|pg_cancel|lo_)\\b', re.IGNORECASE)
+_MUTATING = re.compile('\\b(INSERT|UPDATE|DELETE|MERGE|UPSERT|REPLACE|CREATE|ALTER|DROP|TRUNCATE|RENAME|GRANT|REVOKE|COPY|VACUUM|ANALYZE\\s+\\w|REINDEX|CLUSTER|LOCK|SET\\s+(?!TRANSACTION)|RESET|DO|CALL|EXECUTE|OPTIMIZE|ATTACH|DETACH|KILL|SYSTEM\\b(?!\\s*\\.)|INTO\\s+OUTFILE|pg_terminate|pg_cancel|lo_)\\b', re.IGNORECASE)
 
 def is_read_only_sql(query: str) -> bool:
     body = re.sub('--[^\\n]*|/\\*.*?\\*/', ' ', query, flags=re.DOTALL).strip()
@@ -2660,7 +2811,8 @@ class Solver:
                     log('still unmeasured after one request; adopting the patch as best effort')
                     return patch
                 names = ', '.join((check.name for check in unmeasured))
-                feedback += f'\n\nEvery check passed, but {names} could not run, so the database work this change performs was never measured -- and that measurement is what the task is about. Reply with the same diagnosis and a `measure` probe that reports: `setup` creating the objects the call needs, `call` a single line using N as the selection size. If the count cannot be reduced further, look again for work the new query makes redundant -- a guard or a lookup the set-based form no longer needs.'
+                raised = any(('probe itself raised' in check.detail for check in unmeasured))
+                feedback += f'\n\nEvery check passed, but {names} could not run, so the database work this change performs was never measured -- and that measurement is what the task is about. ' + ('The probe you supplied is the thing that failed; the detail above names the exception. Send the same edit again with `measure` corrected.' if raised else 'Reply with the same diagnosis and a `measure` probe that reports: `setup` creating the objects the call needs, `call` a single line using N as the selection size.') + ' If the count cannot be reduced further, look again for work the new query makes redundant -- a guard or a lookup the set-based form no longer needs.'
                 messages.append({'role': 'user', 'content': feedback})
                 continue
             if unverified:

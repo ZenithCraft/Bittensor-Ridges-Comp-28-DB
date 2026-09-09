@@ -56,19 +56,68 @@ G, R, Y, B, D, X = "\033[32m", "\033[31m", "\033[33m", "\033[36m", "\033[2m", "\
 # The verifier service harbor would have built from [verifier.environment].
 # `main` is deliberately not reused: that name belongs to the agent's container,
 # and the whole point here is that they are different images.
-OVERLAY = """\
+OVERLAY_HEAD = """\
 services:
   verifier:
     build:
       context: .
       dockerfile: Dockerfile
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
     command: ["sh", "-c", "sleep infinity"]
 """
+
+# Top-level service names in a compose file, and whether each declares a
+# healthcheck. Two indentation levels of a mapping is all this needs to know,
+# so it stays a regex rather than a YAML dependency this harness would
+# otherwise carry for one field.
+_SERVICE = re.compile(r"^  ([A-Za-z0-9][\w.-]*):\s*$")
+_HEALTHCHECK = re.compile(r"^    healthcheck:\s*$")
+
+
+def sidecars(compose: Path) -> dict[str, bool]:
+    """The task's own sidecar services, mapped to whether they report health.
+
+    The bench is not one stack: the PostgreSQL tasks ship postgres and redis,
+    the ClickHouse tasks ship a single clickhouse. Hardcoding the first set
+    meant `grade.py` produced a compose file referring to services that do not
+    exist on a ClickHouse task, so the true grader could not be run on a third
+    of the corpus. Reading the names out of the task's own file needs no list
+    to keep up to date.
+
+    Health matters because `depends_on` and `--wait` only mean "started" for a
+    service that declares no healthcheck, and waiting on health that is never
+    reported hangs until the timeout.
+    """
+    found: dict[str, bool] = {}
+    current: str | None = None
+    inside_services = False
+    for line in compose.read_text().splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith(" "):
+            inside_services = line.startswith("services:")
+            current = None
+            continue
+        if not inside_services:
+            continue
+        named = _SERVICE.match(line)
+        if named:
+            current = named.group(1)
+            found.setdefault(current, False)
+        elif current and _HEALTHCHECK.match(line):
+            found[current] = True
+    found.pop("verifier", None)
+    return found
+
+
+def overlay_for(services: dict[str, bool]) -> str:
+    """The verifier service, waiting on whatever the task actually ships."""
+    if not services:
+        return OVERLAY_HEAD
+    rows = "".join(
+        f"      {name}:\n        condition: "
+        f"{'service_healthy' if healthy else 'service_started'}\n"
+        for name, healthy in sorted(services.items()))
+    return OVERLAY_HEAD + "    depends_on:\n" + rows
 
 
 def docker(*args: str, timeout: float = 3600, check: bool = False,
@@ -140,6 +189,7 @@ class Verifier:
         self.keep = keep
         self.verbose = verbose
         self.overlay = self.tests / ".grade-verifier.yaml"
+        self.sidecars = sidecars(self.tests / "docker-compose.yaml")
 
     # -- lifecycle -------------------------------------------------------
     def _compose(self, *args: str, timeout: float = 3600) -> subprocess.CompletedProcess:
@@ -148,22 +198,51 @@ class Verifier:
                       *args, cwd=self.tests, timeout=timeout)
 
     def __enter__(self) -> "Verifier":
-        self.overlay.write_text(OVERLAY)
-        # Down first: a previous run's postgres holds the schema this run's
-        # conservation check hashes, so a reused database is a different test.
+        self.overlay.write_text(overlay_for(self.sidecars))
+        # Down first: a previous run's database holds the schema this run's
+        # conservation check hashes, so a reused one is a different test.
         self._compose("down", "-v", "--remove-orphans", timeout=300)
         say(f"{D}building the verifier image (cached layers are reused){X}")
         built = self._compose("build", "verifier")
         if built.returncode:
             raise SystemExit(f"verifier image build failed:\n{built.stdout[-3000:]}")
-        say(f"{D}starting postgres and redis{X}")
-        up = self._compose("up", "-d", "--wait", "postgres", "redis", timeout=900)
-        if up.returncode:
-            raise SystemExit(f"sidecars did not become healthy:\n{up.stdout[-3000:]}")
+        if self.sidecars:
+            names = sorted(self.sidecars)
+            say(f"{D}starting {', '.join(names)}{X}")
+            # --wait only where health is reported; asking for it otherwise
+            # waits out the full timeout on a container that is already up.
+            waitable = [n for n in names if self.sidecars[n]]
+            up = self._compose("up", "-d", *(["--wait"] if waitable else []),
+                               *names, timeout=900)
+            if up.returncode:
+                raise SystemExit(f"sidecars did not become healthy:\n{up.stdout[-3000:]}")
         started = self._compose("up", "-d", "--force-recreate", "verifier", timeout=600)
         if started.returncode:
             raise SystemExit(f"verifier container did not start:\n{started.stdout[-3000:]}")
+        self.stage_pristine()
         return self
+
+    def stage_pristine(self) -> None:
+        """Put the pristine copy of the application where the grader looks.
+
+        The two halves of the bench check source-tree conservation differently.
+        The PostgreSQL tasks hash a manifest baked into the image; the
+        ClickHouse ones diff /app against a pristine tree at /tests/app -- and
+        their verifier Dockerfile copies the test scripts into /tests without
+        copying that tree, so every file in /app reads as newly added and the
+        reference solution scores zero.
+
+        In a real run the verifier has the task's whole tests directory
+        available, so the tree is simply there. Here the image is built from
+        that directory and keeps only what the Dockerfile asked for, so it has
+        to be put back. Copied after every container creation, because
+        recreating the verifier is what gives each patch a fresh /app and it
+        takes the staged tree with it.
+        """
+        pristine = self.tests / "app"
+        if not pristine.is_dir():
+            return                       # a manifest-based task; nothing to stage
+        self.copy_in(pristine, "/tests/app")
 
     def __exit__(self, *exc) -> None:
         if self.keep:
@@ -198,6 +277,7 @@ class Verifier:
     def recreate(self) -> None:
         """A fresh /app. Grading mutates it, so each patch needs its own."""
         self._compose("up", "-d", "--force-recreate", "verifier", timeout=600)
+        self.stage_pristine()
 
     # -- the two things this script does ---------------------------------
     def patch_from_solution(self) -> str:
