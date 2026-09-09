@@ -468,6 +468,10 @@ class Instruction:
     @property
     def primary_kind(self) -> str:
         return self.kinds[0] if self.kinds else 'general'
+
+    @property
+    def bounded_work(self) -> bool:
+        return 'bounded_queries' in self.kinds or bool(self.targets.get('max_queries'))
 SHELL_FENCES = frozenset({'bash', 'sh', 'shell', 'zsh', 'console', 'shell-session', 'terminal'})
 
 def _fenced_blocks(text: str, *, tagged: bool=False):
@@ -756,6 +760,9 @@ class Repository:
                 self._cache[relative] = original
         except OSError as exc:
             log(f'WARNING: could not restore {relative} ({exc}); the checkout may not be pristine')
+
+    def forget(self, relative: str) -> None:
+        self._cache.pop(relative, None)
 
     def revert_all(self) -> None:
         for relative in list(self._snapshots):
@@ -1617,6 +1624,7 @@ class Checker:
         self.instruction = instruction
         self.probe = probe
         self.candidates = list(candidates)
+        self._baselines: dict[str, tuple[dict[int, int], list | None] | None] = {}
 
     def run_all(self, changed: Sequence[str], *, include_tests: bool=True) -> list[CheckResult]:
         results = [self.check_scope(changed)]
@@ -1944,11 +1952,66 @@ class Checker:
             return []
         result = run_command(['ruff', 'check', '--no-cache', *python_files], timeout=120)
         return [CheckResult('ruff', result.returncode == 0, truncate(result.stdout, 2000))]
-    _DJANGO_PROBE = '\nimport json\nfrom django.db import connection\nfrom django.test.utils import CaptureQueriesContext\n{setup}\ncounts = {{}}\nfor _n in ({small}, {large}):\n    N = _n\n    with CaptureQueriesContext(connection) as _ctx:\n        {call}\n    counts[_n] = len(_ctx)\nprint("RIDGES_QC" + json.dumps(counts))\nprint("RIDGES_QS" + json.dumps([q["sql"] for q in _ctx.captured_queries[:6]]))\n'
+    _DJANGO_PROBE = '\nimport json, traceback\nfrom django.db import connection, transaction\nfrom django.test.utils import CaptureQueriesContext\n\n_cfg = connection.settings_dict\n_cfg["NAME"] = (_cfg.get("TEST") or {{}}).get("NAME") or ("test_" + _cfg["NAME"])\nconnection.close()\n\ndef _fingerprint(value):\n    # Order-insensitive, because a filter rewrite is not required to preserve\n    # ordering and the task\'s own tests cover it when it is.\n    try:\n        if hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):\n            return sorted(repr(item) for item in value)\n    except Exception:\n        pass\n    return [repr(value)]\n\ncounts = {{}}\n_fp = None\ntry:\n    with transaction.atomic():\n{setup}\n        for _n in ({small}, {large}):\n            N = _n\n            with CaptureQueriesContext(connection) as _ctx:\n{call}\n            counts[_n] = len(_ctx)\n{result}\n        transaction.set_rollback(True)\nexcept Exception:\n    traceback.print_exc()\nelse:\n    print("RIDGES_QC" + json.dumps(counts))\n    print("RIDGES_QS" + json.dumps([q["sql"] for q in _ctx.captured_queries[:6]]))\n    if _fp is not None:\n        print("RIDGES_QR" + json.dumps(_fp))\n'
+
+    def _probe_run(self, manage: str, setup: str, call: str, result: str, small: int, large: int) -> tuple[dict[int, int] | None, list | None, str]:
+        script = self._DJANGO_PROBE.format(setup='\n'.join((f'        {line}' for line in setup.splitlines())) or '        pass', call='\n'.join((f'                {line}' for line in call.splitlines())), result=f'        _fp = _fingerprint({result})' if result else '        pass', small=small, large=large)
+        run = run_command([app_python(self.repo.root), manage, 'shell', '-c', script], timeout=min(300.0, max(60.0, remaining_seconds() - 200)))
+        stdout = run.stdout or ''
+        fingerprint = None
+        found = re.search('RIDGES_QR(\\[.*\\])', stdout)
+        if found:
+            try:
+                fingerprint = sorted(json.loads(found.group(1)))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        match = re.search('RIDGES_QC(\\{.*\\})', stdout)
+        if not match:
+            return (None, fingerprint, stdout)
+        try:
+            counts = {int(k): int(v) for k, v in json.loads(match.group(1)).items()}
+        except (ValueError, json.JSONDecodeError):
+            return (None, fingerprint, stdout)
+        return (counts, fingerprint, stdout)
+
+    def _baseline_probe(self, manage: str, setup: str, call: str, result: str, small: int, large: int) -> tuple[dict[int, int], list | None] | None:
+        signature = hashlib.sha1(f'{setup}\x00{call}\x00{result}\x00{small}\x00{large}'.encode()).hexdigest()
+        if signature in self._baselines:
+            return self._baselines[signature]
+        if remaining_seconds() < 420:
+            return None
+        edited: dict[str, str | None] = {}
+        for relative in self.repo.changed_files():
+            path = self.repo.root / relative
+            try:
+                edited[relative] = read_source(path) if path.exists() else None
+            except (OSError, UnicodeDecodeError):
+                return None
+        if not edited:
+            return None
+        self._baselines[signature] = None
+        try:
+            self.repo.revert_all()
+            counts, fingerprint, _ = self._probe_run(manage, setup, call, result, small, large)
+        finally:
+            for relative, text in edited.items():
+                try:
+                    if text is None:
+                        (self.repo.root / relative).unlink(missing_ok=True)
+                        self.repo.forget(relative)
+                    else:
+                        self.repo.write(relative, text)
+                except OSError as exc:
+                    log(f'WARNING: could not restore {relative} after the baseline probe ({exc}); the patch may be incomplete')
+        if counts is None:
+            return None
+        self._baselines[signature] = (counts, fingerprint)
+        return self._baselines[signature]
 
     def measure_query_scaling(self, probe: dict) -> CheckResult | None:
         setup = (probe.get('setup') or '').strip()
         call = (probe.get('call') or '').strip()
+        result_expr = ' '.join((probe.get('result') or '').split())
         if not call:
             return None
         manage = next((p for p in self.repo.files if Path(p).name == 'manage.py' and p.count('/') <= 2), None)
@@ -1959,27 +2022,55 @@ class Checker:
             large = int(probe.get('large') or 10)
         except (TypeError, ValueError):
             small, large = (1, 10)
-        script = self._DJANGO_PROBE.format(setup='\n'.join((f'{line}' for line in setup.splitlines())), call='\n        '.join(call.splitlines()), small=small, large=large)
-        result = run_command([app_python(self.repo.root), manage, 'shell', '-c', script], timeout=min(300.0, max(60.0, remaining_seconds() - 200)))
-        match = re.search('RIDGES_QC(\\{.*\\})', result.stdout or '')
-        if not match:
-            return CheckResult('query scaling', True, f'the probe produced no query count, so the database work this change performs is unmeasured. Output was:\n{truncate(result.stdout, 2000)}', verified=False)
-        try:
-            counts = {int(k): int(v) for k, v in json.loads(match.group(1)).items()}
-        except (ValueError, json.JSONDecodeError):
-            return CheckResult('query scaling', True, "the probe's count could not be read", verified=False)
+        counts, fingerprint, stdout = self._probe_run(manage, setup, call, result_expr, small, large)
+        if counts is None:
+            return CheckResult('query scaling', True, f'the probe produced no query count, so the database work this change performs is unmeasured. Output was:\n{truncate(stdout, 2000)}', verified=False)
         low, high = (counts.get(small), counts.get(large))
         if low is None or high is None:
             return CheckResult('query scaling', True, f'incomplete measurement: {counts}', verified=False)
+        baseline = self._baseline_probe(manage, setup, call, result_expr, small, large)
+        base, base_fp = baseline if baseline else (None, None)
+        base_low = base.get(small) if base else None
+        base_high = base.get(large) if base else None
+        before = f' Before the edit the same probe issued {base_low} at N={small} and {base_high} at N={large}.' if base_high is not None else ''
         limit = self.instruction.targets.get('max_queries')
         failure = None
         if limit and high > limit:
             failure = f'the instruction allows at most {limit} queries; measured {low} at N={small} and {high} at N={large}.'
         elif high > low + 1:
             failure = f'query count still grows with input: {low} queries at N={small}, {high} at N={large}. The work must be bounded -- fold the per-item statements into one set-based query.'
+        elif base_high is not None and high > base_high and self.instruction.bounded_work:
+            failure = f'this change increased the database work it was meant to reduce: {base_high} queries at N={large} before it, {high} after.'
+        elif base_fp is not None and fingerprint is not None and (base_fp != fingerprint):
+            failure = self._differential_failure(base_fp, fingerprint)
         if failure:
-            return CheckResult('query scaling', False, failure + self._explain_captured(result.stdout or ''))
-        return CheckResult('query scaling', True, f'bounded: {low} queries at N={small}, {high} at N={large}' + (f' (limit {limit})' if limit else ''))
+            return CheckResult('query scaling', False, failure + before + self._explain_captured(stdout))
+        if base_high is not None:
+            detail = f'bounded: {base_high} -> {high} queries at N={large}, {base_low} -> {low} at N={small}'
+        else:
+            detail = f'bounded: {low} queries at N={small}, {high} at N={large}'
+        if base_fp is not None and fingerprint is not None:
+            detail += f'; `result` unchanged ({len(fingerprint)} item(s))'
+        return CheckResult('query scaling', True, detail + (f' (limit {limit})' if limit else ''))
+
+    @staticmethod
+    def _differential_failure(before: list, after: list) -> str:
+        gone = [item for item in before if item not in after][:5]
+        added = [item for item in after if item not in before][:5]
+        detail = f'`result` changed: the code before this edit produced {len(before)} item(s), this version produces {len(after)}. Reducing the query count is only correct if the rows come back the same.'
+        if gone:
+            detail += '\n  only before: ' + truncate(', '.join(gone), 400)
+        if added:
+            detail += '\n  only after:  ' + truncate(', '.join(added), 400)
+        detail += "\n  If the values differ only by database ids, that is this measurement's own artefact -- the two runs are separate transactions and the id sequence does not rewind. Supply a `result` expression that does not depend on ids."
+        return detail
+
+    def unmeasured_bounded_work(self, supplied: dict) -> CheckResult | None:
+        if not self.instruction.bounded_work or (supplied or {}).get('call'):
+            return None
+        if not any((Path(p).name == 'manage.py' and p.count('/') <= 2 for p in self.repo.files)):
+            return None
+        return CheckResult('query scaling', True, 'this task is about the number of statements the change issues, and no `measure` probe was supplied, so that number was never taken', verified=False)
 
     def _explain_captured(self, stdout: str) -> str:
         match = re.search('RIDGES_QS(\\[.*\\])', stdout)
@@ -2069,7 +2160,7 @@ def summarise(checks: Sequence[CheckResult]) -> str:
     return '\n'.join(lines)
 SYSTEM_PROMPT = "You are a database query engineer. You fix, author, and optimise the queries a real application issues against PostgreSQL or ClickHouse, working inside the application's own repository: raw SQL, ORM code, or query-builder code.\n\nHow you work:\n\n* Edit production query code, and write the fix so it holds for data you have not seen. Implement the general rule the task states, in terms of the columns and relations it names, rather than anything that happens to suit the rows in front of you.\n* Reduce the database work the query performs -- statements issued, rows and buffers touched, index usage. Remove work the query genuinely does not need, rather than moving it somewhere less visible.\n* Keep everything outside the blast radius the instruction sets byte-identical, imports included, and build the fix from names already in scope.\n* Make the smallest change that fixes the underlying cause.\n\nReasoning you should apply, by symptom:\n\n* Work that grows with input size -- a statement per element, per row, or per iteration -- becomes one set-based statement: a single bulk insert/update, one `IN`/`ANY` predicate, a join, or a CTE. Compute the set difference in the database, and keep any signal/callback contract firing exactly once with the same payload.\n* A slow or unselective plan usually means the predicate the application actually issues is not the one the index serves. Match index column order and partiality to the real predicate, including equality columns first.\n* Wrong aggregates over a hierarchy or a many-to-many usually mean fan-out: rows multiplied by a join. Fix it with DISTINCT on the counted key, a subquery/lateral, or a nested-set/recursive descendant predicate, keeping the correction in the database rather than in application code.\n* Percentages and ratios should be computed in the database with explicit numeric casting and a zero-denominator guard.\n* On ClickHouse, favour the primary key order and PREWHERE, prefer set-based expressions over per-row subqueries, and remember that JOIN semantics and nullability differ from PostgreSQL. An `explain` request there also returns read_rows, read_bytes, selected parts and marks -- the amount of data the query actually touched, so check it fell. Build a series with numbers(N) or arrayJoin(range(...)) rather than by selecting from system.numbers: a report should not depend on the server's own introspection tables.\n\nYou answer only with a single JSON object, described in the user message."
 DIRECTIVE = '# Instructions\n\nDiagnose the database defect described in the task statement below, then reply with one JSON object in the format given at the end of this message.\n\nWork in this order:\n\n1. Read the task statement. It is the authority on what to change, which files you may edit, and which checks to run.\n2. Locate the code that issues the query in question, using the source provided below.\n3. Name the database-level cause in at most two sentences.\n4. Write the smallest edit that fixes that cause.\n5. Reply with the JSON object.\n\nWhen the statement does not name the file to edit and the provided source does not settle which file issues the query, reply with the `need_context` object and request what would settle it. Request context whenever you are unsure rather than editing a file you have not read.'
-EDIT_PROTOCOL = 'Reply with ONE JSON object and nothing else. Begin the reply with `{` and end it with `}`. Two shapes are allowed.\n\nTo gather more evidence before deciding (the agent tells you how many rounds remain; an unnamed target allows more than a named one, and each failed attempt grants another):\n\n{"action": "need_context",\n "why": "<one sentence>",\n "requests": [\n   {"kind": "read_file", "path": "<repo-relative path>", "start": 1, "end": 200},\n   {"kind": "grep", "pattern": "<python regex>", "path_filter": "<optional substring>"},\n   {"kind": "sql", "query": "<read-only statement to run against the live database>"},\n   {"kind": "explain", "query": "<SELECT ... to EXPLAIN on the live database>"},\n   {"kind": "read_file", "path": "<repo-relative path>", "symbol": "<def or class name: returns that definition whole>"},\n   {"kind": "schema", "tables": ["<table name>", "..."]},\n   {"kind": "callers", "symbol": "<function or class name: who defines and who references it>"},\n   {"kind": "count", "setup": "<Django shell setup>", "call": "<one line using N>", "small": 1, "large": 10}\n ]}\n`count` measures the query count at two sizes BEFORE you edit -- use it on bounded-work tasks so you know the number you are trying to change.\n\nTo make the change:\n\n{"action": "edit",\n "diagnosis": "<the database-level cause, one or two sentences>",\n "verify": ["<any shell command the instruction says to run before finishing, copied verbatim; [] if it names none>"],\n "constraints": {"editable_files": ["<repo-relative paths the instruction allows you to change>"],\n                 "bounded_to_method": "<Class.method the instruction restricts the change to, or null>"},\n "edits": [\n   {"path": "<repo-relative path>",\n    "search": "<exact contiguous text from the current file, unique within it>",\n    "replace": "<replacement text>"}\n ]}\n\nA complete `edit` reply, to copy the shape of:\n\n{"action": "edit",\n "diagnosis": "share_pct divides two integer columns, so the fraction is truncated before Round() runs.",\n "verify": ["python manage.py test shop.tests.test_reports --keepdb --noinput"],\n "constraints": {"editable_files": ["shop/reports/querysets.py"],\n                 "bounded_to_method": "OrderQuerySet.annotate_share"},\n "edits": [\n   {"path": "shop/reports/querysets.py",\n    "search": "        return self.annotate(\\n            share_pct=Round(F(\'paid\') * 100 / F(\'total\'), 2),",\n    "replace": "        return self.annotate(\\n            share_pct=Round(F(\'paid\') * 100.0 / F(\'total\'), 2),"}\n ]}\n\nRules for edits:\n* `search` must reproduce the existing file byte for byte, including indentation. Include 2 to 5 surrounding lines, enough to appear exactly once in the file.\n* Give the smallest `search`/`replace` pair that expresses the change -- one edit per distinct change, each covering the lines that change plus that much context.\n* Change only what the fix requires. Leave docstrings, comments, formatting, blank lines and import order exactly as they are unless the task asks for them to change -- an unnecessary edit is a way to fail a scope check, never a way to pass one.\n* Keep `diagnosis` to at most 2 sentences and the whole reply under 2000 characters unless the edit itself is longer. Reason as far as naming the cause and writing the edit; deliberation past that point is billed and is not read.\n* `constraints` is read only when the instruction named no file and no method: state what it DOES allow, exactly as written. The agent enforces it against your own edits, so claim only what the instruction grants.\n* After a failed attempt you may request context again -- the failure output usually points at something worth reading before the next edit.\n* `verify` matters: those commands are run against the live database and their output comes back to you if they fail. Copy every check the instruction names, wherever it states them -- fenced block, inline text, or prose.\n* When the task is about work that must not grow with input size, add a probe so the agent can measure it before submitting:\n    "measure": {"setup": "<imports and fixture creation, Django shell>",\n                "call": "<one line exercising the change, using N as the size>",\n                "small": 1, "large": 10}\n  Use `N` as the selection size in `call`. The agent runs it at both sizes and tells you the query counts; if they grow with N the fix is not bounded.\n* To create a new file instead, use {"path": ..., "new_file": true, "content": "<full text>"}.\n* Escape newlines properly -- the whole reply must parse as JSON.'
+EDIT_PROTOCOL = 'Reply with ONE JSON object and nothing else. Begin the reply with `{` and end it with `}`. Two shapes are allowed.\n\nTo gather more evidence before deciding (the agent tells you how many rounds remain; an unnamed target allows more than a named one, and each failed attempt grants another):\n\n{"action": "need_context",\n "why": "<one sentence>",\n "requests": [\n   {"kind": "read_file", "path": "<repo-relative path>", "start": 1, "end": 200},\n   {"kind": "grep", "pattern": "<python regex>", "path_filter": "<optional substring>"},\n   {"kind": "sql", "query": "<read-only statement to run against the live database>"},\n   {"kind": "explain", "query": "<SELECT ... to EXPLAIN on the live database>"},\n   {"kind": "read_file", "path": "<repo-relative path>", "symbol": "<def or class name: returns that definition whole>"},\n   {"kind": "schema", "tables": ["<table name>", "..."]},\n   {"kind": "callers", "symbol": "<function or class name: who defines and who references it>"},\n   {"kind": "count", "setup": "<Django shell setup>", "call": "<one line using N>", "small": 1, "large": 10}\n ]}\n`count` measures the query count at two sizes BEFORE you edit -- use it on bounded-work tasks so you know the number you are trying to change.\n\nTo make the change:\n\n{"action": "edit",\n "diagnosis": "<the database-level cause, one or two sentences>",\n "verify": ["<any shell command the instruction says to run before finishing, copied verbatim; [] if it names none>"],\n "constraints": {"editable_files": ["<repo-relative paths the instruction allows you to change>"],\n                 "bounded_to_method": "<Class.method the instruction restricts the change to, or null>"},\n "edits": [\n   {"path": "<repo-relative path>",\n    "search": "<exact contiguous text from the current file, unique within it>",\n    "replace": "<replacement text>"}\n ]}\n\nA complete `edit` reply, to copy the shape of:\n\n{"action": "edit",\n "diagnosis": "share_pct divides two integer columns, so the fraction is truncated before Round() runs.",\n "verify": ["python manage.py test shop.tests.test_reports --keepdb --noinput"],\n "constraints": {"editable_files": ["shop/reports/querysets.py"],\n                 "bounded_to_method": "OrderQuerySet.annotate_share"},\n "edits": [\n   {"path": "shop/reports/querysets.py",\n    "search": "        return self.annotate(\\n            share_pct=Round(F(\'paid\') * 100 / F(\'total\'), 2),",\n    "replace": "        return self.annotate(\\n            share_pct=Round(F(\'paid\') * 100.0 / F(\'total\'), 2),"}\n ]}\n\nRules for edits:\n* `search` must reproduce the existing file byte for byte, including indentation. Include 2 to 5 surrounding lines, enough to appear exactly once in the file.\n* Give the smallest `search`/`replace` pair that expresses the change -- one edit per distinct change, each covering the lines that change plus that much context.\n* Change only what the fix requires. Leave docstrings, comments, formatting, blank lines and import order exactly as they are unless the task asks for them to change -- an unnecessary edit is a way to fail a scope check, never a way to pass one.\n* Keep `diagnosis` to at most 2 sentences and the whole reply under 2000 characters unless the edit itself is longer. Reason as far as naming the cause and writing the edit; deliberation past that point is billed and is not read.\n* `constraints` is read only when the instruction named no file and no method: state what it DOES allow, exactly as written. The agent enforces it against your own edits, so claim only what the instruction grants.\n* After a failed attempt you may request context again -- the failure output usually points at something worth reading before the next edit.\n* `verify` matters: those commands are run against the live database and their output comes back to you if they fail. Copy every check the instruction names, wherever it states them -- fenced block, inline text, or prose.\n* When the task is about work that must not grow with input size, add a probe so the agent can measure it before submitting:\n    "measure": {"setup": "<imports and fixture creation, Django shell>",\n                "call": "<one line exercising the change, using N as the size>",\n                "result": "<expression the change must NOT alter, e.g. sorted(x.name for x in qs)>",\n                "small": 1, "large": 10}\n  Use `N` as the selection size in `call`. The agent runs it at both sizes, on your edit and again on the code it replaced, and reports both counts. If they grow with N the fix is not bounded; if they did not drop, the rewrite moved code without removing work.\n  `result` is optional but worth supplying: it is evaluated after `call` on both versions and compared, which is the only evidence that fewer statements still return the same rows. Make it independent of database ids -- the two runs are separate transactions, so ids do not repeat.\n* To create a new file instead, use {"path": ..., "new_file": true, "content": "<full text>"}.\n* Escape newlines properly -- the whole reply must parse as JSON.'
 
 class PromptBuilder:
 
@@ -2098,7 +2189,7 @@ class PromptBuilder:
         if not (self.instruction.edit_only or self.instruction.lint_paths or self.instruction.named_paths):
             facts.append("the instruction names no file to edit: the candidates below are this agent's ranking, not the task's -- identify which one actually issues the query, and fill `constraints` with what the instruction does permit")
         if 'bounded_queries' in self.instruction.kinds or self.instruction.targets.get('max_queries'):
-            facts.append('supply a `measure` probe with your edit: this agent runs it at two selection sizes and reports the query count back to you, so a fix that still scales with input is caught before you finish')
+            facts.append('supply a `measure` probe with your edit: this agent runs it at two selection sizes, before and after your change, and reports both counts back to you -- so a fix that still scales with input, or that does not actually issue fewer statements than the code it replaced, is caught before you finish')
         facts.extend(self.instruction.unparsed)
         if self.instruction.targets.get('create_paths'):
             facts.append(f"these paths named by the instruction do not exist yet: {self.instruction.targets['create_paths']} -- create them with a new_file edit")
@@ -2529,7 +2620,8 @@ class Solver:
             include_tests = remaining_seconds() > 400
             checks = self.checker.run_all(changed, include_tests=include_tests)
             if include_tests and all((c.passed for c in checks)):
-                measured = self.checker.measure_query_scaling(payload.get('measure') or {})
+                supplied = payload.get('measure') or {}
+                measured = self.checker.measure_query_scaling(supplied) or self.checker.unmeasured_bounded_work(supplied)
                 if measured is not None:
                     checks.append(measured)
                     log(f'query scaling: {measured.detail}')

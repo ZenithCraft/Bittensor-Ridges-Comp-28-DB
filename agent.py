@@ -1205,6 +1205,17 @@ class Instruction:
     def primary_kind(self) -> str:
         return self.kinds[0] if self.kinds else "general"
 
+    @property
+    def bounded_work(self) -> bool:
+        """Whether this task is judged on how much database work the change performs.
+
+        Deliberately narrower than "optimisation": the probe counts statements,
+        so it answers a task about statements growing with input, or one that
+        states a ceiling outright. An index task is also optimisation but is
+        judged on the plan, which this cannot measure and must not claim to.
+        """
+        return "bounded_queries" in self.kinds or bool(self.targets.get("max_queries"))
+
 
 # Fence tags that mean "the lines in here are shell commands". Measured across
 # the 62 bench statements: every one of the 60 fenced blocks is tagged ```bash,
@@ -1819,6 +1830,11 @@ class Repository:
             # Worth saying loudly: a file left modified is a file we changed
             # without meaning to, and it will show up in the patch.
             log(f"WARNING: could not restore {relative} ({exc}); the checkout may not be pristine")
+
+    def forget(self, relative: str) -> None:
+        """Drop a cached file body. Used when a file is removed behind the
+        cache's back, so a later read does not return text that is gone."""
+        self._cache.pop(relative, None)
 
     def revert_all(self) -> None:
         for relative in list(self._snapshots):
@@ -3229,6 +3245,9 @@ class Checker:
         # Files we independently judged relevant. When the instruction names no
         # editable path this is the only thing bounding the blast radius.
         self.candidates = list(candidates)
+        # Probe signature -> (counts, fingerprint) for the unedited code, so
+        # the baseline costs one shell run per run, not one per repair round.
+        self._baselines: dict[str, tuple[dict[int, int], list | None] | None] = {}
 
     def run_all(self, changed: Sequence[str], *, include_tests: bool = True) -> list[CheckResult]:
         trace("Checker", "in", changed=changed, include_tests=include_tests,
@@ -3760,25 +3779,171 @@ class Checker:
     # tests measure query count with CaptureQueriesContext at two selection
     # sizes. Passing a test suite says nothing about that, so measure it here:
     # a fix that still scales with input is a zero we can detect ourselves.
+    # Three things this template gets right that the obvious version does not.
+    #
+    # It repoints the connection at the TEST database first. `manage.py shell`
+    # opens the default one, which in these projects has no tables at all --
+    # migrations are applied to the database Django builds for a test run. Every
+    # probe until now died on `relation "..." does not exist` and reported
+    # nothing, which is why an optimisation task could ship unmeasured. The
+    # task's own `manage.py test` runs before this and leaves that database in
+    # place, so by the time the probe runs it exists.
+    #
+    # And it measures inside a transaction, rolled back at the end. That is not
+    # only tidiness: a Django TestCase wraps each test in a transaction too, so
+    # the query count seen here is taken under the same conditions the task's
+    # own tests take theirs -- outside one, Django's per-statement transaction
+    # management would inflate the count. The rollback then leaves the database
+    # exactly as it was found.
+    #
+    # And it can fingerprint the result, so the same two runs answer the other
+    # half of the question. Fewer statements returning different rows is not an
+    # optimisation, and a test suite that passed before the edit is no evidence
+    # about the rewrite that replaced the code it was testing.
     _DJANGO_PROBE = """
-import json
-from django.db import connection
+import json, traceback
+from django.db import connection, transaction
 from django.test.utils import CaptureQueriesContext
-{setup}
+
+_cfg = connection.settings_dict
+_cfg["NAME"] = (_cfg.get("TEST") or {{}}).get("NAME") or ("test_" + _cfg["NAME"])
+connection.close()
+
+def _fingerprint(value):
+    # Order-insensitive, because a filter rewrite is not required to preserve
+    # ordering and the task's own tests cover it when it is.
+    try:
+        if hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
+            return sorted(repr(item) for item in value)
+    except Exception:
+        pass
+    return [repr(value)]
+
 counts = {{}}
-for _n in ({small}, {large}):
-    N = _n
-    with CaptureQueriesContext(connection) as _ctx:
-        {call}
-    counts[_n] = len(_ctx)
-print("RIDGES_QC" + json.dumps(counts))
-print("RIDGES_QS" + json.dumps([q["sql"] for q in _ctx.captured_queries[:6]]))
+_fp = None
+try:
+    with transaction.atomic():
+{setup}
+        for _n in ({small}, {large}):
+            N = _n
+            with CaptureQueriesContext(connection) as _ctx:
+{call}
+            counts[_n] = len(_ctx)
+{result}
+        transaction.set_rollback(True)
+except Exception:
+    traceback.print_exc()
+else:
+    print("RIDGES_QC" + json.dumps(counts))
+    print("RIDGES_QS" + json.dumps([q["sql"] for q in _ctx.captured_queries[:6]]))
+    if _fp is not None:
+        print("RIDGES_QR" + json.dumps(_fp))
 """
+
+    def _probe_run(self, manage: str, setup: str, call: str, result: str,
+                   small: int, large: int) -> tuple[dict[int, int] | None, list | None, str]:
+        """Run the probe script once.
+
+        Returns (counts, fingerprint, stdout). counts is None if the script died
+        or printed something we could not read; fingerprint is None unless the
+        model supplied a `result` expression to compare across the edit.
+        """
+        # The blocks are nested now, so each is indented to its own level and an
+        # empty setup still has to be a body.
+        script = self._DJANGO_PROBE.format(
+            setup="\n".join(f"        {line}" for line in setup.splitlines()) or "        pass",
+            call="\n".join(f"                {line}" for line in call.splitlines()),
+            result=f"        _fp = _fingerprint({result})" if result else "        pass",
+            small=small, large=large)
+        run = run_command([app_python(self.repo.root), manage, "shell", "-c", script],
+                          timeout=min(300.0, max(60.0, remaining_seconds() - 200)))
+        stdout = run.stdout or ""
+        fingerprint = None
+        found = re.search(r"RIDGES_QR(\[.*\])", stdout)
+        if found:
+            try:
+                # Sorted on the way in, so the comparison downstream can never
+                # fail a correct patch over the order two runs happened to
+                # produce. The script sorts too; this makes it independent of
+                # that, because a spurious failure here costs a repair round.
+                fingerprint = sorted(json.loads(found.group(1)))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        match = re.search(r"RIDGES_QC(\{.*\})", stdout)
+        if not match:
+            return None, fingerprint, stdout
+        try:
+            counts = {int(k): int(v) for k, v in json.loads(match.group(1)).items()}
+        except (ValueError, json.JSONDecodeError):
+            return None, fingerprint, stdout
+        return counts, fingerprint, stdout
+
+    def _baseline_probe(self, manage: str, setup: str, call: str, result: str,
+                        small: int, large: int) -> tuple[dict[int, int], list | None] | None:
+        """The same probe, run against the code as it was before the edit.
+
+        A count on its own does not say much: three queries may be two too many
+        or one fewer than the code started with. Taking the same measurement
+        either side of the change turns the check into a delta, which is what
+        an optimisation task is actually graded on -- and it makes a rewrite
+        that reshuffles the code without reducing the work visible at once. The
+        same two runs also answer the other half of the question for free: did
+        the faster version still return what the slower one returned?
+
+        The sequence is revert, probe, put back. That is safe here because the
+        edit is on disk and read back first, and because the probe only reads:
+        it runs inside a transaction that is rolled back. Restoring is done in
+        a finally, so a probe that times out cannot cost us the patch.
+
+        `result` is part of the cache key, not just the script. A model that
+        answers a spurious mismatch by supplying a better expression must get a
+        fresh baseline; comparing the new expression against a fingerprint
+        taken with the old one would compare two different things.
+        """
+        signature = hashlib.sha1(
+            f"{setup}\x00{call}\x00{result}\x00{small}\x00{large}".encode()).hexdigest()
+        if signature in self._baselines:
+            return self._baselines[signature]
+        # Two shell runs plus the repair round that reads their result; below
+        # that the delta is a luxury and the time belongs to the fix.
+        if remaining_seconds() < 420:
+            return None
+        edited: dict[str, str | None] = {}
+        for relative in self.repo.changed_files():
+            path = self.repo.root / relative
+            try:
+                edited[relative] = read_source(path) if path.exists() else None
+            except (OSError, UnicodeDecodeError):
+                return None          # cannot put it back, so do not take it away
+        if not edited:
+            return None
+        # Remember the attempt even if it fails, so a baseline that cannot be
+        # taken is not re-taken on every subsequent round.
+        self._baselines[signature] = None
+        try:
+            self.repo.revert_all()
+            counts, fingerprint, _ = self._probe_run(manage, setup, call, result, small, large)
+        finally:
+            for relative, text in edited.items():
+                try:
+                    if text is None:
+                        (self.repo.root / relative).unlink(missing_ok=True)
+                        self.repo.forget(relative)
+                    else:
+                        self.repo.write(relative, text)
+                except OSError as exc:
+                    log(f"WARNING: could not restore {relative} after the baseline "
+                        f"probe ({exc}); the patch may be incomplete")
+        if counts is None:
+            return None
+        self._baselines[signature] = (counts, fingerprint)
+        return self._baselines[signature]
 
     def measure_query_scaling(self, probe: dict) -> CheckResult | None:
         """Run the model's probe at two sizes and compare query counts."""
         setup = (probe.get("setup") or "").strip()
         call = (probe.get("call") or "").strip()
+        result_expr = " ".join((probe.get("result") or "").split())
         if not call:
             return None
         manage = next((p for p in self.repo.files
@@ -3791,23 +3956,13 @@ print("RIDGES_QS" + json.dumps([q["sql"] for q in _ctx.captured_queries[:6]]))
         except (TypeError, ValueError):
             small, large = 1, 10
 
-        script = self._DJANGO_PROBE.format(
-            setup="\n".join(f"{line}" for line in setup.splitlines()),
-            call="\n        ".join(call.splitlines()),
-            small=small, large=large)
-        result = run_command([app_python(self.repo.root), manage, "shell", "-c", script],
-                             timeout=min(300.0, max(60.0, remaining_seconds() - 200)))
-        match = re.search(r"RIDGES_QC(\{.*\})", result.stdout or "")
-        if not match:
+        counts, fingerprint, stdout = self._probe_run(
+            manage, setup, call, result_expr, small, large)
+        if counts is None:
             return CheckResult("query scaling", True,
                                f"the probe produced no query count, so the database work this "
                                f"change performs is unmeasured. Output was:\n"
-                               f"{truncate(result.stdout, 2000)}", verified=False)
-        try:
-            counts = {int(k): int(v) for k, v in json.loads(match.group(1)).items()}
-        except (ValueError, json.JSONDecodeError):
-            return CheckResult("query scaling", True, "the probe's count could not be read",
-                               verified=False)
+                               f"{truncate(stdout, 2000)}", verified=False)
 
         trace("measure_query_scaling", "out", counts=counts,
               limit=self.instruction.targets.get("max_queries"))
@@ -3815,6 +3970,15 @@ print("RIDGES_QS" + json.dumps([q["sql"] for q in _ctx.captured_queries[:6]]))
         if low is None or high is None:
             return CheckResult("query scaling", True, f"incomplete measurement: {counts}",
                                verified=False)
+
+        # Now the same measurement on the code we started from.
+        baseline = self._baseline_probe(manage, setup, call, result_expr, small, large)
+        base, base_fp = baseline if baseline else (None, None)
+        base_low = base.get(small) if base else None
+        base_high = base.get(large) if base else None
+        before = (f" Before the edit the same probe issued {base_low} at N={small} and "
+                  f"{base_high} at N={large}." if base_high is not None else "")
+
         limit = self.instruction.targets.get("max_queries")
         failure = None
         if limit and high > limit:
@@ -3826,11 +3990,78 @@ print("RIDGES_QS" + json.dumps([q["sql"] for q in _ctx.captured_queries[:6]]))
             failure = (f"query count still grows with input: {low} queries at N={small}, "
                        f"{high} at N={large}. The work must be bounded -- fold the per-item "
                        f"statements into one set-based query.")
+        # A task whose subject is how much work the change does, where the
+        # change does more of it, is wrong however well it scales. Only a
+        # strict increase: a fix that legitimately costs one more statement on
+        # a task that never asked for fewer must not be failed for it.
+        elif base_high is not None and high > base_high and self.instruction.bounded_work:
+            failure = (f"this change increased the database work it was meant to reduce: "
+                       f"{base_high} queries at N={large} before it, {high} after.")
+        # Fewer statements returning different rows is not an optimisation.
+        # Last, deliberately: the counts above are certain, this comparison
+        # depends on an expression the model wrote, so it must never displace
+        # feedback that does not.
+        elif base_fp is not None and fingerprint is not None and base_fp != fingerprint:
+            failure = self._differential_failure(base_fp, fingerprint)
         if failure:
-            return CheckResult("query scaling", False, failure + self._explain_captured(result.stdout or ""))
-        return CheckResult("query scaling", True,
-                           f"bounded: {low} queries at N={small}, {high} at N={large}"
-                           + (f" (limit {limit})" if limit else ""))
+            return CheckResult("query scaling", False,
+                               failure + before + self._explain_captured(stdout))
+        if base_high is not None:
+            detail = (f"bounded: {base_high} -> {high} queries at N={large}, "
+                      f"{base_low} -> {low} at N={small}")
+        else:
+            detail = f"bounded: {low} queries at N={small}, {high} at N={large}"
+        if base_fp is not None and fingerprint is not None:
+            detail += f"; `result` unchanged ({len(fingerprint)} item(s))"
+        return CheckResult("query scaling", True, detail + (f" (limit {limit})" if limit else ""))
+
+    @staticmethod
+    def _differential_failure(before: list, after: list) -> str:
+        """Say what the two `result` values disagree about, not just that they do.
+
+        A whole-list diff of a hundred rows tells the model nothing it can act
+        on, so show the rows that appear on only one side. And name the benign
+        cause explicitly: the two runs are separate transactions, so a database
+        sequence does not rewind between them, and an expression built out of
+        auto-assigned ids differs even when the rows are identical. The model
+        can answer that by narrowing `result`, which re-baselines.
+        """
+        gone = [item for item in before if item not in after][:5]
+        added = [item for item in after if item not in before][:5]
+        detail = (f"`result` changed: the code before this edit produced {len(before)} item(s), "
+                  f"this version produces {len(after)}. Reducing the query count is only "
+                  f"correct if the rows come back the same.")
+        if gone:
+            detail += "\n  only before: " + truncate(", ".join(gone), 400)
+        if added:
+            detail += "\n  only after:  " + truncate(", ".join(added), 400)
+        detail += ("\n  If the values differ only by database ids, that is this measurement's "
+                   "own artefact -- the two runs are separate transactions and the id sequence "
+                   "does not rewind. Supply a `result` expression that does not depend on ids.")
+        return detail
+
+    def unmeasured_bounded_work(self, supplied: dict) -> CheckResult | None:
+        """A bounded-work task with no probe is unmeasured, not finished.
+
+        measure_query_scaling returns None when the model supplied nothing to
+        run, so no check was appended and `clean` went true on a task whose
+        whole subject is how many statements the change issues. That is the same
+        hole as a probe that fails, reached by a different route -- and it is the
+        route that actually occurred: two of three runs on the device-filter task
+        supplied no probe at all, so the mechanism meant to catch them never had
+        anything to catch.
+
+        Silent when the project has no Django runner: there is no measurement to
+        ask for, and asking would spend a call on something the model cannot give.
+        """
+        if not self.instruction.bounded_work or (supplied or {}).get("call"):
+            return None
+        if not any(Path(p).name == "manage.py" and p.count("/") <= 2 for p in self.repo.files):
+            return None
+        return CheckResult(
+            "query scaling", True,
+            "this task is about the number of statements the change issues, and no `measure` "
+            "probe was supplied, so that number was never taken", verified=False)
 
     def _explain_captured(self, stdout: str) -> str:
         """The plan of the statements the probe captured, so a scaling failure
@@ -4121,9 +4352,17 @@ wherever it states them -- fenced block, inline text, or prose.
 so the agent can measure it before submitting:
     "measure": {"setup": "<imports and fixture creation, Django shell>",
                 "call": "<one line exercising the change, using N as the size>",
+                "result": "<expression the change must NOT alter, e.g. \
+sorted(x.name for x in qs)>",
                 "small": 1, "large": 10}
-  Use `N` as the selection size in `call`. The agent runs it at both sizes and \
-tells you the query counts; if they grow with N the fix is not bounded.
+  Use `N` as the selection size in `call`. The agent runs it at both sizes, on \
+your edit and again on the code it replaced, and reports both counts. If they \
+grow with N the fix is not bounded; if they did not drop, the rewrite moved \
+code without removing work.
+  `result` is optional but worth supplying: it is evaluated after `call` on \
+both versions and compared, which is the only evidence that fewer statements \
+still return the same rows. Make it independent of database ids -- the two \
+runs are separate transactions, so ids do not repeat.
 * To create a new file instead, use {"path": ..., "new_file": true, \
 "content": "<full text>"}.
 * Escape newlines properly -- the whole reply must parse as JSON."""
@@ -4218,8 +4457,10 @@ class PromptBuilder:
         if ("bounded_queries" in self.instruction.kinds
                 or self.instruction.targets.get("max_queries")):
             facts.append("supply a `measure` probe with your edit: this agent runs it at two "
-                         "selection sizes and reports the query count back to you, so a fix that "
-                         "still scales with input is caught before you finish")
+                         "selection sizes, before and after your change, and reports both counts "
+                         "back to you -- so a fix that still scales with input, or that does not "
+                         "actually issue fewer statements than the code it replaced, is caught "
+                         "before you finish")
         # What this agent tried to read and could not. The model has the same
         # statement in front of it and can simply be asked -- which is cheaper
         # and far more reliable than the parser silently defaulting.
@@ -4855,7 +5096,9 @@ class Solver:
             # Optimisation is graded on database work. If the model supplied a
             # probe, measure the scaling it claims to have fixed.
             if include_tests and all(c.passed for c in checks):
-                measured = self.checker.measure_query_scaling(payload.get("measure") or {})
+                supplied = payload.get("measure") or {}
+                measured = (self.checker.measure_query_scaling(supplied)
+                            or self.checker.unmeasured_bounded_work(supplied))
                 if measured is not None:
                     checks.append(measured)
                     log(f"query scaling: {measured.detail}")
