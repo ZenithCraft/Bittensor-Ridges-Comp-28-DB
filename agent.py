@@ -682,7 +682,7 @@ class LLM:
         # transparent proxy. A route that cannot be reached is dropped for the
         # run, so a wrong first guess costs one failed connection, not the task.
         self.dead_routes: set[str] = set()
-        self.effort = "low"             # reasoning effort sent with every call
+        self.effort = "minimal"             # reasoning effort sent with every call
 
     def routes(self) -> list[str]:
         found: list[str] = []

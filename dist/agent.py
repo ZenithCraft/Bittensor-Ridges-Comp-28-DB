@@ -182,7 +182,7 @@ class LLM:
         self._insecure_ctx.check_hostname = False
         self._insecure_ctx.verify_mode = ssl.CERT_NONE
         self.dead_routes: set[str] = set()
-        self.effort = 'low'
+        self.effort = 'minimal'
 
     def routes(self) -> list[str]:
         found: list[str] = []
