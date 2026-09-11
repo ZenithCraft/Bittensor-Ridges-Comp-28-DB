@@ -138,60 +138,58 @@ def strip(tree: ast.AST) -> ast.AST:
 # and the build fails loudly if one stops matching, because a rename that silently
 # dropped the explanation would leave exactly the construct that needed it bare.
 ANNOTATIONS: tuple[tuple[str, str], ...] = (
-    ("if __name__ not in sys.modules:",
-     "The host may exec this module without registering it in sys.modules, which breaks\n"
-     "anything resolving a class back to its defining module -- dataclasses' KW_ONLY probe\n"
-     "is the one that bites. Give them something real."),
-    ("LADDER: list[list[str]] = [",
-     "Escalation ladder, strongest model first. A retry after a failed attempt moves one\n"
-     "rung up and switches model family: a second opinion from the same architecture tends\n"
-     "to repeat the same mistake."),
-    ("self._insecure_ctx.check_hostname = False",
-     "Certificate verification off for one retry only. In production a transparent proxy\n"
-     "intercepts openrouter.ai; when its CA is not in the container trust store an otherwise\n"
-     "healthy request fails verification. The retry is used only after an SSLError and the\n"
-     "hop is loopback-local. Normal calls verify."),
-    ("PROBLEM_PATTERNS: dict[str, tuple[str, ...]] = {",
-     "What KIND of problem the statement describes, which selects the evidence gathered and\n"
-     "the checks run. It never selects a fix: no branch here leads to stored patch text, and\n"
-     "the label is not shown to the model. The statement itself is sent verbatim."),
-    ("_PROBE_HOSTS = (",
-     "Last-resort discovery of the application's own database, used only when the repository\n"
-     "and environment name none. The task ships a live database and the app's config holds\n"
-     "the credentials; these conventional names and default logins are the fallback for when\n"
-     "that config could not be read. Every candidate must answer SELECT 1 to be used."),
-    ("def _postgres_via_python(self, target: DatabaseTarget, query: str, timeout: float) -> str:",
-     "Runs a read-only query through the app's own driver when psql is absent. Investigation\n"
-     "queries are filtered by is_read_only_sql before they reach here."),
-    ("class Checker:",
-     "Everything this agent can check for itself before committing to a patch: scope, syntax,\n"
-     "the constraints the instruction states, and the repository's own tests. Ordered\n"
-     "cheapest-first so a syntax slip never costs a six-minute test run."),
-    ("_DANGEROUS_NAMES = {",
-     "Names an edit may not introduce into a method the instruction bounds. Pre-existing uses\n"
-     "are not flagged -- see the inherited-violation check below -- so a correct fix is never\n"
-     "rejected for code it did not write."),
-    ("ERROR_HINTS: tuple[tuple[str, str], ...] = (",
-     "Translations of failure output the models keep misreading, matched against the test\n"
-     "output of the run rather than against the problem statement. Each is a fact about SQL\n"
-     "or the ORM, true of any repository; none names a task, a file or an expected value."),
-    ("def agent_main(input: dict) -> str:",
-     "Entry point. Parses the statement, indexes and ranks the repository, connects to the\n"
-     "live database, then loops: ask the model, apply its edits, run the repository's own\n"
-     "checks, feed failures back. The patch returned is always built from edits applied\n"
-     "during this run; there is no path that returns one from anywhere else."),
+    ("class Allowance:",
+     "The run's clock and money. Durations are measured on the monotonic clock, which is\n"
+     "what the harness times the run on; the wall clock can be stepped under us and is only\n"
+     "used to compare file mtimes. sync() adopts the proxy's own cost total when it is above\n"
+     "ours, since the proxy is what refuses the next call once the budget is gone."),
+    ("SEAT_CACHE_TERMS = ",
+     "List prices per model, used only to pace the run when the endpoint does not quote a\n"
+     "cost. They never choose a model or a fix; the graded cost comes from the proxy."),
+    ("HISTORY_GIT = ",
+     "The patch is read straight off the working tree at the end, so a git command that\n"
+     "moves or discards changes loses the work. Read-only git is allowed."),
+    ("NETWORK_COMMAND = ",
+     "Nothing the task needs is outside the container. A network command from the shell\n"
+     "would only burn time waiting on an unreachable host."),
+    ("class Tree:",
+     "The application folder, snapshotted at start without git: some task images have no\n"
+     "git binary and the repo ships without its history. The patch is a difflib diff of\n"
+     "snapshot versus disk in the format git apply reads, and restore writes the snapshot\n"
+     "back so the harness applies the patch to a clean tree."),
+    ("def diff_lines(",
+     "The shared head and tail of a file are left out of the comparison so a one-line edit\n"
+     "to a long file costs a few lines of work; a middle too large to compare in bounded\n"
+     "time is replaced whole, which git applies just the same."),
+    ("SCOPE_FILE_RES = ",
+     "Phrasing that names the file an instruction confines the change to. Read out so the\n"
+     "edit gate and the final revert know the scope; every path is verified on disk first\n"
+     "and nothing here selects a fix."),
+    ("class Warden:",
+     "The instruction's own conditions, checked before hand-in: only the named files\n"
+     "change, no test files are touched, no definitions are dropped, no suppressions are\n"
+     "added, and the check commands it names exit clean."),
+    ("def harness_lead(",
+     "The harness writes the instruction file the moment its timer starts, then commits a\n"
+     "git baseline of the whole tree before this process runs. The file's age is how far\n"
+     "the harness clock is ahead of ours; both deadlines are moved by it."),
+    ("def agent_main(",
+     "Entry point. Reads the scope out of the instruction, locates and plans only when the\n"
+     "instruction names no file, drives the edit, then always builds the patch from the\n"
+     "tree, restores it, and checks that the patch applies. There is no path that returns a\n"
+     "patch from anywhere but this run's edits."),
 )
 
 HEADER = '''"""Ridges miner agent for the database query engineering category.
 
     def agent_main(input: dict) -> str   # returns a unified diff
 
-Runs inside the task container with the application repository at the workdir and a
-live database reachable from it. Only the unified diff returned travels any further:
-the patch is applied to an untouched checkout elsewhere and the tests are re-run
-there. So the agent may experiment freely here -- run the suite, run EXPLAIN, read
-the schema -- and the diff must stay minimal and confined to the files the
-instruction names.
+Runs inside the task container with the application repository at the workdir. Only
+the unified diff returned travels any further: the harness applies it to the tree and
+the verifier runs elsewhere. Stages: the scope is read out of the instruction; a
+locator and a planner run only when it names no file; a driver edits, runs the checks
+the instruction names, and submits. The patch is a diff of the working tree against a
+snapshot taken at start, so no git and no network are needed.
 
 Standard library only: an arbitrary application container is not guaranteed to have
 anything else. Built from agent.py by build_upload.py; edit that, not this.

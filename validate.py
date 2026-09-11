@@ -157,7 +157,8 @@ def allowed_models() -> list[str]:
     """The model slugs agent.py knows about, read from its own table."""
     tree = ast.parse(AGENT.read_text())
     for node in ast.walk(tree):
-        if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") == "MODELS":
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict)
+                and any(getattr(t, "id", "") == "MODEL_PRICING" for t in node.targets)):
             return [k.value for k in node.value.keys if isinstance(k, ast.Constant)]
     return []
 
@@ -182,27 +183,24 @@ def agent_variant(model: str | None, agent_timeout: float | None = None,
     parts = [re.sub(r"[^a-z0-9]+", "_", (model or "ladder").lower())]
     lines = [AGENT.read_text()]
     if model:
-        lines.append(f'\n\nFORCE_MODEL = "{model}"\n')
+        # Every seat on the one model, no relief seat to fall back to, so a
+        # run measures that model alone. The agent reads these module names
+        # when it builds each Seat, so a trailing reassignment takes effect.
+        lines.append(f'\n\nDRIVER_MODEL = LOCATOR_MODEL = PLANNER_MODEL = "{model}"\n'
+                     f'RELIEF_MODEL = ""\n')
     if agent_timeout is not None:
         # Production always injects AGENT_TIMEOUT (engine.py: min(spec, max)),
-        # so DEFAULT_AGENT_TIMEOUT is dead there and live only here. Left at
-        # the agent's own fallback, a local run paces itself against
-        # {agent.DEFAULT_AGENT_TIMEOUT:.0f}s while the graded run gets the
-        # task.toml budget -- so an early stop measured locally would not have
-        # happened in the container we are trying to predict.
+        # so DEFAULT_WALL_SEC is dead there and live only here. Left at the
+        # agent's own fallback, a local run paces itself against that value
+        # while the graded run gets the task.toml budget -- so an early stop
+        # measured locally would not have happened in the container we are
+        # trying to predict.
         parts.append(f"t{int(agent_timeout)}")
-        lines.append(f"\n\nDEFAULT_AGENT_TIMEOUT = {float(agent_timeout)!r}\n")
+        lines.append(f"\n\nDEFAULT_WALL_SEC = {float(agent_timeout)!r}\n")
     if tracing:
-        # RIDGES_TRACE is read from the environment, and the agent's
-        # environment is the task container's, not this shell's -- the harness
-        # forwards nothing. Baking the flag is the only way in, the same
-        # problem AGENT_TIMEOUT has.
-        parts.append({"stages": "trace", "all": "traceall"}.get(tracing, "tracevars"))
-        lines.append("\n\nTRACE = True\n")
-        if tracing == "all":
-            lines.append("TRACE_ALL = True\n")
-        elif tracing == "vars":
-            lines.append("TRACE_VARS = True\n")
+        # The current agent has no trace switch; nothing is baked so the
+        # artifact's bytes stay honest.
+        print(f"{YELLOW}tracing requested, but agent.py has no trace switch; ignored{RESET}")
     path = VARIANTS / f"agent_{'_'.join(parts)}.py"
     path.write_text("".join(lines))
     return path
@@ -305,23 +303,51 @@ def newest_job_dir(task: str, since: float) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
 
 
-def agent_log(job_dir: Path | None) -> tuple[float | None, int | None, list[str]]:
-    """The agent's own cost line and log, from the harbor job tree."""
+# The agent's closing line:
+#   [RUN] done in 457s, $0.0386 over 41 calls, 3 edits, patch 1505B, usable=yes
+AGENT_DONE = re.compile(
+    r"\[RUN\] done in (?P<secs>\d+)s, \$(?P<cost>[0-9.]+) over (?P<calls>\d+) calls?, "
+    r"(?P<edits>\d+) edits?, patch (?P<patch>\d+)B, usable=(?P<usable>\w+)")
+# The previous agent's closing line, kept so old run directories still read.
+AGENT_DONE_LEGACY = re.compile(r"cost \$(?P<cost>[0-9.]+) \([^)]+\) over (?P<calls>\d+) call")
+# Per-stage bills: [LOCATOR] cost calls=11 usd=0.0057
+AGENT_STAGE_COST = re.compile(r"\[(?P<stage>[A-Z]+)\] cost calls=(?P<calls>\d+) usd=(?P<usd>[0-9.]+)")
+# Lines worth echoing back. Model calls and file reads are left out as noise.
+AGENT_LINE = re.compile(r"^\[(?!SEAT\]|READ\])[A-Z]+\]")
+
+
+def agent_summary(job_dir: Path | None) -> dict:
+    """Everything the agent said about itself, from its runtime log."""
     if job_dir is None:
-        return None, None, []
-    cost = calls = None
-    interesting: list[str] = []
-    for path in job_dir.rglob("*"):
-        if not path.is_file():
-            continue
+        return {}
+    out: dict = {}
+    lines: list[str] = []
+    # The agent's stdout lands in agent/runtime.log; fall back to any file.
+    paths = sorted(job_dir.rglob("runtime.log")) or [p for p in job_dir.rglob("*") if p.is_file()]
+    for path in paths:
         try:
             text = path.read_text(errors="replace")
         except OSError:
             continue
-        for match in re.finditer(r"cost \$([0-9.]+) \([^)]+\) over (\d+) call", text):
-            cost, calls = float(match.group(1)), int(match.group(2))
-        interesting += [ln for ln in text.splitlines() if "[db-agent" in ln]
-    return cost, calls, interesting
+        for match in AGENT_DONE.finditer(text):
+            out.update(cost=float(match["cost"]), calls=int(match["calls"]),
+                       agent_secs=int(match["secs"]), edits=int(match["edits"]),
+                       patch_bytes=int(match["patch"]), usable=match["usable"])
+        if "cost" not in out:
+            for match in AGENT_DONE_LEGACY.finditer(text):
+                out.update(cost=float(match["cost"]), calls=int(match["calls"]))
+        for match in AGENT_STAGE_COST.finditer(text):
+            out.setdefault("stages", {})[match["stage"].lower()] = {
+                "calls": int(match["calls"]), "usd": float(match["usd"])}
+        lines += [ln for ln in text.splitlines() if AGENT_LINE.match(ln) or "[db-agent" in ln]
+    out["lines"] = lines
+    return out
+
+
+def agent_log(job_dir: Path | None) -> tuple[float | None, int | None, list[str]]:
+    """The agent's own cost line and log, from the harbor job tree."""
+    summary = agent_summary(job_dir)
+    return summary.get("cost"), summary.get("calls"), summary.get("lines", [])
 
 
 def parse_stdout(output: str) -> dict:
@@ -361,8 +387,12 @@ def run_task(task: str, model: str | None, quiet: bool) -> dict:
               "ledger_delta": ledger_delta, "returncode": code}
     result.update(parse_stdout(output))
     result.update({k: v for k, v in read_result_json(job_dir).items() if v is not None})
-    cost, calls, agent_lines = agent_log(job_dir)
+    summary = agent_summary(job_dir)
+    cost, calls, agent_lines = summary.get("cost"), summary.get("calls"), summary.get("lines", [])
     result["cost"], result["calls"] = cost, calls
+    for key in ("agent_secs", "edits", "patch_bytes", "usable", "stages"):
+        if key in summary:
+            result[key] = summary[key]
 
     checks = junit_checks(job_dir)
     if checks:
@@ -388,8 +418,12 @@ def run_task(task: str, model: str | None, quiet: bool) -> dict:
         verdict = f"reward={result.get('reward')} state={result.get('state')}"
     if result.get("error"):
         verdict += f" {RED}error={result['error']}{RESET}"
+    stages = result.get("stages") or {}
+    stage_note = "".join(f" {name}={money(v['usd'])}/{v['calls']}c" for name, v in stages.items())
+    agent_note = (f" calls={calls} edits={result.get('edits')} patch={result.get('patch_bytes')}B "
+                  f"usable={result.get('usable')}" if calls is not None else "")
     print(f"\n-> {verdict} tests={result.get('tests')} agent_cost={money(cost)} "
-          f"ledger={money(ledger_delta)} in {elapsed:.0f}s", flush=True)
+          f"ledger={money(ledger_delta)} in {elapsed:.0f}s{agent_note}{stage_note}", flush=True)
     return result
 
 
@@ -431,7 +465,8 @@ def scorecard(results: list[dict]) -> int:
             print(f"    {r['task']} [{r['model']}]: {r['error']}")
     if n:
         mean = total_cost / n
-        target, cap = agent.COST_TARGET_USD, agent.DEFAULT_MAX_COST_USD
+        cap = agent.DEFAULT_COST_LIMIT_USD
+        target = cap * agent.COST_SHARE   # the agent's own soft stop
         verdict = (GREEN + "within target" if mean <= target else
                    YELLOW + f"over ${target:.2f} target" if mean <= cap
                    else RED + f"OVER THE ${cap:.2f} CAP")
