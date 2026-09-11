@@ -1,5926 +1,3998 @@
-"""Ridges miner agent for the database query engineering category.
+"""Ridges DB-query agent — general big-repo edition.
 
-Contract (see ridges/docs/sandbox.md and ridges_harbor/ridges_miner_runtime.py):
+Entry point: agent_main({"problem_statement": ...}) -> unified diff
 
-    def agent_main(input: dict) -> str   # returns a unified diff
+Stages:
+  0. Scope    — reads the named file, method and check commands out of the
+                instruction itself; no model call
+  1. Locator  — finds the target file(s) with search tools, only when the
+                instruction names none
+  2. Planner  — reads the target and forms a plan, only when the locator ran
+  3. Driver   — edits, runs checks, submits; submit re-runs the named checks
+                and refuses edits outside the named files
 
-The agent runs as root inside the task's `main` container, with the application
-repository at the task workdir (usually /app) and a *live* database reachable
-from that container.  Only the unified diff it returns travels any further: the
-patch is applied to an untouched checkout elsewhere and the tests are re-run
-there.  Two consequences drive the whole design:
-
-  1. We may experiment freely in our own container -- run the test suite, run
-     EXPLAIN, probe the schema -- because none of that travels with the patch.
-  2. Only the diff matters, and any file the instruction did not put in scope
-     must come back byte-identical.  The diff is therefore minimal and confined
-     to the files the instruction names.
-
-The repository checkout has had .git removed, so patches are produced from an
-in-memory snapshot with difflib rather than by shelling out to git.
+Standard library only. No git and no network: the application folder is
+snapshotted into memory at start, the patch is a difflib diff against that
+snapshot in the format `git apply` reads, and the folder is restored after.
 """
+from __future__ import annotations
 
 import ast
 import difflib
+import fnmatch
 import hashlib
 import json
-import math
 import os
 import re
+import shlex
 import shutil
-import ssl
+import signal
+import stat
 import subprocess
-import sys
+import tempfile
 import time
 import traceback
-import types
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Iterable, Sequence
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-# The host runtime may exec this module without registering it in sys.modules,
-# which breaks anything that resolves a class back to its defining module
-# (dataclasses' KW_ONLY probe is the one that bites). Give them something real.
-if __name__ not in sys.modules:  # pragma: no cover - depends on the loader
-    sys.modules[__name__] = types.ModuleType(__name__)
-
-AGENT_START = time.monotonic()
-
-# Reserve a slice of the wall clock for patch emission; never spend it all on
-# inference.
-#
-# AGENT_TIMEOUT is injected by the runtime from the task's `[agent]
-# timeout_sec`. The task.toml stating it is NOT one of the four files uploaded
-# to this container -- those are agent.py, _stdlib_contract.py,
-# ridges_miner_runtime.py and instruction.md -- and /opt/task exists only in
-# the checker's container, so this process cannot read the budget itself and
-# must not try. The env var is the whole channel.
-#
-# Production always sets it (engine.py: min(spec_timeout, max_agent_timeout_sec)),
-# so the fallback below is dead there and live only in local runs, where
-# `ridges miner run-local` plumbs no timeout. Bench tasks ask for 1800s, but the
-# competition caps every run at 25 minutes and engine.py takes the lower of the
-# two, so the graded budget is 1500 -- which is what validate.py bakes into its
-# local agent copy, and what this fallback already happens to be.
-DEFAULT_AGENT_TIMEOUT = 1500.0   # local-only fallback; AGENT_TIMEOUT overrides in production
-TIMEOUT_SAFETY_MARGIN = 120.0
-
-# Budget.  RIDGES_MAX_COST_USD is injected by the runtime; the proxy also
-# exposes live usage.  Ranking rewards cheap runs, so we aim far below the cap.
-DEFAULT_MAX_COST_USD = 0.29   # production per-problem inference budget
-COST_TARGET_USD = 0.05  # soft target: stop escalating models past this
-
-USAGE_URL = "http://sandbox-proxy:80/api/v1/usage"
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-# Model roster.  These are the OpenRouter slugs the Ridges inference gateway
-# whitelists (inference_gateway/providers/openrouter.py).  Prices are indicative
-# only -- the proxy's usage endpoint is authoritative for spend.
-@dataclass(frozen=True)
-class ModelSpec:
-    slug: str
-    usd_per_m_in: float
-    usd_per_m_out: float
-    context: int
 
 
-MODELS: dict[str, ModelSpec] = {
-    "deepseek/deepseek-v4-pro-0813": ModelSpec("deepseek/deepseek-v4-pro-0813", 1.12, 3.36, 1048576),  # coding 69, agentic 50, ~$0.0114/task
-    "qwen/qwen3.8-27b": ModelSpec("qwen/qwen3.8-27b", 0.42, 3.00, 1000000),  # coding 68, agentic 51, ~$0.0147/task
-    "moonshotai/kimi-k2.6": ModelSpec("moonshotai/kimi-k2.6", 0.95, 4.00, 262144),  # coding 62, agentic 31, ~$0.0230/task
-    "moonshotai/kimi-k2.7-code": ModelSpec("moonshotai/kimi-k2.7-code", 0.66, 3.40, 262144),  # coding 61, agentic 30, ~$0.0183/task
-    "minimax/minimax-m3": ModelSpec("minimax/minimax-m3", 0.30, 1.20, 1048576),  # coding 59, agentic 36, ~$0.0070/task
-    "qwen/qwen3.6-35b-a3b": ModelSpec("qwen/qwen3.6-35b-a3b", 0.10, 0.90, 262144),  # coding 42, agentic 22, ~$0.0042/task
-    "google/gemma-4-31b-it": ModelSpec("google/gemma-4-31b-it", 0.09, 0.34, 262144),  # coding 43, agentic 14, ~$0.0020/task
+# =========================================================================
+# Constants
+# =========================================================================
+
+FALLBACK_BASE_URL = "https://openrouter.ai/api/v1"
+
+DRIVER_MODEL = os.getenv("RIDGES_AGENT_MODEL", "openai/gpt-5.6-luna")
+RELIEF_MODEL = os.getenv("RIDGES_RELIEF_MODEL", "deepseek/deepseek-v4-pro-0813")
+LOCATOR_MODEL = os.getenv("RIDGES_LOCATOR_MODEL", "openai/gpt-5.6-luna")
+PLANNER_MODEL = os.getenv("RIDGES_PLAN_MODEL", "openai/gpt-5.6-luna")
+
+HIGH_REASONING = (os.getenv("RIDGES_HIGH_REASONING") or "0").strip().lower() not in (
+    "0", "no", "off", "false", "")
+
+# cache-read price per token, context window
+SEAT_CACHE_TERMS = {
+    "xiaomi/mimo-v2.5-pro": (0.0050e-6, 262_144),
+    "xiaomi/mimo-v2.5": (0.0050e-6, 262_144),
+    "minimax/minimax-m2.5": (0.0500e-6, 204_800),
+    "minimax/minimax-m3": (0.0750e-6, 204_800),
+    "deepseek/deepseek-v4-pro": (0.0036e-6, 1_048_576),
+    "deepseek/deepseek-v4-pro-0813": (0.0220e-6, 1_048_576),
+    "openai/gpt-5.6-luna": (0.0200e-6, 400_000),
+    "qwen/qwen3.8-2.4t-a95b": (0.2500e-6, 1_000_000),
+    "@preset/qwen38-24t-lowthink": (0.2500e-6, 1_000_000),
+    "openai/gpt-5.6-terra": (0.2000e-6, 400_000),
+    "google/gemini-3.7-flash": (0.0375e-6, 1_048_576),
+    "deepseek/deepseek-v4-flash-0731": (0.0280e-6, 1_048_576),
+    "tencent/hy3": (0.0330e-6, 262_144),
 }
+UNKNOWN_CACHE_TERMS = (0.1000e-6, 131_072)
 
-# Escalation ladder.  Tier 0 handles the great majority of tasks; each retry
-# after a *verified* failure moves one rung up.  Entries are tried left to
-# right if the gateway rejects a slug.
-# Escalation ladder, ordered by measured capability rather than price.
-#
-# Solving the task is what matters; price is the tiebreaker. So tier 0 is the
-# strongest agentic model that still fits the budget, not the cheapest model
-# overall. Artificial Analysis indices
-# via OpenRouter, cost projected from the token profile of real runs:
-#
-#   glm-4.7            coding 45  agentic 26   $0.0099/task   <- best agentic
-#   kimi-k2.5          coding 47  agentic 22   $0.0122
-#   qwen3.5-397b       coding 48  agentic 20   $0.0177        <- best coding
-#   glm-4.6            coding 46  agentic 19   $0.0129
-#   qwen3-coder-next   coding 36  agentic  9   $0.0040        <- cheapest, weakest agentically
-#
-# This agent is agentic: it runs a context round, applies edits, reads real test
-# failures and retries. Agentic score therefore matters more than raw coding.
-LADDER: list[list[str]] = [
-    # Solving it is the gate, and solving it *consistently* more so. So each
-    # tier leads with the most capable model available, and escalation switches
-    # *family* rather than just spending more -- a second opinion from the same
-    # architecture tends to repeat the same mistake.
-    #
-    # deepseek-v4-flash is excluded entirely despite benchmarking well
-    # (coding 69, agentic 48, $0.0012). On two real tasks it returned no content
-    # even with the cap removed, burning 551s to produce nothing -- it loses on
-    # score, runtime and, once you count the wasted calls, price as well.
-    ["deepseek/deepseek-v4-pro-0813", "qwen/qwen3.8-27b", "minimax/minimax-m3"],
-    ["qwen/qwen3.8-27b", "moonshotai/kimi-k2.6", "deepseek/deepseek-v4-pro-0813"],
-    ["moonshotai/kimi-k2.6", "moonshotai/kimi-k2.7-code", "qwen/qwen3.8-27b"],
-]
-
-# Models measured to be unusable on this prompt family, whatever the platform
-# allows. This has to be enforced where the roster is built, not only where the
-# ladder is written: discover_models asks the platform what it accepts and that
-# answer is authoritative, so every allowed model was being appended to the
-# roster -- including the ones deliberately left out of LADDER. In production,
-# where discovery succeeds, that put an excluded model back at position 4 on
-# every round. Locally, where discovery usually finds nothing and the built-in
-# roster is used, it never appeared at all: invisible where it is tested and
-# live where it is graded.
-#
-# Only a model measured to return nothing belongs here. Excluding one that
-# produces no content cannot cost a solve, and each burns a whole completion
-# cap before it fails, so this is the one part of the runaway problem that is
-# not a trade.
-BLOCKED_MODELS = frozenset({
-    # Two real tasks, no content either time even with the cap removed, 551s
-    # spent producing nothing -- it loses on score, runtime and price at once.
-    "deepseek/deepseek-v4-flash",
-})
-
-MAX_REPAIR_ROUNDS = 3        # verified wrong answers (tests failed) before giving up
-MAX_GATE_SLIPS = 4           # cheap protocol slips (scope/syntax/contract) -- no tests were run
-MAX_CONTEXT_ROUNDS = 6       # absolute ceiling on investigation, whatever the dynamic budget says
-
-# Guard against runaway generation. The edit protocol needs a short JSON object;
-# anything beyond this is reasoning we are paying for and do not use.
-# Reasoning tokens bill as completion and are emitted *before* any content, so
-# too low a cap yields an empty reply and a wasted call. Observed: a 6000 cap on
-# deepseek-v4-flash produced two empty completions before succeeding at 16000.
-COMPLETION_CAP = 12000                   # a JSON edit is ~2-4k tokens; the rest is reasoning
-MIN_COMPLETION_CAP = 6000
-PRICE_SAFETY = 1.3                       # providers bill above the listed rate
-NUDGE = ("Your previous reply contained no answer text -- the reasoning used up the "
-         "whole token budget. Answer now with the JSON object only.")
-
-# When set, every round uses this model instead of the escalation ladder.
-# Set via RIDGES_DB_AGENT_MODEL, or by appending an assignment to a copy of
-# this file (see validate.py --model).
-FORCE_MODEL = os.getenv("RIDGES_DB_AGENT_MODEL", "").strip()
-
-SOURCE_SUFFIXES = {
-    ".py", ".sql", ".go", ".rb", ".java", ".kt", ".ts", ".tsx", ".js", ".jsx",
-    ".rs", ".php", ".cs", ".scala", ".ex", ".exs", ".c", ".cpp", ".h", ".hpp",
-    ".yml", ".yaml", ".toml", ".json", ".xml", ".hql", ".erb",
-    ".ini", ".cfg", ".properties", ".prisma", ".env",
+# fresh-in, out
+MODEL_PRICING = {
+    "qwen/qwen3.8-2.4t-a95b": (2.000e-6, 6.000e-6),
+    "@preset/qwen38-24t-lowthink": (2.000e-6, 6.000e-6),
+    "xiaomi/mimo-v2.5-pro": (0.600e-6, 1.201e-6),
+    "xiaomi/mimo-v2.5": (0.140e-6, 0.280e-6),
+    "minimax/minimax-m2.5": (0.150e-6, 0.900e-6),
+    "minimax/minimax-m3": (0.375e-6, 1.500e-6),
+    "deepseek/deepseek-v4-pro-0813": (0.660e-6, 1.980e-6),
+    "openai/gpt-5.6-luna": (0.200e-6, 1.200e-6),
+    "openai/gpt-5.6-terra": (2.000e-6, 12.000e-6),
+    "google/gemini-3.7-flash": (0.375e-6, 1.875e-6),
+    "deepseek/deepseek-v4-flash-0731": (0.440e-6, 1.320e-6),
+    "tencent/hy3": (0.132e-6, 0.528e-6),
 }
+UNKNOWN_TOKEN_PRICE = (1.0e-6, 4.0e-6)
 
-SKIP_DIRS = {
-    ".git", "node_modules", "__pycache__", ".venv", "venv", "env", "dist",
-    "build", ".mypy_cache", ".pytest_cache", ".ruff_cache", "site-packages",
-    ".tox", "target", "vendor", "coverage", ".next", ".idea", ".cache",
-}
+# budget
+DEFAULT_COST_LIMIT_USD = 0.29
+DEFAULT_WALL_SEC = 1500.0
+COST_SHARE = 0.88
+WALL_SHARE = 0.90
+WALL_RESERVE_SEC = 45.0
+HARD_TAIL_RESERVE_SEC = 30.0     # for the harness's own git apply after we return
+ANCHOR_FILE = "/installed-agent/instruction.md"   # written when the harness clock starts
+COST_SYNC_TURNS = 5
+USAGE_PATH = "/api/v1/usage"
 
-MAX_INDEXED_FILES = 20_000
+# loop
+TURN_CEILING = 200
+BLANK_REPLY_CEILING = 3
+TOOL_FAULT_CEILING = 12
+SUBMIT_REFUSAL_CEILING = 3
+IDENTICAL_REPLY_CEILING = 3
+EDIT_PRESSES_MAX = 3
+FIRST_EDIT_DEADLINE_TURN = 8
+WRAPUP_TURN = 80
+WRAPUP_CLOCK_SEC = 240.0
+
+# stages
+LOCATOR_TURN_CAP = 25
+LOCATOR_READ_BUDGET = 80_000
+LOCATOR_NOTE_CHARS = 1_500
+LOCATOR_SPEND_SHARE = 0.20
+LOCATOR_CLOCK_SHARE = 0.25       # of the run's clock, measured from the start
+
+PLANNER_TURN_CAP = 30
+PLANNER_READ_BUDGET = 100_000
+PLAN_NOTE_CHARS = 4_000
+PLANNER_SPEND_SHARE = 0.25
+PLANNER_CLOCK_SHARE = 0.45
+
+# output caps
+READ_OUTPUT_CAP = 24_000
+SHELL_OUTPUT_CAP = 8_000
+SEARCH_OUTPUT_CAP = 8_000
+SHELL_REPORT_CAP = 120
+REPLY_TOKEN_CEILING = 8_000
+
+# transcript
+TRANSCRIPT_SPEND_SHARE = 0.35
+TURNS_PLANNED = 50
+CHARS_PER_TOKEN = 3.5
+TRANSCRIPT_FLOOR_CHARS = 40_000
+
+# seat
+TEMPERATURE = 0.0
+SEED = 4242
+SEAT_CALL_TIMEOUT_SEC = 90.0
+SEAT_RETRY_GROWTH = 1.5          # each retry waits longer, not shorter
+SEAT_RETRY_FLOOR_SEC = 20.0
+SEAT_REFUSED_WAIT_SEC = 20.0
+REQUEST_ATTEMPTS = 3
+CALL_CLOCK_SHARE = 0.34
+ABANDONED_REPLY_TOKENS = REPLY_TOKEN_CEILING // 4   # charged for a call we gave up on
+
+# shell
+SHELL_BUDGET_CEILING_SEC = 180.0
+BACKGROUND_JOBS_MAX = 2
+BACKGROUND_POLL_WAIT_SEC = 75.0
+BACKGROUND_POLL_CEILING_SEC = 150.0
+POLLS_PER_JOB_ADVISE = 8
+CHILD_MEMORY_BYTES = 3 * 1024 * 1024 * 1024   # per child, address space; Node and Go start under it
+CHILD_CAP_FLOOR_BYTES = 1024 * 1024 * 1024    # never squeeze a child below this
+MEMORY_HEADROOM_BYTES = 768 * 1024 * 1024     # the agent's own footprint plus slack
+SMALL_CONTAINER_BYTES = 4 * 1024 * 1024 * 1024  # under this, one job at a time
+MEMORY_STOP_SHARE = 0.45      # of the container limit: no second job past this
+MEMORY_REFUSE_SHARE = 0.75    # no new background job past this
+CHILD_OOM_SCORE_ADJ = 800     # the OOM killer takes a child before the agent
+CHILD_NICE = 5
+
+# git
+GIT_TIMED_OUT = 124
+
+# repeat reads
+REPEAT_READ_CEILING = 2
+
+# history / network fences
+HISTORY_GIT = re.compile(
+    r"\bgit\s+(?:-[^\s]+\s+)*(commit|stash|checkout|switch|restore|reset|clean|"
+    r"revert|rebase|merge|cherry-pick|push)\b"
+)
+NETWORK_COMMAND = re.compile(
+    r"(?:^|[|&;]|\$\(|`)\s*(?:sudo\s+)?"
+    r"(curl|wget|nc|ncat|telnet|ssh|scp|rsync|ftp|"
+    r"git\s+(?:fetch|pull|clone|remote|ls-remote|submodule))(?![\w-])"
+)
+
+# tests
+TEST_PATH = re.compile(
+    r"(^|/)conftest\.py$|(^|/)tests?(/|$)|(^|/)test_[^/]*\.py$|_test\.py$")
+NOQA_DIRECTIVE = re.compile(r"#\s*(?:(?:ruff|flake8)\s*:\s*)?noqa\b", re.I)
+
+# statement parsing
+QUOTED_RE = re.compile(r"[`'\"]([A-Za-z_][A-Za-z0-9_.]{2,})[`'\"]")
+WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,}")
+COMMON_WORDS = frozenset(
+    """the this that with from when what which should would could have been
+    test tests file files line lines code error errors return returns value
+    values method function class module import python true false none self
+    argument arguments result results object objects string strings expected
+    also any each every same such keep make change changed unchanged rest
+    currently instead both being handful number numbers added adding still
+    exact exactly correct correctly wrong incorrect incorrectly slow slowly
+    fast expensive cheap large small many few several some most more less
+    least first last new old one two three per well very just even quite
+    rather already again once twice however therefore because since although
+    whether either neither between within across through against toward
+    towards during after under over above below behind""".split()
+)
 
 
-def log(message: str) -> None:
-    elapsed = time.monotonic() - AGENT_START
-    print(f"[db-agent {elapsed:7.1f}s] {message}", flush=True)
+# =========================================================================
+# Small helpers
+# =========================================================================
 
-
-# Per-module tracing: what went into each stage and what came out, so a run can
-# be read stage by stage instead of inferred from its result. Off unless
-# RIDGES_TRACE is set, because a graded run should not pay for it and its
-# operator never reads it -- set it locally when inspecting a run.
-TRACE = bool(os.getenv("RIDGES_TRACE"))
-
-
-def _brief(value, limit: int = 96) -> str:
-    """A value at a glance: size first, then as much content as fits.
-
-    Sizes matter more than contents when the question is where the tokens go,
-    so a long string reports its length and a list reports its count before
-    either shows anything.
-    """
-    if isinstance(value, str):
-        flat = " ".join(value.split())
-        return f"{len(value)}c" if len(flat) > limit else repr(flat)
-    if isinstance(value, dict):
-        return f"{{{len(value)}}}" + (f" {sorted(value)[:6]}" if value else "")
-    if isinstance(value, (list, tuple, set)):
-        items = list(value)
-        shown = ", ".join(_brief(item, 32) for item in items[:4])
-        return f"[{len(items)}]" + (f" {shown}" + (" ..." if len(items) > 4 else "") if items else "")
-    if isinstance(value, float):
-        return f"{value:.3f}"
-    return str(value)
-
-
-# Full call tracing: every function this module enters, with the arguments it
-# was given, and every value it returns. RIDGES_TRACE=all turns it on.
-#
-# The curated trace() points below say what a stage decided; this says what
-# every function did, which is what you want when the question is "where did
-# this value come from" rather than "was this stage right". It is slow and
-# loud, so it is a deliberate mode rather than a default.
-TRACE_ALL = (os.getenv("RIDGES_TRACE") or "").lower() in ("all", "calls", "full")
-
-# Called thousands of times each and carrying nothing worth reading one call at
-# a time. Excluded by name so the output stays legible; the curated trace lines
-# still report what they produced. `log`/`trace`/`_brief` must be here whatever
-# else changes -- tracing the logger from inside the logger does not terminate.
-TRACE_SKIP = frozenset({
-    "log", "trace", "_brief", "_render", "_call_tracer",
-    "read", "read_source", "write_source", "snapshot", "original",
-    "query_density", "_looks_like_path", "_path_tokens", "_token_match",
-    "truncate", "remaining_seconds", "score", "query_weight",
-})
-
-
-def _render(value, limit: int = 72) -> str:
-    """Any value, short, and never raising -- a repr that throws would take the
-    run down with it, which is not a trade a debugging aid gets to make."""
+def say(message: str) -> None:
     try:
-        if isinstance(value, (str, bytes)):
-            body = value.decode("utf-8", "replace") if isinstance(value, bytes) else value
-            flat = " ".join(body.split())
-            return repr(flat) if len(flat) <= limit else f"<{len(body)} chars>"
-        if isinstance(value, (list, tuple, set, frozenset, dict)):
-            # Length first: a repr built only to be measured and thrown away is
-            # the whole cost of this function under per-line tracing, and no
-            # container of more than a dozen items fits in `limit` anyway.
-            if len(value) > 12:
-                return f"<{type(value).__name__} of {len(value)}>"
-            shown = repr(value)
-            return shown if len(shown) <= limit else f"<{type(value).__name__} of {len(value)}>"
-        if isinstance(value, Path):
-            return repr(str(value))
-        if isinstance(value, (int, float, bool, type(None))):
-            return repr(value)
-        shown = repr(value)
-        return shown if len(shown) <= limit else f"<{type(value).__name__}>"
-    except Exception:
-        return "<unreprable>"
+        print(message, flush=True)
+    except (OSError, ValueError):
+        pass
 
 
-def _state_of(subject) -> dict:
-    """A shallow snapshot of an object's attributes, for diffing.
+def one_line(value: object) -> str:
+    return " ".join(str(value or "").split())
 
-    Values are rendered immediately rather than held: a list captured by
-    reference and mutated in place would compare equal to itself and the
-    change -- the whole point of the snapshot -- would be invisible.
-    """
+
+def foreign(text: object) -> str:
+    body = "" if text is None else str(text)
+    return "%dB" % len(body.encode("utf-8", "replace")) if body else "empty"
+
+
+def num_env(name: str, default: float) -> float:
     try:
-        attributes = vars(subject)
-    except TypeError:
-        return {}                                    # no __dict__: nothing to diff
-    snapshot: dict = {}
-    for key, value in attributes.items():
-        if key.startswith("__"):
-            continue
-        snapshot[key] = _render(value, 160)
-        # One level deeper for objects the caller mutates through: the parser
-        # writes to self.parsed.kinds, not to self.parsed, so a snapshot that
-        # stopped here would render the same object twice and report that
-        # nothing changed -- which is the opposite of what happened.
+        value = float((os.getenv(name) or "").strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value == value and value not in (
+        float("inf"), float("-inf")) else default
+
+
+def flag(name: str, default: str = "1") -> bool:
+    return (os.getenv(name) or default).strip().lower() not in (
+        "0", "no", "off", "false", "")
+
+
+def clip(text: str, cap: int, label: str = "output") -> str:
+    if len(text) <= cap:
+        return text
+    note_template = "\n... [%d characters of %s elided] ...\n"
+    keep = cap
+    for _ in range(4):
+        room = max(0, cap - len(note_template % (len(text) - keep, label)))
+        if room == keep:
+            break
+        keep = room
+    if keep <= 0:
+        return (note_template % (len(text), label))[:cap]
+    note = note_template % (len(text) - keep, label)
+    return text[: keep // 2] + note + text[len(text) - (keep - keep // 2):]
+
+
+def reply_fingerprint(message: dict) -> str:
+    calls = (message or {}).get("tool_calls") if isinstance(message, dict) else None
+    parts = []
+    for call in calls if isinstance(calls, list) else []:
+        function = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(function, dict):
+            function = {}
+        parts.append("%s(%s)" % (function.get("name") or "",
+                                 function.get("arguments") or ""))
+    content = message.get("content") if isinstance(message, dict) else ""
+    said = "\n".join(parts) if parts else str(content or "")
+    return hashlib.sha256(said.encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def reasoning_tokens(usage: dict) -> int:
+    details = (usage or {}).get("completion_tokens_details")
+    value = details.get("reasoning_tokens") if isinstance(details, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return -1
+    return int(value)
+
+
+# =========================================================================
+# Allowance
+# =========================================================================
+
+class Spent(Exception):
+    pass
+
+
+class Allowance:
+    """The run's clock and money. Durations are measured on the monotonic
+    clock, which is what the harness times us on; the wall clock can be
+    stepped under us and is only used to compare file mtimes."""
+
+    def __init__(self) -> None:
+        self.started = time.monotonic()
+        self.wall = max(60.0, num_env("AGENT_TIMEOUT", DEFAULT_WALL_SEC))
+        self.ceiling_usd = num_env("RIDGES_MAX_COST_USD", DEFAULT_COST_LIMIT_USD)
+        self.soft_usd = self.ceiling_usd * COST_SHARE
+        self.deadline = self.started + max(30.0, self.wall * WALL_SHARE - WALL_RESERVE_SEC)
+        # After this the harness may already have given up on us.
+        self.hard_deadline = self.started + max(45.0, self.wall - HARD_TAIL_RESERVE_SEC)
+        self.spent = 0.0
+        self.calls = 0
+        self.billed = 0
+        self.edits = 0
+        self.synced_usd = None    # last total the proxy reported
+        self.sync_failed = False
+
+    def shift(self, seconds: float) -> None:
+        """The harness started its clock `seconds` before we started ours."""
+        if seconds > 0:
+            self.started -= seconds
+            self.deadline -= seconds
+            self.hard_deadline -= seconds
+
+    def clock_left(self) -> float:
+        return self.deadline - time.monotonic()
+
+    def hard_left(self) -> float:
+        return self.hard_deadline - time.monotonic()
+
+    def run_length(self) -> float:
+        """Seconds between the start and the soft deadline."""
+        return self.deadline - self.started
+
+    def money_left(self) -> float:
+        return self.soft_usd - self.spent
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    def sync(self, proxy: str = None, timeout: float = 5.0) -> bool:
+        """Adopt the proxy's total when it is above ours. The proxy is what
+        refuses the next call once the budget is gone, so its number wins
+        upward; a lower one may just be lagging."""
+        base = (proxy if proxy is not None
+                else (os.getenv("SANDBOX_PROXY_URL") or "")).strip().rstrip("/")
+        if not base or self.sync_failed:
+            return False
         try:
-            nested = vars(value)
-        except TypeError:
-            continue
-        for inner, held in nested.items():
-            if not inner.startswith("__"):
-                snapshot[f"{key}.{inner}"] = _render(held, 160)
-    return snapshot
+            with urllib.request.urlopen(base + USAGE_PATH, timeout=timeout) as response:
+                report = json.loads(response.read().decode("utf-8", "replace"))
+            total = report.get("total_cost_usd") if isinstance(report, dict) else None
+            if isinstance(total, bool) or not isinstance(total, (int, float)):
+                raise ValueError("no total_cost_usd in the usage reply")
+        except Exception as error:
+            self.sync_failed = True
+            say("[COST] usage endpoint unavailable: %s: %s"
+                % (type(error).__name__, str(error)[:120]))
+            return False
+        self.synced_usd = float(total)
+        if total > self.spent:
+            say("[COST] proxy=$%.4f local=$%.4f; adopting the proxy's total"
+                % (total, self.spent))
+            self.spent = float(total)
+            return True
+        return False
+
+    def halt_reason(self) -> str:
+        if self.clock_left() <= 0:
+            return "wall clock"
+        if self.money_left() <= 0:
+            return "budget"
+        return ""
+
+    def charge(self, model: str, usage: dict) -> float:
+        self.calls += 1
+        quoted = usage.get("cost")
+        if (isinstance(quoted, (int, float)) and not isinstance(quoted, bool)
+                and quoted >= 0):
+            self.billed += 1
+            self.spent += float(quoted)
+            return float(quoted)
+        cost = self.estimate(model, usage)
+        self.spent += cost
+        return cost
+
+    @staticmethod
+    def estimate(model: str, usage: dict) -> float:
+        """List-price estimate from token counts, for when the endpoint
+        does not quote a cost."""
+        prompt = int(usage.get("prompt_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or 0)
+        details = usage.get("prompt_tokens_details") or {}
+        cached = int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
+        fresh = max(0, prompt - cached)
+        in_price, out_price = MODEL_PRICING.get(model, UNKNOWN_TOKEN_PRICE)
+        cache_price = SEAT_CACHE_TERMS.get(model, UNKNOWN_CACHE_TERMS)[0]
+        return fresh * in_price + cached * cache_price + completion * out_price
 
 
-def install_call_tracer() -> None:
-    """Log every call into this module: arguments in, locals computed, state
-    changed, value returned.
+def transcript_cap_chars(model: str, ceiling_usd: float) -> int:
+    cache_price, window = SEAT_CACHE_TERMS.get(model, UNKNOWN_CACHE_TERMS)
+    affordable = (ceiling_usd * TRANSCRIPT_SPEND_SHARE) / (TURNS_PLANNED * cache_price)
+    tokens = min(affordable, window * 0.6)
+    return int(max(TRANSCRIPT_FLOOR_CHARS, tokens * CHARS_PER_TOKEN))
 
-    Most functions here mutate rather than return -- the parser's rules all
-    return None and write to `self.parsed` -- so a tracer that reported only
-    return values would say "None" twelve times and show nothing. What changed
-    is the interesting part, so each frame is snapshotted on the way in and
-    diffed on the way out.
 
-    Consecutive repeats of one function collapse into a count: a loop calling
-    one helper four hundred times is one line saying so.
-    """
-    frames: dict[int, dict] = {}
-    state = {"depth": 0, "last": None, "repeats": 0}
+def rounds_left(allowance: Allowance, model: str, transcript_chars: int,
+                history: list) -> int:
+    """How many more rounds the money can pay for."""
+    cache_price, _ = SEAT_CACHE_TERMS.get(model, UNKNOWN_CACHE_TERMS)
+    in_price, out_price = MODEL_PRICING.get(model, UNKNOWN_TOKEN_PRICE)
+    money = allowance.money_left()
+    if money <= 0:
+        return 0
+    if len(history) >= 3:
+        recent = history[-5:]
+        avg_growth = sum(h["growth"] for h in recent) / len(recent)
+        avg_reply = sum(h["reply_tokens"] for h in recent) / len(recent)
+    else:
+        avg_growth = 4000.0
+        avg_reply = 1200.0
+    # Each round re-reads the transcript at the cache price, pays the fresh
+    # price once for what the last round added, and pays for its reply.
+    a = cache_price * avg_growth / (2.0 * CHARS_PER_TOKEN)
+    b = (cache_price * transcript_chars / CHARS_PER_TOKEN
+         + in_price * avg_growth / CHARS_PER_TOKEN + out_price * avg_reply)
+    if a <= 0:
+        return int(money / b) if b > 0 else TURN_CEILING
+    disc = b * b + 4 * a * money
+    r = (-b + disc ** 0.5) / (2 * a)
+    return max(1, min(TURN_CEILING, int(r)))
 
-    def flush() -> None:
-        if state["repeats"] > 1:
-            log(f"{'  ' * state['depth']}   ... {state['last']} x{state['repeats']}")
-        state["last"], state["repeats"] = None, 0
 
-    def hook(frame, event, arg):
-        if event not in ("call", "return"):
-            return
-        if frame.f_globals.get("__name__") != __name__:
-            return                                   # this module only, not the stdlib
-        code = frame.f_code
-        name = code.co_name
-        if name in TRACE_SKIP or name.startswith("<"):
-            return
-        subject = frame.f_locals.get("self")
+# =========================================================================
+# Beacon
+# =========================================================================
 
-        if event == "call":
-            if name == state["last"]:                # a repeat: count, do not print
-                state["repeats"] += 1
-                state["depth"] += 1
-                return
-            flush()
-            state["last"], state["repeats"] = name, 1
-            arguments = code.co_varnames[: code.co_argcount]
-            shown = ", ".join(f"{n}={_render(frame.f_locals.get(n))}"
-                              for n in arguments if n not in ("self", "cls"))
-            log(f"{'  ' * state['depth']}-> {name}({shown})")
-            frames[id(frame)] = {"before": _state_of(subject) if subject is not None else {},
-                                 "args": set(arguments)}
-            state["depth"] += 1
-            return
+class Beacon:
+    def __init__(self, slug: str) -> None:
+        self.slug = slug.upper()
+        self.calls = 0
+        self.usd = 0.0
 
-        state["depth"] = max(0, state["depth"] - 1)
-        entry = frames.pop(id(frame), None)
-        if state["repeats"] > 1:                     # inside a collapsed run
-            return
-        pad = "  " * (state["depth"] + 1)
-        if entry:
-            # What the function computed: locals that are not its arguments.
-            for key, value in frame.f_locals.items():
-                if key in entry["args"] or key.startswith("_") or key in ("self", "cls"):
+    def reached(self, step: int, spent: float, clock: float) -> None:
+        say("[%s] reached step=%d spent=$%.4f clock=%.0fs"
+            % (self.slug, step, spent, clock))
+
+    def skipped(self, reason: str) -> None:
+        say("[%s] skipped: %s" % (self.slug, reason))
+
+    def fired(self, detail: str) -> None:
+        say("[%s] fired: %s" % (self.slug, detail[:400]))
+
+    def bill(self) -> None:
+        say("[%s] cost calls=%d usd=%.4f" % (self.slug, self.calls, self.usd))
+
+
+# =========================================================================
+# Tree — a snapshot of the application folder. No git, no network.
+# =========================================================================
+#
+# The task container holds the application at /app with its .git removed,
+# and some task images do not ship a git binary at all. Everything below
+# therefore works from the files on disk: the tree is read into memory at
+# start, the patch is a difflib diff of snapshot-vs-disk written in the
+# format `git apply` reads, and restore writes the snapshot back.
+
+SNAPSHOT_SKIP_DIRS = frozenset((
+    ".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", "node_modules", ".venv", "venv", ".tox", ".cache"))
+SNAPSHOT_KEEP_BYTES = 2 * 1024 * 1024        # per file, kept in memory
+SNAPSHOT_TOTAL_BYTES = 128 * 1024 * 1024     # across the whole snapshot
+SNAPSHOT_FILE_CEILING = 200_000
+SNAPSHOT_HASH_CEILING = 64 * 1024 * 1024      # bigger files are not hashed
+PRISTINE_BUDGET_SEC = 90.0                    # copying the tree at start
+PRISTINE_BYTES_CEILING = 2 * 1024 * 1024 * 1024
+RACY_WINDOW_NS = 2_000_000_000     # mtimes this close to the snapshot are re-hashed
+LINE_SPLIT = re.compile(r"(?<=\n)")
+NO_NEWLINE = "\\ No newline at end of file\n"
+HUNK_RANGE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def git(args: list, cwd: str, timeout: float = 60.0) -> tuple:
+    """Only ever used for `git apply --check`, and only when git exists."""
+    try:
+        done = subprocess.run(
+            ["git"] + args, cwd=cwd, capture_output=True, text=True,
+            timeout=max(2.0, timeout), errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return GIT_TIMED_OUT, "git timed out"
+    except Exception as error:
+        return 1, "%s: %s" % (type(error).__name__, error)
+    return done.returncode, (done.stdout or "") + (done.stderr or "")
+
+
+class ToolFault(Exception):
+    pass
+
+
+def parse_python(source: str):
+    """ast.parse over text read with surrogateescape: the bytes go back
+    exactly, so a coding declaration or a stray byte is the parser's call
+    and not a UnicodeEncodeError."""
+    return ast.parse(source.encode("utf-8", "surrogateescape"))
+
+
+def match_line_endings(text: str, old: str, new: str) -> tuple:
+    """`old` and `new` in the line-ending convention `text` uses. A file
+    whose first line break is CRLF gets CRLF spans; anything else LF."""
+    crlf = text.find("\r\n")
+    lf = text.find("\n")
+    uses_crlf = crlf >= 0 and crlf + 1 == lf
+    out = []
+    for span in (old, new):
+        span = span.replace("\r\n", "\n")
+        if uses_crlf:
+            span = span.replace("\n", "\r\n")
+        out.append(span)
+    return out[0], out[1]
+
+
+def split_lines(text: str) -> list:
+    """Split on \\n only, keeping the newline on each line. git counts lines
+    this way; str.splitlines also breaks on \\r, \\f and \\x1c, which would
+    misnumber hunks in files that contain them."""
+    if not text:
+        return []
+    return [part for part in LINE_SPLIT.split(text) if part]
+
+
+def looks_binary(data: bytes) -> bool:
+    return b"\0" in data[:8192]
+
+
+def file_mode(st_mode: int) -> str:
+    return "100755" if st_mode & 0o111 else "100644"
+
+
+DIFF_CONTEXT = 3
+DIFF_LINES_CEILING = 20_000   # differing lines beyond which the file is replaced whole
+
+
+def hunk_range(count: int, start: int = 1) -> str:
+    if count == 0:
+        return "%d,0" % max(0, start - 1)
+    if count == 1:
+        return "%d" % start
+    return "%d,%d" % (start, count)
+
+
+def shift_hunk_header(line: str, offset: int) -> str:
+    match = HUNK_RANGE.match(line)
+    if not match or not offset:
+        return line
+    old_start, old_count, new_start, new_count = match.groups()
+    old = "%d" % (int(old_start) + offset) + ("," + old_count if old_count is not None else "")
+    new = "%d" % (int(new_start) + offset) + ("," + new_count if new_count is not None else "")
+    return "@@ -%s +%s @@" % (old, new) + line[match.end():]
+
+
+def diff_lines(a: list, b: list, src: str, dst: str, whole: bool = False) -> list:
+    """The unified diff of two line lists, in the shape difflib emits.
+
+    The lines the two share at the head and the tail are left out of the
+    comparison (their last few kept as context), so a small edit to a long
+    file costs a few lines of work whatever the file's size. A middle that
+    is still too large to compare in bounded time is replaced whole: one
+    hunk that removes every old line and adds every new one, which git
+    applies just the same."""
+    limit = min(len(a), len(b))
+    head = 0
+    while head < limit and a[head] == b[head]:
+        head += 1
+    tail = 0
+    while tail < limit - head and a[-1 - tail] == b[-1 - tail]:
+        tail += 1
+    keep_head = max(0, head - DIFF_CONTEXT)
+    keep_tail = max(0, tail - DIFF_CONTEXT)
+    mid_a = a[keep_head:len(a) - keep_tail]
+    mid_b = b[keep_head:len(b) - keep_tail]
+    if whole or len(mid_a) + len(mid_b) > DIFF_LINES_CEILING:
+        say("[PATCH] whole-file hunk for %s: %d differing lines%s"
+            % (dst if dst != "/dev/null" else src, len(mid_a) + len(mid_b),
+               " (asked for)" if whole else ""))
+        out = ["--- %s\n" % src, "+++ %s\n" % dst,
+               "@@ -%s +%s @@\n" % (hunk_range(len(a)), hunk_range(len(b)))]
+        out += ["-" + line for line in a]
+        out += ["+" + line for line in b]
+        return out
+    out = []
+    for line in difflib.unified_diff(mid_a, mid_b, src, dst, n=DIFF_CONTEXT):
+        if keep_head and line.startswith("@@ "):
+            line = shift_hunk_header(line, keep_head)
+        out.append(line)
+    return out
+
+
+def file_diff(rel: str, kind: str, before: bytes, after: bytes,
+              mode_before: str, mode_after: str, whole: bool = False) -> str:
+    """One file's section of a patch, in the shape `git apply` reads."""
+    a = split_lines(before.decode("utf-8", "surrogateescape"))
+    b = split_lines(after.decode("utf-8", "surrogateescape"))
+    head = ["diff --git a/%s b/%s\n" % (rel, rel)]
+    if kind == "added":
+        head.append("new file mode %s\n" % (mode_after or "100644"))
+        src, dst = "/dev/null", "b/" + rel
+    elif kind == "deleted":
+        head.append("deleted file mode %s\n" % (mode_before or "100644"))
+        src, dst = "a/" + rel, "/dev/null"
+    else:
+        if mode_before and mode_after and mode_before != mode_after:
+            head.append("old mode %s\nnew mode %s\n" % (mode_before, mode_after))
+        src, dst = "a/" + rel, "b/" + rel
+    body = []
+    for line in diff_lines(a, b, src, dst, whole):
+        # header lines carry their own newline; a body line does too unless
+        # it is the file's last line and the file has no trailing newline.
+        body.append(line if line.endswith("\n") else line + "\n" + NO_NEWLINE)
+    if not body and kind == "modified" and len(head) == 1:
+        return ""
+    return "".join(head + body)
+
+
+def patch_dry_run(patch: str, original) -> bool:
+    """Would `git apply` accept this patch against the snapshot? A strict,
+    offset-free check of every context and removed line. `original(rel)`
+    returns the snapshot bytes for a path, or None when they are not held."""
+    for part in split_by_file(patch):
+        rel, new_file, deleted = "", False, False
+        for line in part.split("\n"):
+            if line.startswith("--- "):
+                if line[4:].strip() == "/dev/null":
+                    new_file = True
+                elif line.startswith("--- a/"):
+                    rel = rel or line[6:].rstrip("\t")
+            elif line.startswith("+++ "):
+                if line[4:].strip() == "/dev/null":
+                    deleted = True
+                elif line.startswith("+++ b/"):
+                    rel = rel or line[6:].rstrip("\t")
+            elif line.startswith("@@ "):
+                break
+        if not rel:
+            return False
+        before = b"" if new_file else original(rel)
+        if before is None:
+            return None
+        src = [row.rstrip("\n") for row in
+               split_lines(before.decode("utf-8", "surrogateescape"))]
+        pos = 0
+        in_hunk = False
+        for line in part.split("\n"):
+            head = HUNK_RANGE.match(line)
+            if head:
+                start = int(head.group(1))
+                count = int(head.group(2)) if head.group(2) is not None else 1
+                pos = max(0, start - 1) if count else start
+                in_hunk = True
+                continue
+            if not in_hunk or not line:
+                continue
+            tag, text = line[0], line[1:]
+            if tag in (" ", "-"):
+                if pos >= len(src) or src[pos] != text:
+                    return False
+                pos += 1
+            elif tag in ("+", "\\"):
+                continue
+            else:
+                in_hunk = False
+        if deleted and pos != len(src):
+            return False
+    return True
+
+
+class Tree:
+    """The application folder at `root`, read into memory at start."""
+
+    def __init__(self, root: str) -> None:
+        self.root = os.path.realpath(root)
+        self.base = "snapshot"
+        self.index: dict = {}       # rel -> (size, mtime_ns, st_mode)
+        self.digests: dict = {}     # rel -> sha256 of the file at start
+        self.originals: dict = {}   # rel -> bytes at start, when small enough
+        self.unkept: set = set()    # rel paths hashed but not held in memory
+        self.pristine_dir = None
+        self.taken_ns = 0
+        self.dropped: list = []     # why the last patch is incomplete, if it is
+        self._snapshot()
+
+    # ---- walking -----------------------------------------------------
+
+    def _walk(self):
+        """(rel, full) for every regular file, skipping noise directories
+        and symlinks. Never follows links out of the tree."""
+        count = 0
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d not in SNAPSHOT_SKIP_DIRS
+                and not os.path.islink(os.path.join(dirpath, d)))
+            for name in sorted(filenames):
+                full = os.path.join(dirpath, name)
+                try:
+                    if os.path.islink(full) or not os.path.isfile(full):
+                        continue
+                except OSError:
                     continue
-                log(f"{pad}. {key} = {_render(value)}")
-            # What it changed on the object it was called on.
-            after = _state_of(subject) if subject is not None else {}
-            for key, value in after.items():
-                if entry["before"].get(key) != value:
-                    log(f"{pad}~ self.{key}: {entry['before'].get(key, '<new>')} -> {value}")
-        log(f"{'  ' * state['depth']}<- {name} = {_render(arg)}")
+                count += 1
+                if count > SNAPSHOT_FILE_CEILING:
+                    say("[TREE] more than %d files; the rest are not tracked"
+                        % SNAPSHOT_FILE_CEILING)
+                    return
+                yield os.path.relpath(full, self.root).replace(os.sep, "/"), full
 
-    sys.setprofile(hook)
+    def _snapshot(self) -> None:
+        began = time.monotonic()
+        kept = 0
+        unhashed = 0
+        for rel, full in self._walk():
+            try:
+                st = os.stat(full)
+                if st.st_size > SNAPSHOT_HASH_CEILING:
+                    # Too big to hash in the time this run has; size and
+                    # mtime are all that tells a change on it.
+                    self.index[rel] = (st.st_size, st.st_mtime_ns, st.st_mode)
+                    self.digests[rel] = ""
+                    self.unkept.add(rel)
+                    unhashed += 1
+                    continue
+                if (st.st_size > SNAPSHOT_KEEP_BYTES
+                        or kept + st.st_size > SNAPSHOT_TOTAL_BYTES):
+                    # Hash streaming; never pull a big file into memory.
+                    self.index[rel] = (st.st_size, st.st_mtime_ns, st.st_mode)
+                    self.digests[rel] = self._digest(full)
+                    self.unkept.add(rel)
+                    continue
+                with open(full, "rb") as fh:
+                    data = fh.read()
+            except OSError as error:
+                say("[TREE] unreadable, not tracked: %s (%s)" % (rel, error))
+                continue
+            self.index[rel] = (st.st_size, st.st_mtime_ns, st.st_mode)
+            self.digests[rel] = hashlib.sha256(data).hexdigest()
+            self.originals[rel] = data
+            kept += len(data)
+        self.taken_ns = time.time_ns()
+        if unhashed:
+            say("[TREE] %d file(s) over %dMB tracked by size and mtime only"
+                % (unhashed, SNAPSHOT_HASH_CEILING // (1024 * 1024)))
+        say("[TREE] snapshot of %s in %.1fs: %d files, %d held (%dB), "
+            "%d hashed only"
+            % (self.root, time.monotonic() - began, len(self.index),
+               len(self.originals), kept, len(self.unkept)))
 
+    def files(self) -> list:
+        return sorted(self.index)
 
-# Line-level variable tracing: every assignment, as it happens, with the value
-# before it, the value after it, and the statement that caused the change.
-# RIDGES_TRACE=vars turns it on.
-#
-# Call tracing above reports a function's locals once, at return. That is one
-# value per name per call: a variable assigned three times inside a loop shows
-# only what it held at the end, and the statement that produced each value is
-# not visible at all. When the question is "at which line did this stop being
-# right", that is not enough.
-#
-# sys.settrace fires between statements rather than around calls, so each frame
-# can be re-read after every line and the difference attributed to the line
-# that made it. Nothing is inferred: a name appears here only because its
-# rendered value actually changed.
-#
-# It re-reads every frame after every statement, so it is far slower and far
-# louder than either mode above. It is for reading one task, never for a graded
-# run.
-TRACE_VARS = (os.getenv("RIDGES_TRACE") or "").lower() in ("vars", "lines", "values", "everything")
+    def current_files(self) -> list:
+        return [rel for rel, _ in self._walk()]
 
+    # ---- paths and IO -------------------------------------------------
 
-def install_variable_tracer() -> None:
-    """Log every variable change in this module, statement by statement.
+    def absolute(self, path: str) -> str:
+        root = os.path.normpath(self.root)
+        joined = os.path.normpath(os.path.join(root, path))
+        if joined != root and not joined.startswith(root + os.sep):
+            raise ToolFault("path escapes the repository: %s" % path)
+        return joined
 
-    Four things change inside a function and all four are reported:
+    def relative(self, path: str) -> str:
+        return os.path.relpath(self.absolute(path), self.root).replace(os.sep, "/")
 
-      * locals -- a new name, or a name whose value is not what it was;
-      * mutation in place -- values are rendered to text on capture, so a list
-        appended to differs from itself a statement earlier, which a tracer
-        holding the object by reference could never see;
-      * attributes of `self`, one level deep, which is where this agent's
-        parsers and probes actually keep their results;
-      * module globals, checked on return, for the few the code mutates.
+    def read_bytes(self, path: str) -> bytes:
+        full = self.absolute(path)
+        if not os.path.isfile(full):
+            raise ToolFault("no such file: %s" % path)
+        with open(full, "rb") as fh:
+            return fh.read()
 
-    Output is one line naming the statement and one line per change:
+    def read(self, path: str) -> str:
+        """The file as text, byte-faithful: bytes that are not UTF-8 come
+        back as surrogates and line endings are left alone, so text that
+        goes through `edit` and back writes the same bytes it read."""
+        return self.read_bytes(path).decode("utf-8", "surrogateescape")
 
-        L1102| self.parsed.kinds = [kind for _, kind in sorted(scores, reverse=True)]
-            scores: [] -> [(3, 'result_correctness'), (2, 'index_or_plan')]
-            self.parsed.kinds: [] -> ['result_correctness', 'index_or_plan']
-    """
-    import linecache
+    def write_bytes(self, path: str, data: bytes) -> None:
+        full = self.absolute(path)
+        rel = self.relative(path)
+        if rel in self.unkept and rel not in self.originals:
+            # About to overwrite a file we only hashed: keep its bytes now
+            # so the patch and the restore still have the original.
+            try:
+                with open(full, "rb") as fh:
+                    self.originals[rel] = fh.read()
+                self.unkept.discard(rel)
+            except OSError:
+                pass
+        os.makedirs(os.path.dirname(full) or self.root, exist_ok=True)
+        with open(full, "wb") as fh:
+            fh.write(data)
 
-    # Module state the code mutates rather than rebinds -- MODELS gains live
-    # prices from discover_models, for one. Diffed on return rather than per
-    # line: rendering them costs more than a local does and they change rarely.
-    watched = {name: value for name, value in globals().items()
-               if isinstance(value, (dict, list, set)) and not name.startswith("_")}
-    frames: dict[int, dict] = {}
-    depth = {"n": 0}
+    def write(self, path: str, text: str) -> None:
+        self.write_bytes(path, text.encode("utf-8", "surrogateescape"))
 
-    def locals_of(frame) -> dict:
+    # ---- change detection ---------------------------------------------
+
+    @staticmethod
+    def _digest(full: str) -> str:
+        digest = hashlib.sha256()
+        with open(full, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def changed_paths(self) -> list:
+        """[(rel, kind)] with kind one of modified / added / deleted."""
+        out = []
+        seen = set()
+        for rel, full in self._walk():
+            seen.add(rel)
+            known = self.index.get(rel)
+            if known is None:
+                out.append((rel, "added"))
+                continue
+            try:
+                st = os.stat(full)
+                # Same size and mtime means unchanged, unless the mtime is
+                # so close to the snapshot that a rewrite could share it
+                # (filesystem clocks tick coarsely). Those are re-hashed.
+                if (st.st_size == known[0] and st.st_mtime_ns == known[1]
+                        and st.st_mtime_ns < self.taken_ns - RACY_WINDOW_NS):
+                    continue
+                known_digest = self.digests.get(rel, "")
+                if not known_digest:
+                    # Never hashed: size or mtime moving is the only signal.
+                    if st.st_size != known[0] or st.st_mtime_ns != known[1]:
+                        out.append((rel, "modified"))
+                    continue
+                if self._digest(full) != known_digest:
+                    out.append((rel, "modified"))
+            except OSError:
+                continue
+        for rel in self.index:
+            if rel not in seen:
+                out.append((rel, "deleted"))
+        return sorted(out)
+
+    def has_changes(self, budget: float = 10.0):
         try:
-            items = dict(frame.f_locals)
-        except Exception:                            # a frame mid-teardown
-            return {}
-        return {key: _render(value, 200) for key, value in items.items()
-                if not key.startswith("__")}
-
-    def globals_now() -> dict:
-        return {name: _render(value, 200) for name, value in watched.items()}
-
-    def statement(frame, lineno: int) -> str:
-        text = linecache.getline(frame.f_code.co_filename, lineno).strip()
-        return text if len(text) <= 110 else text[:107] + "..."
-
-    def report(frame, record, *, include_globals: bool = False) -> None:
-        """What the statement just executed changed, or silence if nothing."""
-        after = locals_of(frame)
-        before = record["locals"]
-        changes = [f"{key} = {value}" if key not in before else f"{key}: {before[key]} -> {value}"
-                   for key, value in after.items() if before.get(key) != value]
-        record["locals"] = after
-
-        subject = record["self"]
-        if subject is not None:
-            state = _state_of(subject)
-            changes += [f"self.{key}: {record['state'].get(key, '<new>')} -> {value}"
-                        for key, value in state.items() if record["state"].get(key) != value]
-            record["state"] = state
-        if include_globals:
-            module = globals_now()
-            changes += [f"{key} (module global): {record['globals'].get(key, '<new>')} -> {value}"
-                        for key, value in module.items() if record["globals"].get(key) != value]
-            record["globals"] = module
-
-        if not changes:
-            return
-        pad = "  " * (record["depth"] + 1)
-        log(f"{pad}L{record['line']}| {statement(frame, record['line'])}")
-        for change in changes:
-            log(f"{pad}    {change}")
-
-    def local_hook(frame, event, arg):
-        record = frames.get(id(frame))
-        if record is None:
+            return bool(self.changed_paths())
+        except OSError:
             return None
-        if event == "line":
-            report(frame, record)
-            record["line"] = frame.f_lineno          # attribute the next diff to this line
-        elif event == "exception":
-            kind, value, _ = arg
-            log(f"{'  ' * (record['depth'] + 1)}!! line {frame.f_lineno}: "
-                f"{getattr(kind, '__name__', kind)}: {_render(value)}")
-        elif event == "return":
-            report(frame, record, include_globals=True)
-            frames.pop(id(frame), None)
-            depth["n"] = record["depth"]
-            log(f"{'  ' * depth['n']}<- {frame.f_code.co_name} = {_render(arg)}")
-        return local_hook
 
-    def hook(frame, event, arg):
-        if event != "call":
+    def original(self, rel: str):
+        """Bytes of `rel` as it was at start, or None if not held."""
+        data = self.originals.get(rel)
+        if data is not None:
+            return data
+        if rel in self.unkept and self.pristine_dir:
+            try:
+                with open(os.path.join(self.pristine_dir, rel), "rb") as fh:
+                    return fh.read()
+            except OSError:
+                return None
+        return None
+
+    def _current(self, rel: str) -> bytes:
+        with open(self.absolute(rel), "rb") as fh:
+            return fh.read()
+
+    # ---- the patch ------------------------------------------------------
+
+    def diff(self, budget: float = 60.0, whole=()) -> str:
+        """The patch. Anything a section could not be built for is listed
+        in self.dropped, so the caller can say the patch is incomplete.
+        Paths in `whole` are written as whole-file hunks."""
+        deadline = time.monotonic() + max(1.0, budget)
+        pieces, skipped = [], []
+        whole = set(whole or ())
+        for rel, kind in self.changed_paths():
+            if time.monotonic() > deadline:
+                say("[TREE] diff ran out of time at %s" % rel)
+                skipped.append("%s and later (out of time)" % rel)
+                break
+            before = b"" if kind == "added" else self.original(rel)
+            if before is None:
+                skipped.append("%s (original not held)" % rel)
+                continue
+            try:
+                after = b"" if kind == "deleted" else self._current(rel)
+            except OSError as error:
+                skipped.append("%s (%s)" % (rel, error))
+                continue
+            if looks_binary(before) or looks_binary(after):
+                skipped.append("%s (binary)" % rel)
+                continue
+            mode_before = (file_mode(self.index[rel][2])
+                           if rel in self.index else None)
+            try:
+                mode_after = (None if kind == "deleted"
+                              else file_mode(os.stat(self.absolute(rel)).st_mode))
+            except OSError:
+                mode_after = mode_before
+            pieces.append(file_diff(rel, kind, before, after,
+                                    mode_before, mode_after, rel in whole))
+        for note in skipped:
+            say("[PATCH] INCOMPLETE: left out %s" % note)
+        self.dropped = list(skipped)
+        return "".join(pieces)
+
+    def fingerprint(self, changed: list = None) -> dict:
+        """{rel: sha256 or None} of every changed path as it is on disk now;
+        None for a deleted path, '?' for one that could not be read."""
+        out = {}
+        for rel, kind in (self.changed_paths() if changed is None else changed):
+            if kind == "deleted":
+                out[rel] = None
+                continue
+            try:
+                out[rel] = self._digest(self.absolute(rel))
+            except (OSError, ToolFault):
+                out[rel] = "?"
+        return out
+
+    def round_trip(self, patch: str, expected: dict, budget: float = 20.0):
+        """Apply the patch to a copy of the files as they were at start and
+        compare the result with `expected`, the fingerprint of what the run
+        left on disk. A patch that applies is not yet a patch that rebuilds
+        the tree the model tested; this is the proof of that.
+
+        Returns the rels that differ, [] when every file is reproduced, and
+        None when git could not answer. Reads originals from memory or the
+        pristine copy, never from the working tree, so it can run before
+        or after restore()."""
+        if not patch.strip() or not expected:
+            return []
+        if not shutil.which("git"):
+            say("[PATCH] round trip skipped: no git")
+            return []
+        deadline = time.monotonic() + max(1.0, budget)
+        try:
+            base = tempfile.mkdtemp(prefix="roundtrip-")
+        except OSError as error:
+            say("[PATCH] round trip failed: %s" % error)
             return None
-        if frame.f_globals.get("__name__") != __name__:
-            return None                              # this module only, not the stdlib
-        code = frame.f_code
-        name = code.co_name
-        if name in TRACE_SKIP or name.startswith("<"):
+        try:
+            rels = set(expected)
+            for part in split_by_file(patch):
+                rels.add(patch_section_path(part))
+            for rel in sorted(r for r in rels if r):
+                data = self.original(rel)
+                if data is None:
+                    continue            # added in this run: nothing to seed
+                target = os.path.join(base, rel)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, "wb") as fh:
+                    fh.write(data)
+                if rel in self.index:
+                    os.chmod(target, stat.S_IMODE(self.index[rel][2]))
+            fd, path = tempfile.mkstemp(prefix="ridges-patch-", suffix=".diff", dir=base)
+            with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as fh:
+                fh.write(patch)
+            code, out = git(["apply", path], base, max(1.0, deadline - time.monotonic()))
+            if code != 0:
+                say("[PATCH] round trip could not apply: %s" % out.strip()[:200])
+                return None
+            differs = []
+            for rel, digest in sorted(expected.items()):
+                target = os.path.join(base, rel)
+                got = self._digest(target) if os.path.isfile(target) else None
+                if got != digest:
+                    differs.append(rel)
+            return differs
+        except (OSError, ToolFault) as error:
+            say("[PATCH] round trip failed: %s" % error)
             return None
-        arguments = code.co_varnames[: code.co_argcount]
-        shown = ", ".join(f"{n}={_render(frame.f_locals.get(n))}"
-                          for n in arguments if n not in ("self", "cls"))
-        log(f"{'  ' * depth['n']}-> {name}({shown})")
-        subject = frame.f_locals.get("self")
-        frames[id(frame)] = {
-            "depth": depth["n"],
-            "line": frame.f_lineno,
-            "self": subject,
-            "locals": locals_of(frame),
-            "state": _state_of(subject) if subject is not None else {},
-            "globals": globals_now(),
-        }
-        depth["n"] += 1
-        return local_hook
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
 
-    sys.settrace(hook)
+    def _check(self, patch: str, budget: float):
+        """True / False / None(unknown). Prefers `git apply --check`, which
+        needs no repository, and falls back to a Python dry run when the
+        image has no git."""
+        if shutil.which("git"):
+            try:
+                fd, path = tempfile.mkstemp(prefix="ridges-patch-", suffix=".diff")
+            except OSError as error:
+                say("[PATCH] could not be written out: %s" % error)
+                return None
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8",
+                               errors="surrogateescape") as fh:
+                    fh.write(patch)
+                code, out = git(["apply", "--check", path], self.root, budget)
+            except OSError as error:
+                say("[PATCH] could not be filled: %s" % error)
+                return None
+            finally:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            if code == GIT_TIMED_OUT:
+                return None
+            if code != 0:
+                say("[PATCH] git apply --check: %s" % out.strip()[:200])
+            return code == 0
+        try:
+            return patch_dry_run(patch, self.original)
+        except Exception as error:
+            say("[PATCH] dry run failed: %s: %s" % (type(error).__name__, error))
+            return None
+
+    def applies(self, patch: str, budget: float = 30.0):
+        if not patch.strip():
+            say("[PATCH] empty: the run finished without changing a line")
+            return False
+        answer = self._check(patch, budget)
+        if answer is True:
+            say("[PATCH] applies cleanly")
+        elif answer is False:
+            say("[PATCH] will not apply")
+        else:
+            say("[PATCH] could not be checked")
+        return answer
+
+    def applies_quietly(self, patch: str, budget: float):
+        if not patch.strip():
+            return False
+        return self._check(patch, budget)
+
+    def salvage(self, patch: str, budget: float = 45.0) -> str:
+        deadline = time.monotonic() + max(1.0, budget)
+        parts = split_by_file(patch)
+        if len(parts) < 2:
+            say("[PATCH] nothing to salvage: %d section(s)" % len(parts))
+            return ""
+        kept, dropped, unread = [], 0, 0
+        for part in parts:
+            left = deadline - time.monotonic()
+            answer = self.applies_quietly(part, left) if left > 0 else None
+            if answer is None:
+                unread = len(parts) - len(kept) - dropped
+                say("[PATCH] salvage left %d unread" % unread)
+                break
+            if answer:
+                kept.append(part)
+            else:
+                dropped += 1
+        if not kept:
+            say("[PATCH] salvage kept nothing of %d" % len(parts))
+            return ""
+        joined = "".join(kept)
+        whole = self.applies_quietly(joined, max(1.0, deadline - time.monotonic()))
+        if whole is None:
+            say("[PATCH] salvage could not re-check %d" % len(kept))
+            return ""
+        if not whole:
+            say("[PATCH] salvage kept %d that will not apply together" % len(kept))
+            return ""
+        say("[PATCH] salvaged %d of %d, dropped %d, unread %d"
+            % (len(kept), len(parts), dropped, unread))
+        lost = [patch_section_path(p) for p in parts if p not in kept]
+        note = "salvage dropped %d section(s): %s" % (
+            len(lost), ", ".join(p for p in lost if p)[:300])
+        say("[PATCH] INCOMPLETE: %s" % note)
+        self.dropped.append(note)
+        return joined
+
+    # ---- restore ----------------------------------------------------------
+
+    def put_back(self, rel: str, kind: str) -> str:
+        """Return one path to its state at start. '' on success, else why not."""
+        try:
+            full = self.absolute(rel)
+        except ToolFault as fault:
+            return str(fault)
+        if kind == "added":
+            try:
+                os.remove(full)
+            except OSError as error:
+                return str(error)
+            return ""
+        data = self.original(rel)
+        if data is None:
+            return "original not held"
+        try:
+            os.makedirs(os.path.dirname(full) or self.root, exist_ok=True)
+            with open(full, "wb") as fh:
+                fh.write(data)
+            os.chmod(full, stat.S_IMODE(self.index[rel][2]))
+        except OSError as error:
+            return str(error)
+        return ""
+
+    def restore(self, budget: float = 60.0) -> None:
+        deadline = time.monotonic() + max(1.0, budget)
+        put_back, removed, failed = 0, 0, []
+        for rel, kind in self.changed_paths():
+            if time.monotonic() > deadline:
+                failed.append("%s (out of time)" % rel)
+                break
+            why = self.put_back(rel, kind)
+            if why:
+                failed.append("%s (%s)" % (rel, why))
+            elif kind == "added":
+                removed += 1
+            else:
+                put_back += 1
+        for note in failed:
+            say("[TREE] could not restore %s" % note)
+        say("[TREE] restored: %d file(s) put back, %d removed"
+            % (put_back, removed))
+
+    def revert_outside(self, allowed: list, budget: float = 30.0) -> list:
+        """Undo every change to a path the instruction did not allow. The
+        verifier hashes those files, so a stray edit there scores zero."""
+        if not allowed:
+            return []
+        deadline = time.monotonic() + max(1.0, budget)
+        undone = []
+        for rel, kind in self.changed_paths():
+            if rel in allowed:
+                continue
+            if time.monotonic() > deadline:
+                say("[TREE] out of time reverting; %s left as is" % rel)
+                break
+            why = self.put_back(rel, kind)
+            if why:
+                say("[TREE] could not revert %s (%s)" % (rel, why))
+            else:
+                undone.append(rel)
+        if undone:
+            say("[TREE] reverted outside the allowed files: %s"
+                % ", ".join(undone))
+        return undone
+
+    # ---- a separate pristine copy, for running the baseline suite ----------
+
+    def make_pristine(self, budget: float = PRISTINE_BUDGET_SEC):
+        """A copy of the tree as it was at start, or None. Built once.
+
+        Only the files the snapshot could not hold in memory need to be
+        in it, so only those are copied. A copy that cannot finish inside
+        the budget, or that the disk cannot take, is thrown away whole: a
+        partial copy would be trusted as an original and is worse than
+        none."""
+        if self.pristine_dir and os.path.isdir(self.pristine_dir):
+            return self.pristine_dir
+        wanted = [rel for rel in self.unkept if rel in self.index]
+        if not wanted:
+            say("[TREE] pristine copy not needed: every original is in memory")
+            return None
+        need = sum(self.index[rel][0] for rel in wanted)
+        if need > PRISTINE_BYTES_CEILING:
+            say("[TREE] no pristine copy: %dMB of unheld files is over the "
+                "ceiling" % (need // (1024 * 1024)))
+            return None
+        began = time.monotonic()
+        deadline = began + max(1.0, budget)
+        try:
+            base = tempfile.mkdtemp(prefix="start")
+            free = shutil.disk_usage(base).free
+        except OSError as error:
+            say("[TREE] no pristine copy: %s" % error)
+            return None
+        if free < need * 2:
+            say("[TREE] no pristine copy: %dMB free, %dMB needed"
+                % (free // (1024 * 1024), need // (1024 * 1024)))
+            shutil.rmtree(base, ignore_errors=True)
+            return None
+        where = os.path.join(base, "tree")
+        copied = 0
+        why = ""
+        for rel in sorted(wanted):
+            if time.monotonic() > deadline:
+                why = "out of time after %d file(s)" % copied
+                break
+            target = os.path.join(where, rel)
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.copyfile(self.absolute(rel), target)
+                copied += 1
+            except (OSError, ToolFault) as error:
+                why = "%s: %s" % (rel, error)
+                break
+        if why:
+            say("[TREE] no pristine copy: %s" % why)
+            shutil.rmtree(base, ignore_errors=True)
+            return None
+        self.pristine_dir = where
+        say("[TREE] pristine copy of %d unheld file(s) at %s in %.1fs"
+            % (copied, where, time.monotonic() - began))
+        return where
 
 
-def trace(stage: str, direction: str = "", **fields) -> None:
-    """One line at a module boundary. `direction` is "in", "out" or "".
+# =========================================================================
+# search_files, workdir, package roots, inside
+# =========================================================================
 
-    Deliberately flat key=value rather than a nested dump: the point is to scan
-    a whole run for the stage where a number stops making sense.
-    """
-    if not TRACE:
-        return
-    rendered = "  ".join(f"{key}={_brief(value)}" for key, value in fields.items())
-    log(f"  {direction:<3} {stage:<24} {rendered}")
+PROJECT_MARKERS = ("manage.py", "pyproject.toml", "setup.py", "requirements.txt",
+                   "package.json", "go.mod", "Gemfile", "pom.xml",
+                   "build.gradle", "composer.json", "Cargo.toml", "mix.exs",
+                   "Makefile", "src")
+
+SEARCH_SKIP_DIRS = tuple(sorted(SNAPSHOT_SKIP_DIRS)) + (
+    "site-packages", "dist", "build", "target", "vendor", "coverage")
 
 
-def remaining_seconds() -> float:
+def _looks_like_project(path: str) -> bool:
     try:
-        budget = float(os.getenv("AGENT_TIMEOUT") or DEFAULT_AGENT_TIMEOUT)
-    except ValueError:
-        budget = DEFAULT_AGENT_TIMEOUT
-    return budget - TIMEOUT_SAFETY_MARGIN - (time.monotonic() - AGENT_START)
-
-
-PROJECT_MARKERS = ("manage.py", "pyproject.toml", "setup.py", "requirements.txt", "package.json",
-                   "go.mod", "Gemfile", "pom.xml", "build.gradle", "composer.json", "Cargo.toml",
-                   "mix.exs", "Makefile", "schema", "src")
-
-
-def _looks_like_project(path: Path) -> bool:
-    try:
-        return any((path / marker).exists() for marker in PROJECT_MARKERS)
+        return any(os.path.exists(os.path.join(path, m)) for m in PROJECT_MARKERS)
     except OSError:
         return False
 
 
-def workdir() -> Path:
-    """The application repository root inside the task container.
-
-    The explicit override wins; then the working directory, but only when it
-    holds a project (a runtime started from `/` must not index the whole
-    filesystem); then the conventional mount points.
-    """
+def workdir() -> str:
     override = os.getenv("RIDGES_WORKDIR")
-    if override and Path(override).is_dir():
-        return Path(override).resolve()
-    cwd = Path(os.getcwd())
-    if cwd.is_dir() and cwd.resolve() not in (Path("/"), Path("/installed-agent")) and _looks_like_project(cwd):
-        return cwd.resolve()
-    for candidate in ("/app", "/repo", "/workspace", "/src"):
-        path = Path(candidate)
-        if path.is_dir() and _looks_like_project(path):
-            trace("workdir", "out", root=str(path.resolve()), source="conventional mount")
-            return path.resolve()
-    chosen = cwd.resolve() if cwd.is_dir() and cwd.resolve() != Path("/") else Path("/app")
-    trace("workdir", "out", root=str(chosen), source="fallback")
-    return chosen
+    if override and os.path.isdir(override):
+        return os.path.realpath(override)
+    for candidate in ("/app", "/repo", "/workspace"):
+        if os.path.isdir(candidate) and _looks_like_project(candidate):
+            return os.path.realpath(candidate)
+    cwd = os.path.realpath(os.getcwd())
+    if cwd not in ("/", "/installed-agent") and _looks_like_project(cwd):
+        return cwd
+    return cwd
 
 
-def app_python(root: Path) -> str:
-    """The interpreter the application itself runs under.
-
-    `sys.executable` is the agent's Python. When the application lives in a
-    virtualenv, asking Django for its settings with the wrong interpreter fails
-    silently on the first import -- so look for the app's own first.
-    """
-    manage = root / "manage.py"
-    if manage.is_file():
-        try:
-            first = manage.read_text(errors="replace").splitlines()[:1]
-        except OSError:
-            first = []
-        if first and first[0].startswith("#!"):
-            exe = first[0][2:].split()[-1]
-            if exe.startswith("/") and Path(exe).exists() and "env" not in Path(exe).name:
-                return exe
-    for candidate in (root / ".venv/bin/python", root / "venv/bin/python",
-                      Path("/opt/venv/bin/python"), Path("/app/.venv/bin/python")):
-        if candidate.exists():
-            trace("app_python", "out", interpreter=str(candidate), source="virtualenv")
-            return str(candidate)
-    trace("app_python", "out", interpreter=sys.executable, source="the agent's own")
-    return sys.executable
-
-
-def run_command(
-    command: Sequence[str] | str,
-    *,
-    cwd: Path | None = None,
-    timeout: float = 300.0,
-    env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess:
-    """Run a command, capturing merged output, never raising on failure."""
-    shell = isinstance(command, str)
-    merged = os.environ.copy()
-    merged["PYTHONDONTWRITEBYTECODE"] = "1"
-    if env:
-        merged.update(env)
-    shown = command if shell else " ".join(str(part) for part in command)
-    trace("run_command", "in", cmd=shown, timeout=timeout)
-    started = time.monotonic()
+def search_files(root: str, pattern: str, mode: str = "content",
+                 include: str = None, context: int = 0,
+                 timeout: float = 15.0, where: str = None) -> str:
+    """grep -r over the tree on disk. Paths come back relative to root."""
+    flags = {"files": "-rlE", "count": "-rcE"}.get(mode, "-rEn")
+    args = ["grep", flags, "--binary-files=without-match", "-I"]
+    if context and mode == "content":
+        args.append("-C%d" % max(0, min(20, context)))
+    if include:
+        args.append("--include=" + include)
+    for skip in SEARCH_SKIP_DIRS:
+        args.append("--exclude-dir=" + skip)
+    target = "."
+    if where and where.strip(" ./"):
+        target = "./" + where.strip().strip("/")
+    args += ["--", pattern, target]
     try:
-        done = subprocess.run(
-            command,
-            shell=shell,
-            cwd=str(cwd or workdir()),
-            env=merged,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        output = exc.output or ""
-        if isinstance(output, bytes):
-            output = output.decode("utf-8", "replace")
-        done = subprocess.CompletedProcess(command, 124, output + f"\n[timeout after {timeout}s]")
-    except (OSError, ValueError) as exc:
-        done = subprocess.CompletedProcess(command, 127, f"[could not run: {exc}]")
-    # Subprocesses are where the wall clock goes -- a test run is minutes while
-    # every other stage is milliseconds -- so each one reports what it spent.
-    trace("run_command", "out", cmd=shown, rc=done.returncode,
-          seconds=time.monotonic() - started, output=len(done.stdout or ""))
-    return done
-
-
-def truncate(text: str, limit: int, *, head_ratio: float = 0.4) -> str:
-    """Keep the head and tail of long output -- errors live at both ends."""
-    if text is None:
+        done = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                              timeout=timeout, errors="replace")
+    except (subprocess.TimeoutExpired, OSError):
         return ""
-    if len(text) <= limit:
-        return text
-    head = int(limit * head_ratio)
-    tail = limit - head
-    return f"{text[:head]}\n... [{len(text) - limit} characters elided] ...\n{text[-tail:]}"
-
-
-# ---------------------------------------------------------------------------
-# Inference transport
-# ---------------------------------------------------------------------------
-
-
-class InferenceError(RuntimeError):
-    pass
-
-
-class BudgetExhausted(RuntimeError):
-    pass
-
-
-class LLM:
-    """Inference client that works in production and in `ridges miner run-local`.
-
-    Three transports, tried in order of availability:
-
-      * the sandbox proxy's /api/inference (older runtime, still deployed);
-      * OpenRouter directly -- in production a transparent MITM proxy
-        intercepts openrouter.ai and enforces the model allowlist and budget;
-      * a provider base URL from the local-testing env vars the miner CLI sets.
-
-    Only the standard library is used: an arbitrary task container is not
-    guaranteed to have `requests`, let alone the `openrouter` SDK.
-    """
-
-    def __init__(self) -> None:
-        self.run_id = os.getenv("EVALUATION_RUN_ID") or os.getenv("RUN_ID") or ""
-        self.sandbox_proxy = (os.getenv("SANDBOX_PROXY_URL") or "").rstrip("/")
-        self.openrouter_key = os.getenv("OPENROUTER_API_KEY") or ""
-        self.local_key = os.getenv("RIDGES_INFERENCE_API_KEY") or ""
-        self.local_base = (os.getenv("RIDGES_INFERENCE_BASE_URL") or "").rstrip("/")
-        try:
-            self.max_cost = float(os.getenv("RIDGES_MAX_COST_USD") or DEFAULT_MAX_COST_USD)
-        except ValueError:
-            self.max_cost = DEFAULT_MAX_COST_USD
-        self.spent_estimate = 0.0
-        self.calls = 0
-        self.unsupported: set[str] = set()
-        self._usage_unavailable = False
-        self.blocked: set[str] = set()   # permanently refused for this key
-        # Models that spent a whole completion cap on reasoning and said nothing.
-        # For the rest of the run they answer with reasoning switched off: on
-        # this prompt family their thinking does not terminate, and we pay for
-        # every token of it.
-        self.no_reasoning: set[str] = set()
-        self._second_pass = False
-        self.discovered: list[str] = []
-        self.prompt_tokens = 0
-        self.completion_tokens = 0
-        self.cached_tokens = 0          # prompt tokens the provider served from its prefix cache
-        self.reasoning_tokens = 0       # completion tokens spent thinking, not answering
-        self.per_model: dict[str, float] = {}
-        self._insecure_ctx = ssl.create_default_context()
-        self._insecure_ctx.check_hostname = False
-        self._insecure_ctx.verify_mode = ssl.CERT_NONE
-        # OpenAI-style routes in order of preference. The documented production
-        # contract is `{SANDBOX_PROXY_URL}/api/v1/chat/completions` with no
-        # open internet; the direct URL is what local runs reach through the
-        # transparent proxy. A route that cannot be reached is dropped for the
-        # run, so a wrong first guess costs one failed connection, not the task.
-        self.dead_routes: set[str] = set()
-        # Reasoning effort sent with every call. "low" rather than "minimal":
-        # OpenRouter documents high/medium/low, and a 3-run comparison at
-        # "minimal" left the reasoning share of completion tokens at 81-92%,
-        # against 86-95% at "low" -- so the value either is not honoured on this
-        # route or barely moves the model. "low" is the documented one and the
-        # one every earlier measurement was taken at.
-        self.effort = "low"
-
-    def routes(self) -> list[str]:
-        found: list[str] = []
-        if self.sandbox_proxy and self.openrouter_key:
-            found.append(f"{self.sandbox_proxy}/api/v1/chat/completions")
-        if self.openrouter_key:
-            found.append(OPENROUTER_URL)
-        if self.local_base and self.local_key:
-            found.append(f"{self.local_base}/chat/completions")
-        return found
-
-    # -- roster discovery -------------------------------------------------
-    def discover_models(self) -> list[str]:
-        """Ask the platform which models it will actually accept.
-
-        The allowed list is operational config, not a repo constant -- the docs
-        point at Discord for it, and it changes. Asking beats assuming: whatever
-        comes back is authoritative for this run, and MODELS is only the
-        fallback for when nothing answers.
-        """
-        endpoints = []
-        if self.sandbox_proxy:
-            endpoints += [f"{self.sandbox_proxy}/api/inference-models",
-                          f"{self.sandbox_proxy}/api/v1/models"]
-        endpoints += ["http://sandbox-proxy:80/api/inference-models",
-                      "http://sandbox-proxy:80/api/v1/models"]
-
-        for url in endpoints:
-            try:
-                request = urllib.request.Request(url, method="GET")
-                with urllib.request.urlopen(request, timeout=8) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-            except Exception:
-                continue
-            rows = payload.get("data") if isinstance(payload, dict) else payload
-            if not isinstance(rows, list) or not rows:
-                continue
-            names: list[str] = []
-            for row in rows:
-                if isinstance(row, str):
-                    names.append(row)
-                elif isinstance(row, dict):
-                    # /api/inference-models uses `name`; OpenAI-shaped lists use `id`.
-                    name = row.get("name") or row.get("id") or row.get("external_name")
-                    if name:
-                        names.append(name)
-                        spec = MODELS.get(name)
-                        cin = row.get("cost_usd_per_million_input_tokens")
-                        cout = row.get("cost_usd_per_million_output_tokens")
-                        if cin is not None and cout is not None:
-                            MODELS[name] = ModelSpec(name, float(cin), float(cout),
-                                                     int(row.get("max_input_tokens")
-                                                         or (spec.context if spec else 128000)))
-            if names:
-                log(f"discovered {len(names)} allowed model(s) from {url}")
-                trace("LLM.discover_models", "out", source=url, allowed=names)
-                self.discovered = names
-                return names
-        trace("LLM.discover_models", "out", allowed=[],
-              note="nothing answered; the built-in roster stands")
-        return []
-
-    def roster(self, preferred: Sequence[str]) -> list[str]:
-        """Preferred models first, then anything else the platform allows.
-
-        The tail is ordered by measured capability, not alphabetically. MODELS
-        is written strongest-first, and sorting the tail by name instead put
-        the weakest entry in the table (gemma, coding 43 / agentic 14) ahead of
-        one nearly twice its score (kimi-k2.6, coding 62). Models the table
-        does not know come last, in name order so two runs agree.
-        """
-        allowed = [m for m in self.discovered if m not in BLOCKED_MODELS]
-        if allowed:
-            ordered = [m for m in preferred if m in allowed and m not in BLOCKED_MODELS]
-            known = [m for m in MODELS if m in allowed and m not in ordered]
-            unknown = sorted(m for m in allowed if m not in ordered and m not in known)
-            return ordered + known + unknown
-        return [m for m in preferred if m not in BLOCKED_MODELS] + [
-            name for name in MODELS if name not in preferred and name not in BLOCKED_MODELS]
-
-    # -- budget ----------------------------------------------------------
-    def spent(self) -> float:
-        """Authoritative spend from the proxy, falling back to our estimate."""
-        reported = self._usage()
-        if reported is not None:
-            return reported
-        return self.spent_estimate
-
-    def _usage(self) -> float | None:
-        if self._usage_unavailable:
-            return None
-        if not self.sandbox_proxy:
-            # The proxy's usage endpoint only exists behind the sandbox proxy.
-            # Elsewhere the lookup blocks on DNS for seconds per call; the
-            # provider-reported figure is exact anyway.
-            self._usage_unavailable = True
-            return None
-        try:
-            request = urllib.request.Request(USAGE_URL, method="GET")
-            with urllib.request.urlopen(request, timeout=5) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            value = payload.get("total_cost_usd")
-            return float(value) if value is not None else None
-        except Exception:
-            self._usage_unavailable = True
-            return None
-
-    def headroom(self) -> float:
-        return max(0.0, self.max_cost - self.spent())
-
-    # -- transport -------------------------------------------------------
-    def _post(self, url: str, payload: dict, headers: dict, timeout: float) -> dict:
-        body = json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-        try:
-            try:
-                with urllib.request.urlopen(request, timeout=timeout) as response:
-                    return json.loads(response.read().decode("utf-8"))
-            except ssl.SSLError:
-                # The production proxy MITMs openrouter.ai; if its CA is not in the
-                # container trust store, verification fails on an otherwise healthy
-                # request.  Retry without verification -- the hop is loopback-local.
-                with urllib.request.urlopen(request, timeout=timeout,
-                                            context=self._insecure_ctx) as response:
-                    return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:500]
-            raise InferenceError(f"HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise InferenceError(f"transport failure: {exc.reason}") from exc
-        except (OSError, ValueError) as exc:
-            # Connection reset, remote disconnect, socket timeout, or a body
-            # that is not JSON. All of these are one bad round trip, not a
-            # reason to abandon the task: report them as retryable.
-            raise InferenceError(f"transport failure: {exc.__class__.__name__}: {exc}") from exc
-
-    def _call_via_routes(self, model: str, messages: list[dict], temperature: float,
-                         timeout: float, cap: int, reasoning: bool) -> str:
-        """Try each OpenAI-style route in order; a route that cannot be reached
-        at all (connection refused, unknown host, 404 on the path) is retired
-        for the run. Model-level errors propagate unchanged so the caller's
-        per-model handling still applies."""
-        live = [r for r in self.routes() if r not in self.dead_routes]
-        last: InferenceError | None = None
-        for url in live:
-            key = self.local_key if url.startswith(self.local_base or "\0") else self.openrouter_key
-            try:
-                return self._call_openai_style(url, key, model, messages, temperature, timeout, cap,
-                                               reasoning=reasoning)
-            except InferenceError as exc:
-                text = str(exc)
-                unreachable = ("transport failure" in text
-                               or ("HTTP 404" in text and "model" not in text.lower())
-                               or "HTTP 502" in text or "HTTP 503" in text)
-                if unreachable and len(live) > 1:
-                    self.dead_routes.add(url)
-                    log(f"inference route unreachable, retired for this run: {url} ({truncate(text, 120)})")
-                    last = exc
-                    continue
-                raise
-        if self.sandbox_proxy:
-            # Legacy sandbox schema: no max_tokens or reasoning control, but an answer.
-            return self._call_sandbox_proxy(model, messages, temperature, timeout)
-        raise last or InferenceError("no inference transport configured")
-
-    def _call_sandbox_proxy(self, model: str, messages: list[dict], temperature: float, timeout: float) -> str:
-        payload = {
-            "run_id": self.run_id,
-            "evaluation_run_id": self.run_id,
-            "model": model,
-            "temperature": temperature,
-            "messages": messages,
-        }
-        data = self._post(
-            f"{self.sandbox_proxy}/api/inference",
-            payload,
-            {"Content-Type": "application/json"},
-            timeout,
-        )
-        if isinstance(data, str):
-            return data
-        return data.get("content") or ""
-
-    def _call_openai_style(self, url: str, key: str, model: str, messages: list[dict],
-                           temperature: float, timeout: float,
-                           max_tokens: int | None = None, reasoning: bool = True) -> str:
-        payload = {
-            "model": model,
-            "temperature": temperature,
-            "messages": messages,
-            # Reasoning tokens bill as completion. This agent wants a short JSON
-            # edit, not an essay; providers that ignore the field are unaffected.
-            # Measured on deepseek-v4-pro: effort=low still thinks 1k tokens for
-            # a one-line question, and on some prompts never stops. enabled=false
-            # yields 0 reasoning tokens and the answer in the content stream.
-            "reasoning": {"effort": self.effort} if reasoning else {"enabled": False},
-        }
-        if max_tokens:
-            payload["max_tokens"] = max_tokens
-        data = self._post(
-            url,
-            payload,
-            {"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-            timeout,
-        )
-        self._record_usage(model, data.get("usage") or {})
-        try:
-            choice = data["choices"][0]
-            content = choice["message"].get("content") or ""
-        except (KeyError, IndexError, TypeError) as exc:
-            raise InferenceError(f"malformed completion: {truncate(json.dumps(data), 300)}") from exc
-        if not content.strip() and choice.get("finish_reason") == "length":
-            # The cap cut the reply off before any content survived; say so
-            # clearly so the caller can retry with more room.
-            raise InferenceError("completion truncated by max_tokens before any content")
-        return content
-
-    def _record_usage(self, model: str, usage: dict) -> None:
-        prompt = float(usage.get("prompt_tokens") or 0)
-        completion = float(usage.get("completion_tokens") or 0)
-        self.prompt_tokens += int(prompt)
-        self.completion_tokens += int(completion)
-        details = usage.get("prompt_tokens_details") or {}
-        self.cached_tokens += int(details.get("cached_tokens") or 0)
-        reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
-        self.reasoning_tokens += int(reasoning)
-
-        reported = usage.get("cost")
-        if reported is not None:
-            # The provider's own figure: exact, and free of a stale price table.
-            cost = float(reported)
-        else:
-            spec = MODELS.get(model)
-            if not spec:
-                return
-            cost = (prompt / 1e6) * spec.usd_per_m_in + (completion / 1e6) * spec.usd_per_m_out
-
-        self.spent_estimate += cost
-        self.per_model[model] = self.per_model.get(model, 0.0) + cost
-
-    def ledger(self) -> str:
-        """Where the tokens went, and how much of it was avoidable.
-
-        Three numbers decide whether a run was expensive for a good reason.
-        Cached prompt tokens are prompt this agent re-sent and the provider
-        served from its prefix cache -- cheap, and evidence the message stack
-        is stable. Reasoning tokens bill as completion and are never read by
-        anything: they are pure loss. Prompt tokens per call is what falls
-        when the prompt gets shorter, and it is multiplied by every call the
-        loop makes, so a long first prompt is paid again on every retry.
-        """
-        if not self.calls:
-            return "no inference calls"
-        billed = self.prompt_tokens - self.cached_tokens
-        rows = [
-            f"calls              {self.calls}",
-            f"prompt tokens      {self.prompt_tokens:>8,}   {self.prompt_tokens // self.calls:>7,}/call",
-            f"  served by cache  {self.cached_tokens:>8,}   {self.cached_tokens / max(1, self.prompt_tokens):>7.0%}",
-            f"  billed in full   {billed:>8,}",
-            f"completion tokens  {self.completion_tokens:>8,}   {self.completion_tokens // self.calls:>7,}/call",
-            f"  spent reasoning  {self.reasoning_tokens:>8,}   "
-            f"{self.reasoning_tokens / max(1, self.completion_tokens):>7.0%} of completion, never read",
-        ]
-        return "token ledger\n  " + "\n  ".join(rows)
-
-    def report(self) -> str:
-        """A human-readable account of what this run cost."""
-        rows = [f"  {model:32} ${cost:.5f}" for model, cost in
-                sorted(self.per_model.items(), key=lambda item: -item[1])]
-        source = "proxy" if self._usage() is not None else "provider-reported"
-        return (
-            f"cost ${self.spent():.5f} ({source}) over {self.calls} call(s), "
-            f"{self.prompt_tokens} prompt ({self.cached_tokens} cached) + "
-            f"{self.completion_tokens} completion ({self.reasoning_tokens} reasoning) tokens"
-            + ("\n" + "\n".join(rows) if rows else "")
-        )
-
-    def complete(
-        self,
-        candidates: Sequence[str],
-        messages: list[dict],
-        *,
-        temperature: float = 0.0,
-        timeout: float = 240.0,
-    ) -> tuple[str, str]:
-        """Return (content, model_used), trying each candidate slug in turn."""
-        if self.headroom() <= 0.005:
-            raise BudgetExhausted(f"cost cap reached (~${self.spent():.4f} of ${self.max_cost:.2f})")
-
-        ordered = list(candidates) if FORCE_MODEL else self.roster(candidates)
-        usable = [name for name in ordered if name not in self.unsupported]
-        if not usable:
-            raise BudgetExhausted(
-                "no allowed model is usable with this key: every candidate returned "
-                "404 (not allowed) or 402 (insufficient credit)"
-            )
-
-        last_error: Exception | None = None
-        # Models that have already spun on this prompt go last, and answer with
-        # reasoning off. Measured on prefix-hierarchy: runs where the edit was
-        # written with reasoning on passed 2/2; runs that fell back to the same
-        # model with reasoning off passed 1/6. So a runaway hands the turn to
-        # the next family with its reasoning intact, and only when every family
-        # has spun do we take an answer without reasoning.
-        usable.sort(key=lambda m: m in self.no_reasoning)          # stable: keeps ladder order otherwise
-        skipped_for_budget = False
-        for model in usable:
-            if model in self.unsupported:
-                continue
-            transient = 0          # network / 5xx style retries, at most 2
-            while transient < 2:
-                try:
-                    cap = self.affordable_cap(model, messages, COMPLETION_CAP)
-                    if cap is None:
-                        log(f"{model}: even a {MIN_COMPLETION_CAP}-token reply would exceed "
-                            f"the remaining budget (~${self.headroom():.3f}); skipping")
-                        skipped_for_budget = True
-                        break
-                    reasoning = model not in self.no_reasoning
-                    outgoing = messages
-                    if not reasoning:
-                        # This model spent a whole cap thinking earlier. Say so;
-                        # the answer now has to come out in the content stream.
-                        outgoing = messages + [{"role": "user", "content": NUDGE}]
-                    if remaining_seconds() < timeout + 60:
-                        # A call that cannot finish before the deadline is a
-                        # call whose answer nobody will read. Stop cleanly.
-                        raise BudgetExhausted("wall-clock budget cannot cover another completion")
-                    self.calls += 1
-                    trace("LLM.complete", "in", call=self.calls, model=model,
-                          messages=len(outgoing), reasoning=reasoning, cap=cap,
-                          prompt_chars=sum(len(str(m.get("content", ""))) for m in outgoing),
-                          spent=self.spent_estimate)
-                    before = (self.prompt_tokens, self.completion_tokens,
-                              self.cached_tokens, self.reasoning_tokens, self.spent_estimate)
-                    content = ""
-                    try:
-                        content = self._call_via_routes(model, outgoing, temperature,
-                                                        timeout, cap, reasoning)
-                    finally:
-                        # In a finally, because usage is recorded before the
-                        # error is raised: a runaway that spends 12k completion
-                        # tokens and returns nothing is billed in full and
-                        # would otherwise leave no trace at all.
-                        trace("LLM.complete", "out", call=self.calls, model=model,
-                              content_chars=len(content or ""),
-                              prompt=self.prompt_tokens - before[0],
-                              completion=self.completion_tokens - before[1],
-                              cached=self.cached_tokens - before[2],
-                              # Reasoning bills as completion and is never read:
-                              # the single largest avoidable cost in this agent.
-                              reasoning_tokens=self.reasoning_tokens - before[3],
-                              usd=self.spent_estimate - before[4])
-                    if content and content.strip():
-                        log(f"inference ok: {model} ({len(content)} chars, ~${self.spent_estimate:.4f})")
-                        return content, model
-                    last_error = InferenceError("empty completion")
-                except InferenceError as exc:
-                    last_error = exc
-                    text = str(exc)
-                    lowered = text.lower()
-                    if "truncated by max_tokens" in lowered or "empty completion" in lowered:
-                        if reasoning:
-                            self.no_reasoning.add(model)
-                            log(f"{model} spent the whole cap reasoning; trying the next model "
-                                f"family with reasoning on, this one answers without it from now on")
-                        else:
-                            self.unsupported.add(model)
-                            self.blocked.add(model)
-                            log(f"{model} returns no content even without reasoning; moving on")
-                        break
-                    if "403" in text or "access denied" in lowered:
-                        # Refused by policy for this model. Retrying the same
-                        # request is what got denied; move on at once.
-                        self.unsupported.add(model)
-                        self.blocked.add(model)
-                        log(f"model refused by policy on this route: {model}")
-                        break
-                    if "404" in text or "not supported" in lowered or "no allowed providers" in lowered:
-                        # Permanent for this key: the model is not on the
-                        # gateway allowlist, or no permitted provider serves it.
-                        self.unsupported.add(model)
-                        self.blocked.add(model)
-                        break  # try the next slug, not the same one again
-                    if "402" in text or "more credits" in lowered or "insufficient" in lowered:
-                        # Out of credit for this model. No amount of retrying
-                        # fixes that; strike it off and move on immediately.
-                        self.unsupported.add(model)
-                        self.blocked.add(model)
-                        log(f"model unaffordable on this key: {model}")
-                        break
-                    if "429" in text and "cost" in lowered:
-                        raise BudgetExhausted(text) from exc
-                    transient += 1
-                    log(f"inference retry ({model}, attempt {transient}): {truncate(text, 200)}")
-                    time.sleep(2 + 3 * (transient - 1))
-        # Every candidate spun with reasoning on and none has answered yet: go
-        # round once more, now without reasoning (they are all in no_reasoning).
-        spun = [m for m in usable if m in self.no_reasoning and m not in self.unsupported]
-        ran_dry = last_error is not None and ("empty" in str(last_error).lower()
-                                              or "truncated by max_tokens" in str(last_error).lower())
-        if spun and ran_dry and not self._second_pass:
-            self._second_pass = True
-            try:
-                return self.complete(candidates, messages, temperature=temperature, timeout=timeout)
-            finally:
-                self._second_pass = False
-        if skipped_for_budget and last_error is None:
-            raise BudgetExhausted(f"remaining budget (~${self.headroom():.3f}) cannot cover "
-                                  f"another completion")
-        raise InferenceError(f"all models failed; last error: {last_error}")
-
-    def affordable_cap(self, model: str, messages: list[dict], cap: int) -> int | None:
-        """Largest completion cap this call can take without breaching the budget.
-
-        The worst case for a reasoning model is a reply that uses every token
-        of the cap and says nothing. Price that case before sending: shrink the
-        cap to what the remaining budget covers, or refuse the call outright
-        when not even MIN_COMPLETION_CAP fits. Better one small honest reply
-        than a 429 from the gateway with no patch behind it.
-        """
-        # An unknown slug is priced like the dearest model we know of, not
-        # treated as free: the budget guard exists for exactly that case.
-        spec = MODELS.get(model) or ModelSpec(model, 2.0, 8.0, 128000)
-        prompt_tokens = sum(len(str(m.get("content", ""))) for m in messages) / 3.5
-        prompt_cost = prompt_tokens / 1e6 * spec.usd_per_m_in * PRICE_SAFETY
-        room = self.headroom() * 0.95 - prompt_cost
-        if room <= 0:
-            return None
-        max_tokens = int(room / (spec.usd_per_m_out * PRICE_SAFETY) * 1e6)
-        if max_tokens < MIN_COMPLETION_CAP:
-            trace("LLM.affordable_cap", "out", model=model, cap=None,
-                  headroom=self.headroom(), reason="even the smallest reply exceeds the budget")
-            return None
-        if max_tokens < cap:
-            log(f"{model}: shrinking completion cap {cap} -> {max_tokens} to stay in budget")
-            trace("LLM.affordable_cap", "out", model=model, cap=max_tokens, asked=cap,
-                  headroom=self.headroom(), reason="shrunk to fit the budget")
-            return max_tokens
-        trace("LLM.affordable_cap", "out", model=model, cap=cap, headroom=self.headroom())
-        return cap
-
-
-# ---------------------------------------------------------------------------
-# Instruction parsing
-# ---------------------------------------------------------------------------
-
-# Problem taxonomy.  The class does not select a separate solver -- it selects
-# the evidence we gather and the constraints we put in front of the model.
-PROBLEM_PATTERNS: dict[str, tuple[str, ...]] = {
-    "bounded_queries": (
-        r"\bN\+1\b", r"bounded number", r"grows with", r"scale[sd]? with",
-        r"bulk[_ ]?(create|update|insert)", r"per[- ]row", r"in a loop",
-        r"round[- ]trip", r"query count", r"number of (SQL |)queries",
-    ),
-    "index_or_plan": (
-        r"\bindex\b", r"\bindexes\b", r"\bEXPLAIN\b", r"\bbuffers\b",
-        r"sequential scan", r"seq scan", r"full scan", r"\bslow\b",
-        r"\btimeout\b", r"query plan", r"selective", r"partial index",
-    ),
-    "result_correctness": (
-        r"wrong (count|result|value|number)", r"double[- ]count", r"incorrect",
-        r"off by", r"duplicate rows", r"missing rows", r"should return",
-        r"percentage", r"utilization", r"aggregat", r"\bcounts?\b",
-    ),
-    "authoring": (
-        r"\bauthor\b", r"\bwrite\b a query", r"\bimplement\b", r"\badd\b an? annotation",
-        r"annotate", r"currently (returns|raises|is) (not|un)implemented",
-    ),
-    "orm_layer": (
-        r"\bORM\b", r"Django", r"SQLAlchemy", r"queryset", r"QuerySet",
-        r"select_related", r"prefetch_related", r"ActiveRecord", r"Ecto",
-        r"GORM", r"Prisma", r"query builder", r"manager method",
-    ),
-    "raw_sql": (
-        r"\bRawSQL\b", r"raw SQL", r"\.raw\(", r"\bSELECT\b", r"\bJOIN\b",
-        r"\bCTE\b", r"WITH RECURSIVE", r"window function", r"\.sql\b",
-    ),
-    "migration": (
-        r"\bmigration\b", r"ALTER TABLE", r"schema change", r"AddIndex",
-        r"RunSQL", r"alembic", r"\bDDL\b",
-    ),
-    "clickhouse": (
-        r"ClickHouse", r"MergeTree", r"ReplacingMergeTree", r"materiali[sz]ed view",
-        r"\bPREWHERE\b", r"ORDER BY key", r"\bsharding key\b", r"Distributed\(",
-        r"\bpartition(ing|)\b key",
-    ),
-}
-
-ENGINE_PATTERNS = {
-    "clickhouse": (r"clickhouse", r"mergetree", r"prewhere", r"clickhouse_driver", r"chdb"),
-    "postgresql": (r"postgres", r"postgresql", r"psycopg", r"pg_", r"\bpsql\b", r"::regclass"),
-}
-
-
-@dataclass
-class Instruction:
-    """Everything we can learn from the problem statement without an LLM."""
-
-    text: str
-    kinds: list[str] = field(default_factory=list)
-    engine: str = "unknown"
-    named_paths: list[str] = field(default_factory=list)
-    edit_only: list[str] = field(default_factory=list)
-    forbidden: list[str] = field(default_factory=list)
-    commands: list[str] = field(default_factory=list)
-    lint_paths: list[str] = field(default_factory=list)
-    identifiers: list[str] = field(default_factory=list)
-    method_hint: str | None = None
-    class_hint: str | None = None
-    single_method: bool = False
-    style_constraints: list[str] = field(default_factory=list)
-    traced_hint: list[str] = field(default_factory=list)
-    candidate_scores: list[float] = field(default_factory=list)   # ranker scores, best first
-    # Numeric targets the instruction states outright: {"max_queries": 3, "max_read_rows": 50000,
-    # "create_paths": [...]}. Absolute bounds beat relative ones when the task gives them.
-    targets: dict = field(default_factory=dict)
-    # Places the statement clearly contains something this parser could not
-    # extract, phrased as what to ask the model for. See _audit_extraction.
-    unparsed: list[str] = field(default_factory=list)
-
-    @property
-    def primary_kind(self) -> str:
-        return self.kinds[0] if self.kinds else "general"
-
-    @property
-    def bounded_work(self) -> bool:
-        """Whether this task is judged on how much database work the change performs.
-
-        Deliberately narrower than "optimisation": the probe counts statements,
-        so it answers a task about statements growing with input, or one that
-        states a ceiling outright. An index task is also optimisation but is
-        judged on the plan, which this cannot measure and must not claim to.
-        """
-        return "bounded_queries" in self.kinds or bool(self.targets.get("max_queries"))
-
-    # Asking for less data to be read, in the words these statements actually
-    # use. Deliberately separate from bounded_work: that one is about how many
-    # statements are issued, which is what PostgreSQL tasks are graded on;
-    # this is about how much each statement touches, which is what ClickHouse
-    # tasks are graded on. Measured against the six ClickHouse statements in
-    # the corpus -- it fires on the two that ask the query to read less and
-    # stays silent on the four that only ask for different rows.
-    _READS_LESS = re.compile(
-        r"\b(?:far |much |)fewer rows\b|\bproportional to\b|\bfull scan\b"
-        r"|\bread(?:s|ing)?\s+(?:far |much |)(?:fewer|less)\b"
-        r"|\bstopped scaling\b|\bre-?reads?\b|\bscan(?:s|ning)?\s+the whole\b",
-        re.IGNORECASE)
-
-    @property
-    def reduces_work(self) -> bool:
-        """Whether the statement asks the query to touch less data."""
-        return self.bounded_work or bool(self._READS_LESS.search(re.sub(r"\s+", " ", self.text)))
-
-
-# Fence tags that mean "the lines in here are shell commands". Measured across
-# the 62 bench statements: every one of the 60 fenced blocks is tagged ```bash,
-# and none is untagged. The tag is therefore the reliable signal and a list of
-# recognised runner words is a guess at what the tag already states outright.
-SHELL_FENCES = frozenset({"bash", "sh", "shell", "zsh", "console", "shell-session", "terminal"})
-
-
-def _fenced_blocks(text: str, *, tagged: bool = False):
-    """Fenced blocks, with their language tag when asked for."""
-    found = [(match.group(1).lower(), match.group(2).strip())
-             for match in re.finditer(r"```(\w*)\n(.*?)```", text, re.DOTALL)]
-    return found if tagged else [body for _, body in found]
-
-
-def _split_shell_commands(block: str) -> list[str]:
-    """Split a fenced shell block into commands, honouring backslash joins."""
-    joined = re.sub(r"\\\n\s*", " ", block)
-    commands = []
-    for line in joined.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+    rows = []
+    for line in (done.stdout or "").splitlines():
+        if line.startswith("./"):
+            line = line[2:]
+        if mode == "count" and line.endswith(":0"):
             continue
-        commands.append(line)
-    return commands
+        rows.append(line)
+    return "\n".join(rows) + ("\n" if rows else "")
 
 
-def _looks_like_path(token: str) -> bool:
-    if not token or len(token) > 200 or " " in token:
-        return False
-    if token.startswith(("http://", "https://")):
-        return False
-    suffix = re.search(r"(\.[A-Za-z0-9]{1,5})$", token)
-    if not suffix:
-        return False
-    # A slash makes it a path outright; without one, only a recognised source
-    # extension counts, so prose like "e.g." is not mistaken for a filename.
-    return "/" in token or suffix.group(1).lower() in SOURCE_SUFFIXES
-
-
-def normalize_repo_path(raw: str) -> str | None:
-    """Return a clean repo-relative path, or None if it escapes the repo."""
-    if not raw:
-        return None
-    candidate = raw.strip().strip("`").replace("\\", "/")
-    while candidate.startswith("./"):
-        candidate = candidate[2:]
-    path = Path(candidate)
-    if path.is_absolute() or ".." in path.parts or not candidate:
-        return None
-    return path.as_posix()
-
-
-class InstructionParser:
-    """Extracts everything the statement says, one rule per method.
-
-    This started as a single function and grew a rule at a time until it was
-    two hundred lines of interleaved regex, which is where every parsing bug in
-    this agent has come from. Two of them were the same bug: a multi-word
-    phrase that a hard wrap split in half, found once in the style clause and
-    again, later, in the prohibitions -- because the rule "match phrases
-    against the flattened text" lived in a comment rather than in the code.
-
-    Here the three views of the statement are attributes with a stated purpose,
-    so choosing the wrong one is a visible mistake rather than an invisible
-    one, and each rule is small enough to read and test on its own:
-
-      text   the statement exactly as written. Only for what depends on
-             layout -- fenced blocks, paragraph breaks, backtick spans that
-             must not cross a line.
-      flat   whitespace collapsed. Every multi-word phrase matches against
-             this, because a line break can fall anywhere inside one.
-      prose  fenced blocks removed. For paths and identifiers, so a path
-             inside `python manage.py test` is read as an invocation rather
-             than as something the task wants edited.
-
-    Rules run in a fixed order and some depend on earlier ones -- lint paths
-    come out of the parsed commands, and the path filter runs last because it
-    needs every path any rule found.
-    """
-
-    def __init__(self, text: str, root: Path) -> None:
-        self.text = text
-        self.flat = re.sub(r"\s+", " ", text)
-        self.prose = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
-        self.lowered = text.lower()
-        self.root = root
-        self.parsed = Instruction(text=text)
-
-    def parse(self) -> Instruction:
-        trace("parse_instruction", "in", statement=len(self.text), root=str(self.root))
-        for rule in (self._classify, self._detect_engine, self._collect_paths,
-                     self._read_permissions, self._read_prohibitions, self._read_method_bound,
-                     self._read_style_rules, self._read_commands, self._read_lint_paths,
-                     self._collect_identifiers, self._read_numeric_targets, self._resolve_paths,
-                     self._audit_extraction):
-            rule()
-        parsed = self.parsed
-        trace("parse_instruction", "out", kinds=parsed.kinds, engine=parsed.engine,
-              edit_only=parsed.edit_only, lint_paths=parsed.lint_paths,
-              named=parsed.named_paths, method=parsed.method_hint, cls=parsed.class_hint,
-              single_method=parsed.single_method, style=parsed.style_constraints,
-              forbidden=len(parsed.forbidden), commands=parsed.commands,
-              unparsed=parsed.unparsed,
-              targets=parsed.targets, identifiers=parsed.identifiers[:6])
-        return parsed
-
-    # -- what kind of problem this is ------------------------------------
-    def _classify(self) -> None:
-        """Rank the problem shapes the statement matches.
-
-        Selects the evidence gathered and the guidance shown; never sent to
-        the model as a label, which is what it used to be.
-
-        Against `flat` like every other phrase rule: half of PROBLEM_PATTERNS
-        are two-word phrases ("bounded number", "query count", "sequential
-        scan"), so the wrap that cost a style constraint and four prohibition
-        clauses could silently drop a whole classification here too. Measured
-        when this moved: identical on all 62 statements in the corpus, so the
-        bug was latent rather than live -- but a dropped `bounded_queries`
-        would cost the `measure` probe the prompt asks for.
-        """
-        scores: list[tuple[int, str]] = []
-        for kind, patterns in PROBLEM_PATTERNS.items():
-            hits = sum(1 for pattern in patterns if re.search(pattern, self.flat, re.IGNORECASE))
-            if hits:
-                scores.append((hits, kind))
-        self.parsed.kinds = [kind for _, kind in sorted(scores, reverse=True)]
-
-    def _detect_engine(self) -> None:
-        """The engine the prose names, if it names one at all.
-
-        Usually it does not -- a netbox statement never says "PostgreSQL". The
-        live database settles it later; this is only the head start.
-        """
-        scores = {
-            engine: sum(len(re.findall(pattern, self.lowered)) for pattern in patterns)
-            for engine, patterns in ENGINE_PATTERNS.items()
-        }
-        best = max(scores, key=lambda key: scores[key])
-        if scores[best]:
-            self.parsed.engine = best
-
-    # -- what the statement points at ------------------------------------
-    def _collect_paths(self) -> None:
-        """Every path the prose mentions, in the order it mentions them.
-
-        Evidence for the ranker, never authority to edit: check_protected
-        keys on an explicit permission precisely because a path can be
-        mentioned by a prohibition or by a command invocation.
-        """
-        seen: set[str] = set()
-        tokens = (re.findall(r"`([^`\n]+)`", self.prose)
-                  + re.findall(r"(?<![\w`/])([\w./-]+/[\w./-]+\.\w{1,5})", self.prose))
-        for token in tokens:
-            token = token.strip().strip(",.;:")
-            if token in seen or not _looks_like_path(token):
-                continue
-            seen.add(token)
-            self.parsed.named_paths.append(token)
-
-    _PERMISSION = re.compile(
-        r"(?:you\s+may\s+(?:only\s+)?(?:edit|modify|change)(?:\s+only)?"
-        r"|(?:edit|modify|change)\s+only"
-        r"|limit\s+(?:production\s+|source\s+|)changes\s+to"
-        r"|restrict\s+(?:your\s+|)(?:changes|edits)\s+to"
-        r"|the\s+only\s+file\s+you\s+may\s+(?:edit|change|modify)"
-        r"|confine\s+(?:your\s+|)(?:changes|edits)\s+to)",
-        re.IGNORECASE,
-    )
-
-    def _read_permissions(self) -> None:
-        """Files the statement actually permits us to edit.
-
-        Scans `text`, not `flat`: the window has to end where the sentence
-        does, and a 240-character window that ran into the next sentence used
-        to swallow a "do not change tests/x.py" clause and read it as a
-        permission.
-        """
-        for match in self._PERMISSION.finditer(self.text):
-            window = re.split(r"\.\s|\n\s*\n",
-                              self.text[match.end() : match.end() + 240], maxsplit=1)[0]
-            for token in re.findall(r"([\w][\w./-]*\.\w{1,5})", window):
-                if _looks_like_path(token) and token not in self.parsed.edit_only:
-                    self.parsed.edit_only.append(token)
-
-    def _read_prohibitions(self) -> None:
-        """"Do not change models, fields, ..." clauses, whole.
-
-        Against `flat`: the phrase wraps between "Do" and "not" on three of
-        the six netbox samples, which cost four clauses before this moved.
-        """
-        for match in re.finditer(r"Do\s+not\s+(?:change|modify|edit|add|touch)\s+([^.]{0,300})\.",
-                                 self.flat, re.IGNORECASE):
-            self.parsed.forbidden.append(" ".join(match.group(1).split()))
-
-    _METHOD_BOUND = re.compile(
-        r"(?:change|modify|edit)\s+only\s+that\s+(?:method|function)"
-        r"|only\s+that\s+(?:method|function)"
-        r"|keep\s+(?:its|the)\s+signature"
-        r"|(?:the\s+)?rest\s+of\s+(?:its|the)\s+file\s+unchanged"
-        r"|bounded\s+to\s+one\s+method"
-        r"|specifically\s+`[\w.]+\(\)`",
-        re.IGNORECASE)
-    _METHOD_NAME = re.compile(
-        r"`(?:(?P<cls>[A-Za-z_]\w*)\.)?(?P<name>[A-Za-z_]\w*)\(\)`"
-        r"|(?:method|function)\s+`(?:(?P<cls2>[A-Za-z_]\w*)\.)?(?P<name2>[A-Za-z_]\w*)`")
-
-    def _read_method_bound(self) -> None:
-        """Whether the change is bounded to one method, and which one.
-
-        A method hint is only trustworthy written as code -- backticked, or
-        spelled with parentheses. Bare prose ("the method that assigns tags")
-        names no symbol, and guessing one sends the slicer to the wrong place.
-        A statement mentions many symbols, so the one being scoped is the one
-        introduced as such or written with its class.
-        """
-        self.parsed.single_method = bool(self._METHOD_BOUND.search(self.flat))
-        best_rank = -1
-        for match in self._METHOD_NAME.finditer(self.text):
-            name = match.group("name") or match.group("name2")
-            qualifier = match.group("cls") or match.group("cls2")
-            if not name:
-                continue
-            preceding = self.text[max(0, match.start() - 60) : match.start()].lower()
-            rank = 2 if qualifier else 0
-            if re.search(r"specifically|namely|the method|change only|limit .{0,40}to", preceding):
-                rank += 3
-            if rank > best_rank:
-                best_rank = rank
-                self.parsed.class_hint = qualifier
-                self.parsed.method_hint = name
-
-    # -- what the change may not contain ---------------------------------
-    _FORBIDDEN_CONSTRUCTS = {
-        "loops": r"loops?",
-        "comprehensions": r"comprehensions?",
-        "lambdas": r"lambdas?",
-        "exception handling": r"exception handling|try/except",
-        "context managers": r"context managers?",
-        "raw SQL": r"raw SQL",
-    }
-    # Stated as their own sentences rather than in the "no Python ..." list,
-    # so the clause scan above never reaches them. Both are graded: the first
-    # is why F401 leads ERROR_HINTS, the second is what separates a
-    # database-side fix from a Python-side one.
-    # "requires" as well as "imports": the JavaScript and Ruby statements say
-    # `use only names the file already requires`, one word away from the
-    # wording this matched, and so the rule parsed on none of the 21
-    # non-Python tasks in the corpus.
-    _NO_NEW_NAMES = re.compile(
-        r"use only names (?:the file|it) already (?:imports|requires)"
-        r"|only names .{0,24}already (?:imports|requires)"
-        r"|without adding (?:any )?(?:new )?(?:imports|requires)"
-        r"|do not add (?:any )?(?:new )?(?:imports|requires)", re.IGNORECASE)
-    # And the opposite, stated just as plainly. One task reads "unchanged apart
-    # from imports it genuinely needs", and its reference solution adds two --
-    # so a permission has to override the prohibition, or the gate rejects the
-    # correct answer.
-    _IMPORTS_PERMITTED = re.compile(
-        r"apart from (?:any )?imports|except (?:for )?(?:any )?imports"
-        r"|imports it (?:genuinely )?needs|add(?:ing)? (?:only )?the imports",
-        re.IGNORECASE)
-    _NO_MATERIALISE = re.compile(
-        r"do not materiali[sz]e|keep .{0,40}database-backed"
-        r"|must not (?:be )?(?:fetch|load|materiali[sz]e)", re.IGNORECASE)
-
-    def _read_style_rules(self) -> None:
-        """Constructs the statement rules out inside the changed code.
-
-        Cheap to check before an edit is sent, expensive to discover from a
-        structural audit afterwards. Every one of these is a two-word phrase in
-        hard-wrapped prose, so they match `flat`.
-        """
-        constraints = self.parsed.style_constraints
-        if re.search(r"no Python loops|without (?:a |)loops?|plain ORM expressions",
-                     self.flat, re.IGNORECASE):
-            clause = re.search(r"no Python[^.]{0,200}\.", self.flat, re.IGNORECASE)
-            haystack = clause.group(0) if clause else self.flat
-            for label, pattern in self._FORBIDDEN_CONSTRUCTS.items():
-                if re.search(pattern, haystack, re.IGNORECASE):
-                    constraints.append(label)
-        if self._NO_NEW_NAMES.search(self.flat) and not self._IMPORTS_PERMITTED.search(self.flat):
-            constraints.append("names the file does not import")
-        if self._NO_MATERIALISE.search(self.flat):
-            constraints.append("materialising rows in Python")
-
-    # -- how the statement says to check the work -------------------------
-    # Package managers were listed but not the interpreters they wrap, so a
-    # block reading `node --test test/facets.test.js` or `ruby -Itest
-    # test/lapsed_test.rb` matched nothing and the task parsed zero commands.
-    # Measured on the 34 generated PostgreSQL tasks: 11 of them -- every Node
-    # and Ruby task in the corpus -- named their checks this way. With no
-    # command, `Candidate.verified` is false however good the patch is, so the
-    # agent ships a change nothing ever ran. That is a third of an unseen
-    # corpus, and the six NetBox samples could not show it because they are
-    # all Python.
-    _RUNNER = re.compile(
-        r"^\s*(python|python3|pytest|ruff|flake8|mypy|manage\.py|\./|npm|yarn|pnpm|go |cargo"
-        r"|bundle|mvn|gradle|make|psql|clickhouse|tox|nose|rspec|phpunit"
-        r"|node|ruby|deno|bun|php|dotnet|mix\b|elixir|perl|jest|vitest|java\b|swift|dart)",
-        re.IGNORECASE | re.MULTILINE)
-    _LINTER = re.compile(r"^\s*(ruff|flake8|pylint|mypy|black|eslint|gofmt|rubocop)\b")
-
-    def _read_commands(self) -> None:
-        """The checks the statement names, fenced or inline.
-
-        Missing these means the agent never verifies its own patch and
-        reports success on something it did not run, so the inline fallback
-        matters as much as the fenced one.
-        """
-        for tag, block in _fenced_blocks(self.text, tagged=True):
-            # A ```bash fence says what it contains; the runner list only
-            # guesses. Deciding by the tag is what makes an unfamiliar
-            # interpreter work without anyone having enumerated it -- the
-            # allowlist had npm, yarn and bundle but not `node` or `ruby`, so
-            # every Node and Ruby task in the generated corpus parsed no checks
-            # at all. The allowlist still decides untagged fences, where there
-            # is nothing else to go on and a block may be SQL or Python.
-            if tag not in SHELL_FENCES and not (self._RUNNER.match(block)
-                                                or self._RUNNER.search(block)):
-                continue
-            lines = _split_shell_commands(block)
-            lint_lines = [line for line in lines if self._LINTER.match(line)]
-            run_lines = [line for line in lines if not self._LINTER.match(line)]
-            # One fenced block is one script: an `export` or `cd` on line one
-            # must still be in effect on line two. `set -e` so the block's exit
-            # status is the first failure, not whatever the last line returned.
-            if len(run_lines) == 1:
-                self.parsed.commands.append(run_lines[0])
-            elif run_lines:
-                self.parsed.commands.append("set -e\n" + "\n".join(run_lines))
-            self.parsed.commands.extend(lint_lines)   # for lint_paths; the runner skips them
-
-        if not self.parsed.commands:
-            for span in re.findall(r"`([^`]+)`", self.text, re.DOTALL):
-                candidate = " ".join(span.split())     # inline spans wrap across lines
-                if self._RUNNER.match(candidate) and len(candidate) > 12:
-                    self.parsed.commands.append(candidate)
-
-    def _read_lint_paths(self) -> None:
-        """A lint invocation names the file the task expects to have changed --
-        a strong, engine-agnostic hint, and an explicit permission."""
-        for command in self.parsed.commands:
-            if not self._LINTER.match(command):
-                continue
-            for token in command.split():
-                if _looks_like_path(token) and token not in self.parsed.lint_paths:
-                    self.parsed.lint_paths.append(token)
-
-    # -- vocabulary and numbers -------------------------------------------
-    _STOP_IDENTIFIERS = {"do_not", "make_sure", "the_same", "read_only", "task_toml"}
-
-    def _collect_identifiers(self) -> None:
-        """Symbols worth grepping for: they trace a symptom to its query."""
-        found: list[str] = []
-        found += re.findall(r"\b([A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+)\b", self.prose)
-        found += re.findall(r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b", self.prose)
-        for token in re.findall(r"`([A-Za-z_][\w.]*)`", self.prose):
-            if not _looks_like_path(token):
-                found.append(token.split(".")[-1])
-        ordered: list[str] = []
-        for token in found:
-            if token.lower() in self._STOP_IDENTIFIERS or len(token) < 4 or token in ordered:
-                continue
-            ordered.append(token)
-        self.parsed.identifiers = ordered[:40]
-
-    def _read_numeric_targets(self) -> None:
-        """Bounds the instruction states outright. An absolute number beats the
-        relative "must not grow with input" test whenever the task gives one."""
-        match = re.search(
-            r"(?:at\s+most|no\s+more\s+than|a\s+maximum\s+of|not\s+exceed|≤|<=)\s*(\d+)\s+"
-            r"(?:SQL\s+|database\s+)?(?:quer(?:y|ies)|statements?|round[-\s]trips?)",
-            self.flat, re.IGNORECASE) \
-            or re.search(r"\b(\d+)\s+(?:SQL\s+|database\s+)?quer(?:y|ies)\s+"
-                         r"(?:in\s+total|total|regardless|for\s+the\s+whole)",
-                         self.flat, re.IGNORECASE)
-        if match:
-            self.parsed.targets["max_queries"] = int(match.group(1))
-        match = re.search(r"(?:read|scan)s?\s+(?:at\s+most|no\s+more\s+than|fewer\s+than|under)"
-                          r"\s+([\d,]+)\s+rows", self.flat, re.IGNORECASE)
-        if match:
-            self.parsed.targets["max_read_rows"] = int(match.group(1).replace(",", ""))
-
-    def _resolve_paths(self) -> None:
-        """Drop mentioned paths that do not exist, but remember the ones an
-        authoring task expects us to create."""
-        self.parsed.named_paths = [
-            path for path in self.parsed.named_paths
-            if (self.root / path).exists() or (self.root / path).parent.is_dir()
-        ]
-        create = [path for path in self.parsed.named_paths if not (self.root / path).exists()]
-        if create:
-            self.parsed.targets["create_paths"] = create
-
-
-    def _audit_extraction(self) -> None:
-        """Where the statement plainly holds something the rules did not extract.
-
-        Every parsing bug in this agent has been the same one: a phrasing
-        nobody enumerated, failing silently. A missing check command does not
-        raise -- it just leaves `commands` empty, and the run then reports
-        success on a patch nothing executed. The parser cannot be made to know
-        every phrasing, but it can be made to notice when it found nothing
-        where something visibly is.
-
-        Each detector is deliberately broader and dumber than the rule it
-        audits: it looks for the *shape* of the evidence, not its wording, so
-        it keeps working on phrasings the rule has never seen. `node --test`
-        was invisible to the runner list, but a ```bash fence containing lines
-        was never invisible to anyone.
-
-        What comes out is addressed to the model, because the model is reading
-        the same statement verbatim and can simply be asked.
-        """
-        shell_fences = [body for tag, body in _fenced_blocks(self.text, tagged=True)
-                        if tag in SHELL_FENCES or self._RUNNER.search(body)]
-        if shell_fences and not self.parsed.commands:
-            self.parsed.unparsed.append(
-                "this agent could not parse the commands out of the instruction's shell block: "
-                "copy every check it names into `verify`, verbatim, or the patch can only be "
-                "checked statically and nothing will run it")
-        if self.parsed.single_method and not self.parsed.method_hint:
-            self.parsed.unparsed.append(
-                "the instruction bounds the change to one method but names no symbol this agent "
-                "could resolve: put the method in `constraints.bounded_to_method` as "
-                "`Class.method` so the edit can be checked against it")
-        # "change only that method" matches _PERMISSION's `(edit|modify|change)
-        # \s+only` branch, but it restricts a symbol rather than a file -- and
-        # the method detector above already speaks for those. Only a permission
-        # clause that is actually about files is worth asking about, or this
-        # fires on every method-bounded task and says nothing.
-        about_files = any(
-            not re.match(r"\s*that\s+(method|function)", self.text[match.end():match.end() + 24],
-                         re.IGNORECASE)
-            for match in self._PERMISSION.finditer(self.text))
-        if about_files and not (self.parsed.edit_only or self.parsed.lint_paths):
-            self.parsed.unparsed.append(
-                "the instruction restricts which files may change but this agent could not read "
-                "the paths out of that sentence: list them in `constraints.editable_files`")
-
-
-def parse_instruction(text: str, root: Path) -> Instruction:
-    """Everything the statement says, without an LLM. See InstructionParser."""
-    return InstructionParser(text, root).parse()
-
-
-# ---------------------------------------------------------------------------
-# Repository index and target location
-# ---------------------------------------------------------------------------
-
-# Signals that a line participates in a query layer, weighted by specificity.
-QUERY_SIGNALS: tuple[tuple[str, float], ...] = (
-    # raw SQL entry points, any language
-    (r"\bRawSQL\b|\.raw\(|raw_sql|text\(\s*[\"']|find_by_sql|\$queryRaw|\$executeRaw|knex\.raw\(", 3.0),
-    (r"cursor\.execute|connection\.cursor|executemany|execute_batch|\.QueryRow(Context|)\(|\.Query(Context|)\(|\.Exec(Context|)\(|sql\.DB|sqlx\.", 2.0),
-    # SQL keywords, one per line, so multi-line statements are counted too
-    (r"\bSELECT\b", 1.2), (r"\bFROM\s+\w", 0.8), (r"\bJOIN\b", 1.0), (r"\bWHERE\b", 0.8),
-    (r"\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\s+BY\b|\bPREWHERE\b", 1.0),
-    (r"\bINSERT\s+INTO\b|\bUPDATE\b.+\bSET\b|\bDELETE\s+FROM\b", 2.5),
-    (r"\bOVER\s*\(|\bPARTITION\s+BY\b|\bWITH\s+RECURSIVE\b|\bLATERAL\b|\bEXISTS\s*\(", 1.5),
-    # Django
-    (r"\.annotate\(|\.aggregate\(|Subquery\(|OuterRef\(|\bWindow\(|\bExists\(", 2.0),
-    (r"\.select_related\(|\.prefetch_related\(|\.only\(|\.defer\(|\.values(_list|)\(", 1.5),
-    (r"bulk_create|bulk_update|\.update\(|\.delete\(", 1.5),
-    (r"session\.query|select\(|join\(|\.filter\(|\.exclude\(|\.order_by\(", 1.0),
-    # SQLAlchemy
-    (r"session\.(execute|scalars|scalar)\(|sa\.(select|func|text|case)\(|joinedload\(|selectinload\(|\.subquery\(", 1.5),
-    # Knex / Prisma / TypeORM
-    (r"knex\(|\.whereIn\(|\.whereRaw\(|\.leftJoin\(|\.innerJoin\(|\.groupBy\(|\.havingRaw\(|\.select\(|\.insert\(", 1.5),
-    (r"prisma\.\w+\.(findMany|findFirst|findUnique|create|update|upsert|delete|aggregate|groupBy|count)\(", 2.0),
-    (r"createQueryBuilder\(|getRepository\(|leftJoinAndSelect\(|\.getMany\(|\.getRawMany\(", 2.0),
-    # Go: GORM, pgx, database/sql
-    (r"db\.(Where|Preload|Joins|Select|Find|First|Model|Raw|Exec)\(|pool\.(Query|QueryRow|Exec)\(|pgx\.", 1.5),
-    # Ruby ActiveRecord
-    (r"\.includes\(|\.joins\(|\.left_joins\(|\.group\(|\.pluck\(|\.find_each\(|\.where\(|\.where\.not\(", 1.0),
-    # Java: jOOQ / JPA
-    (r"@Query\(|createQuery\(|createNativeQuery\(|JOIN FETCH|dsl\.select|\.fetch\(", 1.5),
-    # ClickHouse: engines, settings, clients
-    (r"MergeTree|SETTINGS\s+\w+|clickhouse|client\.(query|execute|command|query_df|insert)\(|windowFunnel|argMax|uniqExact|quantiles?", 2.5),
-    # DDL / indexes
-    (r"CREATE\s+(UNIQUE\s+|)INDEX|AddIndex|RemoveIndex|models\.Index\(|Index\(fields|@@index|add_index|USING\s+(gin|gist|brin|btree)", 2.5),
-)
-
-
-# Compiled once. `re.search(pattern_string, ...)` consults the module cache on
-# every call, and score() runs this table against every line of every indexed
-# file -- 25 patterns x ~200 lines x 1,206 files is roughly six million cache
-# lookups per task, which measured as the majority of the ranking stage. The
-# strings above stay the readable source of truth; this is the hot copy.
-QUERY_PATTERNS: tuple[tuple[re.Pattern, float], ...] = tuple(
-    (re.compile(pattern), weight) for pattern, weight in QUERY_SIGNALS)
-
-
-def query_density(text: str) -> float:
-    """How much a file looks like it talks to a database, per line.
-
-    Density, not volume, for the reason the ranker normalises: a 5,000-line
-    view module mentioning queries throughout is not more likely to hold *this*
-    query than a 67-line manager whose every line is about it. Shared by the
-    call graph and the problem profiler so neither rebuilds the other's work.
-    """
-    raw = sum(weight * len(pattern.findall(text)) for pattern, weight in QUERY_PATTERNS)
-    return raw / (len(text.splitlines()) ** 0.5 + 4.0)
-
-
-@dataclass
-class RepoFile:
-    path: Path
-    relative: str
-    text: str
-
-    @property
-    def lines(self) -> list[str]:
-        return self.text.splitlines()
-
-
-def read_source(path: Path) -> str:
-    """Read without newline translation: a CRLF file must diff as CRLF, or the
-    patch rewrites every line and `git apply` rejects it against the original."""
-    with open(path, encoding="utf-8", newline="") as handle:
-        return handle.read()
-
-
-def write_source(path: Path, text: str) -> None:
-    with open(path, "w", encoding="utf-8", newline="") as handle:
-        handle.write(text)
-
-
-class Repository:
-    """A lazily-read, in-memory view of the application checkout."""
-
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        self.files: list[str] = []
-        self._cache: dict[str, str] = {}
-        self._snapshots: dict[str, str | None] = {}
-        self._index()
-
-    def _index(self) -> None:
-        count = 0
-        for dirpath, dirnames, filenames in os.walk(self.root):
-            # Sorted: directory order is filesystem-dependent, and two runs
-            # must rank and slice identically from the same checkout.
-            dirnames[:] = sorted(name for name in dirnames if name not in SKIP_DIRS and not name.startswith("."))
-            for name in sorted(filenames):
-                if Path(name).suffix.lower() not in SOURCE_SUFFIXES:
-                    continue
-                full = Path(dirpath) / name
-                try:
-                    if full.is_symlink() or full.stat().st_size > 2_000_000:
-                        continue
-                except OSError:
-                    continue
-                self.files.append(str(full.relative_to(self.root)))
-                count += 1
-                if count >= MAX_INDEXED_FILES:
-                    log(f"index truncated at {MAX_INDEXED_FILES} files")
-                    return
-        log(f"indexed {len(self.files)} source files under {self.root}")
-        trace("Repository", "out", files=len(self.files),
-              suffixes=sorted({Path(f).suffix for f in self.files})[:8])
-
-    def read(self, relative: str) -> str | None:
-        if relative in self._cache:
-            return self._cache[relative]
-        path = self.root / relative
-        try:
-            text = read_source(path)
-        except (OSError, UnicodeDecodeError):
-            return None
-        self._cache[relative] = text
-        return text
-
-    # -- mutation with rollback -----------------------------------------
-    def snapshot(self, relative: str) -> None:
-        if relative in self._snapshots:
-            return
-        path = self.root / relative
-        try:
-            self._snapshots[relative] = read_source(path) if path.exists() else None
-        except (OSError, UnicodeDecodeError):
-            self._snapshots[relative] = None
-
-    def write(self, relative: str, text: str) -> None:
-        """Write a file, or raise OSError naming what stopped it.
-
-        The path comes from the model, so it is untrusted input: `a/b.py/c.py`
-        where `a/b.py` is a file makes mkdir raise NotADirectoryError, and a
-        path that resolves onto a directory makes the open raise
-        IsADirectoryError. apply_edits catches both and reports them as edit
-        errors, because a bad path is something the model can correct on the
-        next round -- while an exception escaping here unwinds the whole solve
-        loop and throws away a patch that may already be passing.
-        """
-        self.snapshot(relative)
-        path = self.root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_source(path, text)
-        self._cache[relative] = text
-
-    def revert(self, relative: str) -> None:
-        """Undo one file, reporting rather than raising.
-
-        Reverting is cleanup, and cleanup that raises turns a recoverable
-        problem into a lost task: solve() reverts before every attempt and
-        after every failure, and agent_main reverts in its finally so the
-        checker sees a pristine checkout. None of those callers has anything
-        useful to do with an OSError, and all of them have something to lose.
-        """
-        if relative not in self._snapshots:
-            return
-        original = self._snapshots[relative]
-        path = self.root / relative
-        try:
-            if original is None:
-                path.unlink(missing_ok=True)
-                self._cache.pop(relative, None)
-            else:
-                write_source(path, original)
-                self._cache[relative] = original
-        except OSError as exc:
-            # Worth saying loudly: a file left modified is a file we changed
-            # without meaning to, and it will show up in the patch.
-            log(f"WARNING: could not restore {relative} ({exc}); the checkout may not be pristine")
-
-    def forget(self, relative: str) -> None:
-        """Drop a cached file body. Used when a file is removed behind the
-        cache's back, so a later read does not return text that is gone."""
-        self._cache.pop(relative, None)
-
-    def revert_all(self) -> None:
-        for relative in list(self._snapshots):
-            self.revert(relative)
-
-    def original(self, relative: str) -> str | None:
-        if relative in self._snapshots:
-            return self._snapshots[relative]
-        return self.read(relative)
-
-    def changed_files(self) -> list[str]:
-        changed = []
-        for relative, original in self._snapshots.items():
-            current = None
-            path = self.root / relative
-            if path.exists():
-                try:
-                    current = read_source(path)
-                except (OSError, UnicodeDecodeError):
-                    continue
-            if current != original:
-                changed.append(relative)
-        return sorted(changed)
-
-
-STOPWORDS = frozenset("""
-a an and are as at be been before but by can do does for from has have if in into is it
-its may must no not of on only or should so than that the their then there these this
-those to use used using was were when which while will with without you your work run
-also any each every same such keep make change changed unchanged rest file files line
-lines method function name names instruction task check checks finishing following
-become becomes became becoming stay stays staying stayed remain remains remaining
-currently instead both being handful number numbers added adding still now exact exactly
-correct correctly wrong incorrect incorrectly slow slowly fast expensive cheap large small
-many few several some most more less least first last new old one two three per well very
-just even quite rather already again once twice however therefore because since although
-whether either neither between within across through against toward towards during after
-under over above below behind result results returns returned returning gives given give
-takes taken take shows shown show needs needed need wants want expected expects expect
-""".split())
-
-
-# Words that name a kind of code artifact. A statement using one is describing
-# where the problem lives, not what it looks like.
-ROLE_WORDS = frozenset("""
-migration index manager queryset filter filterset serializer view signal model cache
-search api admin form util service repository dao schema query sql handler router
-controller resource endpoint task job worker command middleware backend store
-""".split())
-
-
-# Test code in any of the layouts the bench uses: tests/, test/, spec/,
-# __tests__/, test_x.py, x_test.go, x.test.js, x.spec.ts, conftest, fixtures.
-_TEST_PATH = re.compile(
-    r"(^|/)(tests?|specs?|__tests__|fixtures?)(/|$)|(^|/)test_[^/]*$|_test\.\w+$"
-    r"|\.(test|spec)\.\w+$|conftest|fixture")
-_SEED_PATH = re.compile(r"(^|/|_)seeds?(_|\.|/|$)|sample_data|(^|/)data/")
-
-# Path words that carry no information about what a file is for.
-_PATH_NOISE = frozenset("""
-py js ts tsx jsx go rb rs java kt php sql yml yaml toml json index init main src lib app
-internal pkg cmd core utils util common base
-""".split())
-
-
-def _path_tokens(relative: str) -> set[str]:
-    """Words of a path, so `api` matches `api/` but not `capital.py`."""
-    return {t for t in re.split(r"[/._\-]+", relative.lower()) if t and t not in _PATH_NOISE}
-
-
-def _token_match(word: str, tokens: set[str]) -> bool:
-    """Whole-token or stem-prefix match: `filter` reaches `filtersets`, `tag`
-    reaches `tags`, but `api` no longer reaches `capital`."""
-    stem = word.rstrip("s")
-    return any(t.rstrip("s") == stem or t.startswith(stem) for t in tokens)
-
-
-# Ranker weights. Tuned on rank_eval.py (56 bench tasks, symptom-only); the
-# harness is the place to change them, not intuition.
-MENTIONED_PATH_BONUS = 15.0      # the prose names this file in passing
-ROLE_WORD_BONUS = 12.0           # statement and path share a role word (manager, filterset...)
-
-
-class Ranker:
-    """Rank files by how likely they hold the query the task is about.
-
-    Three independent signals, because any one of them is gameable by file
-    size: query-layer density (normalised for length), rare-word overlap with
-    the problem statement, and conventional placement of query code.
-    """
-
-    def __init__(self, repo: Repository, instruction: Instruction) -> None:
-        self.repo = repo
-        self.instruction = instruction
-        self.keywords = self._keywords()
-        self.idf = self._document_frequencies()
-        # Re-rank by count x IDF and drop words no file contains: a word with
-        # df=0 can never match, yet it would hold one of the twelve slots the
-        # hot-line pass reads. "utilization" said three times in the prose but
-        # present in four files now outranks "django" said once and present in
-        # nine hundred.
-        absent = math.log(1.0 + max(1, len(self.repo.files)))
-        present = [w for w in self.keywords if self.idf.get(w, absent) < absent]
-        trace("Ranker", "in", keywords=present, dropped=[w for w in self.keywords if w not in present],
-              idf={w: round(self.idf.get(w, 0.0), 2) for w in present[:8]})
-        self.keywords = present                                  # variant C: original order, df=0 dropped
-
-    def _keywords(self) -> list[str]:
-        """Content words from the prose -- never from the command blocks."""
-        prose = re.sub(r"```.*?```", " ", self.instruction.text, flags=re.DOTALL)
-        counts: dict[str, int] = {}
-        for word in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", prose):
-            lowered = word.lower()
-            if lowered in STOPWORDS:
-                continue
-            counts[lowered] = counts.get(lowered, 0) + 1
-        for identifier in self.instruction.identifiers:
-            lowered = identifier.lower()
-            counts[lowered] = counts.get(lowered, 0) + 3
-        if self.instruction.method_hint:
-            counts[self.instruction.method_hint.lower()] = 12
-        if self.instruction.class_hint:
-            counts[self.instruction.class_hint.lower()] = 12
-        self._counts = counts
-        ordered = sorted(counts, key=lambda word: (-counts[word], word))
-        return ordered[:30]
-
-    def _document_frequencies(self) -> dict[str, float]:
-        """Inverse document frequency, so 'tag' outweighs 'queryset'."""
-        total = max(1, len(self.repo.files))
-        frequency = {word: 0 for word in self.keywords}
-        for relative in self.repo.files:
-            text = self.repo.read(relative)
-            if text is None:
-                continue
-            lowered = text.lower()
-            for word in self.keywords:
-                if word in lowered:
-                    frequency[word] += 1
-        return {
-            word: math.log(1.0 + total / (1.0 + count))
-            for word, count in frequency.items()
-        }
-
-    def score(self, relative: str) -> tuple[float, list[int]]:
-        text = self.repo.read(relative)
-        if text is None:
-            return 0.0, []
-
-        lines = text.splitlines()
-        lowered = text.lower()
-        hot: dict[int, float] = {}
-        signal = 0.0
-
-        for number, line in enumerate(lines, start=1):
-            line_score = 0.0
-            for pattern, weight in QUERY_PATTERNS:
-                if pattern.search(line):
-                    line_score += weight
-            lowered_line = line.lower()
-            for word in self.keywords[:12]:
-                if word in lowered_line:
-                    line_score += min(3.0, self.idf.get(word, 0.0))
-            if line_score:
-                hot[number] = line_score
-                signal += line_score
-
-        # Density, not volume: a 5,000-line view module mentioning queries
-        # everywhere is not more likely to hold *this* query than a 60-line
-        # manager whose every line is about it.
-        density = signal / (len(lines) ** 0.5 + 4.0)
-
-        # Length normalisation applies to the topical term too, or a large
-        # module wins simply by containing more words.
-        topical = 0.0
-        for word in self.keywords:
-            occurrences = lowered.count(word)
-            if occurrences:
-                topical += min(occurrences, 4) * self.idf.get(word, 0.0)
-        topical /= len(lines) ** 0.5 + 4.0
-
-        # A symbol *named* after the subject is far stronger evidence than a
-        # passing mention in a comment or string.
-        symbols = " ".join(
-            match.group(2).lower()
-            for match in re.finditer(r"^\s*(class|def|func|function|type|struct)\s+(\w+)",
-                                     text, re.MULTILINE)
-        )
-        symbol_score = sum(4.0 * self.idf.get(word, 0.0) for word in self.keywords
-                           if len(word) >= 4 and word in symbols)
-
-        path_lower = relative.lower()
-        path_score = 0.0
-        tokens = _path_tokens(relative)
-        for word in self.keywords:
-            if len(word) >= 4 and _token_match(word, tokens):
-                path_score += 3.0 * self.idf.get(word, 0.0)
-                # A role word in both the statement and the path is where the
-                # statement is telling us what KIND of file to look in.
-                if word.rstrip("s") in ROLE_WORDS:
-                    path_score += ROLE_WORD_BONUS
-        for hint, weight in (
-            ("manager", 6.0), ("queryset", 6.0), ("repositor", 6.0), ("migration", 4.0),
-            ("query", 4.0), ("dao", 4.0), ("sql", 4.0), ("model", 2.0),
-            ("filters", 2.0), ("store", 1.5), ("search", 1.5),
-        ):
-            if hint in path_lower:
-                path_score += weight
-
-        if relative in self.instruction.named_paths:
-            path_score += MENTIONED_PATH_BONUS
-
-        total = 3.0 * density + 8.0 * topical + symbol_score + path_score
-        penalty = 1.0
-        if _TEST_PATH.search(path_lower):
-            penalty = 0.1           # a fix never lands in a test
-        elif _SEED_PATH.search(path_lower):
-            penalty = 0.3           # fixture data is dense with SQL but is not the query
-        if "/migrations/" in path_lower and "migration" not in self.keywords:
-            penalty *= 0.5
-        total *= penalty
-
-        top = sorted(hot, key=lambda number: hot[number], reverse=True)[:12]
-        # Guarded rather than trusting trace() to return early: score() runs
-        # once per indexed file -- 1,206 of them on netbox -- so building these
-        # arguments unconditionally would cost more than the ranking does.
-        # Only files that scored something are worth a line.
-        if TRACE and total > 0:
-            trace("Ranker.score", "out", path=relative, total=total,
-                  density=3.0 * density, topical=8.0 * topical,
-                  symbol=symbol_score, path_score=path_score, penalty=penalty,
-                  hot_lines=len(top))
-        return total, sorted(top)
-
-
-class CallGraph:
-    """Trace a symptom to the code that actually issues the query.
-
-    A task names a symptom -- "the IP-address device filter is slow" -- not a
-    query. The query is often several calls away:
-
-        endpoint -> view -> service -> repository -> ORM -> SQL
-
-    Ranking files by keyword and query-signal density finds the query only when
-    the symptom and the query live in the same file. When they do not, the
-    ranker points at the symptom and the fix lands in the wrong place. So follow
-    the references: from the names the instruction mentions, walk outward to the
-    definitions they reach, and see which of those touch a query layer.
-
-    Deliberately approximate. It resolves names, not types, so `a.save()` and
-    `b.save()` are the same symbol -- which over-connects rather than
-    under-connects, and over-connecting is the safe direction for a search whose
-    output is only a ranked shortlist.
-    """
-
-    _DEF = re.compile(r"^\s*(?:class|def|async def|func|function)\s+(\w+)", re.MULTILINE)
-    _CALL = re.compile(r"\b([A-Za-z_]\w{2,})\s*\(")
-    _ATTR = re.compile(r"\.([A-Za-z_]\w{2,})\b")
-
-    # Same notion of "test code" as the protected-paths gate, so the graph never
-    # steers the model toward a helper it would then be forbidden to edit.
-    _TEST_PATH = re.compile(r"(^|/)(tests?|testing|spec|fixtures?|conftest\.py)(/|$)"
-                            r"|(^|/)test_[^/]*$|_test\.[a-z]+$", re.IGNORECASE)
-
-    def __init__(self, repo: Repository) -> None:
-        self.repo = repo
-        self.defined_in: dict[str, list[str]] = {}     # symbol -> files defining it
-        self.defined_at: dict[str, list[tuple[str, int]]] = {}   # symbol -> (file, line)
-        self.mentions: dict[str, set[str]] = {}        # file -> symbols it uses
-        self._weights: dict[str, float] = {}           # query_weight is hot; cache it
-        self._build()
-
-    def _build(self) -> None:
-        for relative in self.repo.files:
-            # Production code only: a fix never belongs in a test, and test
-            # modules would otherwise dominate both seeding and the walk.
-            if self._TEST_PATH.search(relative):
-                continue
-            text = self.repo.read(relative)
-            if text is None:
-                continue
-            for match in self._DEF.finditer(text):
-                name = match.group(1)
-                self.defined_in.setdefault(name, []).append(relative)
-                self.defined_at.setdefault(name, []).append(
-                    (relative, text.count("\n", 0, match.start()) + 1))
-            used = set(self._CALL.findall(text)) | set(self._ATTR.findall(text))
-            self.mentions[relative] = used
-
-    def query_weight(self, relative: str) -> float:
-        """How much this file looks like it talks to a database, per line."""
-        if relative not in self._weights:
-            self._weights[relative] = query_density(self.repo.read(relative) or "")
-        return self._weights[relative]
-
-    def seeds_from_keywords(self, keywords: Sequence[str], limit: int = 40) -> list[str]:
-        """Symbols whose *name* echoes the task's vocabulary.
-
-        Many instructions name no symbol at all -- "find the manager method that
-        assigns tags" mentions no identifier that exists in the code. But the
-        code does, e.g. a TaggableManager or TaggedItem class. Matching the task's
-        content words against defined symbol names gives the walk somewhere to
-        start when the prose gives us nothing.
-        """
-        wanted = [word for word in keywords if len(word) >= 3]
-        hits: list[tuple[int, str]] = []
-        for symbol, files in self.defined_in.items():
-            lowered = symbol.lower()
-            matched = sum(1 for word in wanted if word in lowered)
-            if matched:
-                weight = max((self.query_weight(f) for f in files[:3]), default=0.0)
-                hits.append((matched * 100 + int(weight), symbol))
-        hits.sort(key=lambda hit: (-hit[0], hit[1]))          # score, then name: deterministic
-        return [symbol for _, symbol in hits[:limit]]
-
-    def trace(self, seeds: Sequence[str], max_hops: int = 3) -> dict[str, float]:
-        """Files reachable from the seed symbols, scored by query evidence.
-
-        Score decays with distance, so a query-bearing file two calls from the
-        symptom still outranks an unrelated one that merely mentions SQL.
-        """
-        scores: dict[str, float] = {}
-        frontier = {name for name in seeds if name in self.defined_in}
-        seen: set[str] = set()
-
-        # One hop backwards first: the files that CALL a seed. A symptom named
-        # after a view often has its query in the manager the view calls, but
-        # just as often the reverse -- the named helper is called from the
-        # file that issues the query.
-        for symbol in sorted(frontier):
-            owners = set(self.defined_in.get(symbol, []))
-            for relative, names in self.mentions.items():
-                if symbol in names and relative not in owners:
-                    weight = self.query_weight(relative)
-                    if weight:
-                        scores[relative] = max(scores.get(relative, 0.0), weight * 0.6)
-
-        for hop in range(max_hops):
-            if not frontier:
-                break
-            decay = 0.6 ** hop
-            reached: set[str] = set()
-            for symbol in frontier:
-                if symbol in seen:
-                    continue
-                seen.add(symbol)
-                for relative in self.defined_in.get(symbol, [])[:8]:
-                    weight = self.query_weight(relative)
-                    if weight:
-                        scores[relative] = max(scores.get(relative, 0.0), weight * decay)
-                    # Follow what that file reaches, so the walk can cross from
-                    # a view into the manager the view eventually calls.
-                    reached |= {name for name in self.mentions.get(relative, set())
-                                if name in self.defined_in and name not in seen}
-            # Widening without limit turns into a full-repo scan; keep the most
-            # promising names by how query-ish their defining files are.
-            # Ties broken by name: `reached` is a set of strings, and set order
-            # follows the per-process hash seed. Two runs must see the
-            # same shortlist from the same input.
-            frontier = set(sorted(reached,
-                                  key=lambda n: (-max((self.query_weight(f)
-                                                       for f in self.defined_in.get(n, [])[:3]),
-                                                      default=0.0), n))[:40])
-        return scores
-
-
-def locate_targets(repo: Repository, instruction: Instruction, limit: int = 6) -> list[tuple[str, list[int]]]:
-    """Rank candidate files: instruction-named ones first, then by evidence."""
-    ranker = Ranker(repo, instruction)
-    trace("locate_targets", "in", files=len(repo.files), keywords=ranker.keywords[:8],
-          method=instruction.method_hint, explicit=bool(instruction.edit_only
-                                                        or instruction.lint_paths))
-
-    # Only a permission ("limit changes to X", or the lint command's target)
-    # settles the question. A path the prose merely mentions -- "the signal in
-    # `app/signals.py` must keep firing" -- is evidence for the ranker, not a
-    # decision: measured, treating mentions as decisions sent the model to the
-    # wrong file on 2 of 56 symptom-only cases.
-    explicit = [
-        path
-        for path in (instruction.edit_only or instruction.lint_paths)
-        if (repo.root / path).exists()
-    ]
-    if explicit:
-        results = [(path, ranker.score(path)[1]) for path in explicit[:limit]]
-        log(f"instruction names editable paths: {[path for path, _ in results]}")
-        trace("locate_targets", "out", source="the instruction named them",
-              candidates=[path for path, _ in results],
-              hot_lines=[len(hot) for _, hot in results])
-        return results
-
-    scored: list[tuple[float, str, list[int]]] = []
-    for relative in repo.files:
-        value, hot = ranker.score(relative)
-        if value > 0:
-            scored.append((value, relative, hot))
-
-    # Ranking alone finds the query only when it shares a file with the symptom.
-    # Follow the references too, so a query two calls away is still reachable.
-    traced: dict[str, float] = {}
+def inside(path: str, root: str) -> bool:
     try:
-        graph = CallGraph(repo)
-        seeds = list(instruction.identifiers)
-        if instruction.method_hint:
-            seeds.append(instruction.method_hint)
-        if instruction.class_hint:
-            seeds.append(instruction.class_hint)
-        resolved = [name for name in seeds if name in graph.defined_in]
-        if not resolved:
-            # The instruction names no symbol that exists in the code. Seed from
-            # the task's vocabulary instead, matched against symbol names.
-            resolved = graph.seeds_from_keywords(ranker.keywords)
-            log(f"no named symbol resolved; seeding the trace from vocabulary: {resolved[:6]}")
-        traced = graph.trace(resolved)
-        trace("CallGraph", "in", seeds=resolved[:8], symbols=len(graph.defined_in))
-        trace("CallGraph", "out", reached=len(traced),
-              strongest=sorted(traced, key=lambda k: -traced[k])[:4])
-    except Exception as exc:                      # tracing is a bonus, never a blocker
-        log(f"call-graph tracing skipped: {exc}")
-
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    log("keywords: " + ", ".join(ranker.keywords[:10]))
-    if traced:
-        reached = sorted(traced, key=lambda k: (-traced[k], k))[:4]
-        # Deliberately NOT folded into the ranking: measured on the implicit-
-        # target sample it moved the correct file from rank 2 to rank 5. Kept
-        # as a hint the model can act on through need_context instead.
-        instruction.traced_hint = [r for r in reached
-                                   if r not in {path for _, path, _ in scored[:limit]}][:3]
-        log(f"call-graph reached {len(traced)} query-bearing file(s); strongest: {reached}")
-    log("top candidates: " + ", ".join(f"{path} ({value:.0f})" for value, path, _ in scored[:limit]))
-    instruction.candidate_scores = [value for value, _, _ in scored[:limit]]
-    top = scored[:limit]
-    # The margin is what says whether rank 1 was actually decided: a 5% gap
-    # over rank 2 is a coin toss dressed as a ranking.
-    margin = ((top[0][0] - top[1][0]) / top[0][0]) if len(top) > 1 and top[0][0] else 1.0
-    trace("locate_targets", "out", source="ranked", scored=len(scored),
-          candidates=[path for _, path, _ in top],
-          scores=[round(value, 1) for value, _, _ in top],
-          margin_over_2nd=margin, traced_hint=instruction.traced_hint)
-    return [(path, hot) for _, path, hot in top]
+        path, root = os.path.realpath(path), os.path.realpath(root)
+        if (os.path.splitdrive(path)[0].lower()
+                != os.path.splitdrive(root)[0].lower()):
+            return False
+        return os.path.commonpath([path, root]) == root
+    except (ValueError, OSError, TypeError):
+        return True
 
 
-# ---------------------------------------------------------------------------
-# Code slicing -- show the model the relevant region, not the whole file
-# ---------------------------------------------------------------------------
+# =========================================================================
+# Diff parsing
+# =========================================================================
 
-@dataclass
-class Slice:
-    relative: str
-    start: int          # 1-indexed, inclusive
-    end: int            # 1-indexed, inclusive
-    label: str
-
-    def render(self, repo: Repository) -> str:
-        text = repo.read(self.relative) or ""
-        lines = text.splitlines()
-        chunk = lines[self.start - 1 : self.end]
-        numbered = "\n".join(f"{self.start + offset:5d}| {line}" for offset, line in enumerate(chunk))
-        return f"--- {self.relative} lines {self.start}-{self.end} ({self.label}) ---\n{numbered}"
+def patch_section_path(section: str) -> str:
+    """The b/ path a `diff --git` section is about, or ''."""
+    first = (section or "").split("\n", 1)[0]
+    match = re.match(r"diff --git a/(.*) b/(.*)$", first)
+    return match.group(2) if match else ""
 
 
-def python_definitions(text: str) -> list[tuple[str, int, int, str]]:
-    """(qualified_name, start_line, end_line, kind) for every def/class."""
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:
+def split_by_file(patch: str) -> list:
+    out, current = [], []
+    for line in (patch or "").splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current:
+                out.append("".join(current))
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        out.append("".join(current))
+    return out
+
+
+def path_tail(name: str, root: str = "") -> str:
+    text = str(name or "").replace("\\", "/")
+    base = str(root or "").replace("\\", "/").rstrip("/")
+    if base and text.startswith(base + "/"):
+        text = text[len(base) + 1:]
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+CANDIDATE_BUDGET_SEC = 12.0
+CANDIDATE_TERMS_MAX = 16
+
+
+def candidate_paths(root: str, statement: str, limit: int = 30,
+                    budget: float = CANDIDATE_BUDGET_SEC) -> list:
+    """grep -r over the statement's rare terms, quoted terms first, inside a
+    fixed time budget so a large tree cannot stall the start of the run.
+    Returns up to `limit` paths."""
+    quoted = {m.lower() for m in QUOTED_RE.findall(statement)}
+    terms = {w.lower() for w in WORD_RE.findall(statement)} - COMMON_WORDS
+    terms |= quoted
+    terms = {t for t in terms if len(t) > 3}
+    if not terms:
         return []
+    ordered = sorted(terms, key=lambda t: (t not in quoted, -len(t), t))
+    deadline = time.monotonic() + max(1.0, budget)
+    scores = {}
+    for term in ordered[:CANDIDATE_TERMS_MAX]:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            say("[SEED] out of time after %d term(s)" % len(scores))
+            break
+        out = search_files(root, term, mode="files",
+                           timeout=max(0.5, min(3.0, left)))
+        hits = [p for p in out.splitlines() if p]
+        if not hits or len(hits) > 60:
+            continue
+        weight = (1.0 / len(hits)) * (3.0 if term in quoted else 1.0)
+        for path in hits:
+            penalty = 0.25 if ("test" in path.lower()
+                               or path.startswith("docs/")) else 1.0
+            scores[path] = scores.get(path, 0.0) + weight * penalty
+    return [p for p, _ in sorted(scores.items(), key=lambda kv: -kv[1])][:limit]
 
-    found: list[tuple[str, int, int, str]] = []
 
-    def walk(node: ast.AST, prefix: str) -> None:
+# =========================================================================
+# Scope — what the statement itself says about where the change goes
+# =========================================================================
+#
+# Most instructions name the file, often the method, and always the checks.
+# Reading those out deterministically costs nothing and removes the search
+# the model would otherwise do across the whole tree. Nothing here is tied
+# to one repository: the regexes match phrasing, and every path is verified
+# on disk before it is trusted.
+
+SCOPE_FILE_RES = (
+    re.compile(
+        r"(?:limit(?:ed)?\s+(?:production\s+)?changes?\s+to|"
+        r"you\s+may\s+(?:only\s+)?(?:edit|change|modify)(?:\s+only)?|"
+        r"(?:edit|change|modify)\s+only|"
+        r"only\s+(?:edit|change|modify)|"
+        r"confine\s+(?:your\s+)?changes?\s+to|"
+        r"production\s+changes?\s+(?:are\s+)?limited\s+to)"
+        r"\s*[:\s]*`([^`\n]+)`", re.I),
+    re.compile(r"`([^`\s]+\.[A-Za-z0-9]{1,6})`\s*,?\s*(?:specifically|and\s+only)\b",
+               re.I),
+)
+SCOPE_METHOD_RE = re.compile(r"\bspecifically\s+`([^`\n]+)`", re.I)
+SCOPE_NOT_SYMBOL = (".py", ".js", ".ts", ".go", ".rb", ".php", ".sql", ".md",
+                    ".json", ".yaml", ".yml", ".toml")
+CHECK_RUNNERS = frozenset((
+    "python", "python3", "pytest", "ruff", "flake8", "mypy", "black",
+    "node", "npm", "npx", "pnpm", "yarn", "deno", "jest", "vitest", "eslint", "tsc",
+    "go", "gofmt", "ruby", "bundle", "rails", "rspec", "rake",
+    "cargo", "mvn", "gradle", "php", "composer", "mix", "make",
+    "manage.py", "poetry", "uv", "dotnet"))
+ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+FENCED_BLOCK = re.compile(r"```(?:bash|sh|shell|console|zsh)?[ \t]*\r?\n(.*?)```", re.S)
+INLINE_SPAN = re.compile(r"`([^`]{4,400})`")
+CD_LINE = re.compile(r"^cd\s+(\S+)\s*$")
+SCOPE_EXCERPT_CHARS = 14_000
+CHECK_COMMANDS_MAX = 4
+REGION_LINES_MAX = 250
+IMPORT_LINES_MAX = 60
+
+# One definition-line pattern per language; %s is the escaped name.
+LANG_DEF_RES = {
+    "js": (r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s+%s\s*\(|"
+           r"^\s*(?:export\s+)?(?:const|let|var)\s+%s\s*=|"
+           r"^\s*(?:static\s+)?(?:async\s+)?%s\s*\([^;{}]*\)\s*\{|"
+           r"^\s*%s\s*:\s*(?:async\s*)?(?:function\b|\()"),
+    "go": r"^func\s+(?:\([^)]*\)\s*)?%s\s*[\(\[]",
+    "rb": r"^\s*def\s+(?:self\.)?%s\b",
+    "php": r"^\s*(?:(?:public|private|protected|static|final|abstract)\s+)*function\s+%s\s*\(",
+}
+LANG_OF_EXT = {".js": "js", ".mjs": "js", ".cjs": "js", ".jsx": "js", ".ts": "js",
+               ".tsx": "js", ".go": "go", ".rb": "rb", ".php": "php"}
+IMPORT_LINE = re.compile(
+    r"^\s*(?:import\b|from\b|require\b|package\b|use\b|"
+    r"(?:const|let|var)\s+.*=\s*(?:await\s+)?(?:require|import)\s*\(|"
+    r"#|//|/\*|\*|\)|\"|'|$)")
+
+
+SCOPE_TOP_DENY = frozenset((
+    "docs", "doc", "fixtures", "examples", "example", "tests", "test",
+    "scripts", "build", "dist"))
+
+
+def _resolve_named(rel: str, root: str) -> str:
+    """The path as it exists under root, or '' when it does not.
+
+    A path written from inside the app's package dir, e.g. `ipam/x.py`
+    for netbox/ipam/x.py, is looked for one level down. When more than one
+    top-level dir holds it, the answer is '' rather than a guess: a wrong
+    scope would gate every edit to the real target."""
+    if os.path.isfile(os.path.join(root, rel)):
+        return rel
+    try:
+        tops = sorted(d for d in os.listdir(root)
+                      if os.path.isdir(os.path.join(root, d))
+                      and not d.startswith("."))
+    except OSError:
+        return ""
+    hits = [top + "/" + rel for top in tops
+            if os.path.isfile(os.path.join(root, top, rel))]
+    if len(hits) > 1:
+        hits = [h for h in hits if h.split("/", 1)[0] not in SCOPE_TOP_DENY] or hits
+    if len(hits) > 1:
+        marked = [h for h in hits
+                  if _looks_like_project(os.path.join(root, h.split("/", 1)[0]))]
+        hits = marked or hits
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        say("[SCOPE] `%s` is under %d top-level dirs (%s); not guessing"
+            % (rel, len(hits), ", ".join(h.split("/", 1)[0] for h in hits)))
+    return ""
+
+
+def named_files(statement: str, root: str) -> tuple:
+    """(files that exist, files named but not found), in statement order."""
+    found, missing = [], []
+    for pattern in SCOPE_FILE_RES:
+        for hit in pattern.findall(statement or ""):
+            rel = path_tail(path_tail(hit.strip(), root), "/app").strip("/")
+            if not rel or "/" not in rel and "." not in rel:
+                continue
+            if rel in found or rel in missing or TEST_PATH.search(rel):
+                continue
+            resolved = _resolve_named(rel, root)
+            if resolved:
+                if resolved not in found:
+                    found.append(resolved)
+            else:
+                missing.append(rel)
+    return found, missing
+
+
+def named_symbol(statement: str) -> tuple:
+    """(symbol, owner, name) after the word `specifically`, or empties."""
+    match = SCOPE_METHOD_RE.search(statement or "")
+    if not match:
+        return "", "", ""
+    symbol = re.sub(r"\(\s*\)$", "", match.group(1).strip()).strip()
+    if (not re.match(r"^[A-Za-z_][\w.:]*$", symbol)
+            or symbol.lower().endswith(SCOPE_NOT_SYMBOL)):
+        return "", "", ""
+    if "." in symbol:
+        owner, name = symbol.rsplit(".", 1)
+    elif "::" in symbol:
+        owner, name = symbol.rsplit("::", 1)
+    else:
+        owner, name = "", symbol
+    return symbol, owner, name
+
+
+def _python_region(source: str, owner: str, name: str) -> tuple:
+    try:
+        module = parse_python(source)
+    except (SyntaxError, ValueError):
+        return None, None, "whole"
+    kinds = (ast.FunctionDef, ast.AsyncFunctionDef)
+    matches = []
+    if owner:
+        owner_name = owner.split(".")[-1].split("::")[-1]
+        for node in ast.walk(module):
+            if isinstance(node, ast.ClassDef) and node.name == owner_name:
+                matches += [c for c in node.body
+                            if isinstance(c, kinds) and c.name == name]
+    else:
+        matches = [n for n in module.body
+                   if isinstance(n, kinds) and n.name == name]
+    if not matches:
+        matches = [n for n in ast.walk(module)
+                   if isinstance(n, kinds) and n.name == name]
+    if len(matches) != 1:
+        return None, None, "whole"
+    node = matches[0]
+    start = min([node.lineno] + [d.lineno for d in node.decorator_list])
+    return start, getattr(node, "end_lineno", node.lineno), "ast"
+
+
+def _brace_end(lines: list, start: int) -> int:
+    """Last line (1-based) of a brace-delimited block starting at `start`."""
+    depth = 0
+    opened = False
+    last = min(len(lines), start + REGION_LINES_MAX - 1)
+    for number in range(start, last + 1):
+        text = lines[number - 1]
+        for char in text:
+            if char == "{":
+                depth += 1
+                opened = True
+            elif char == "}":
+                depth -= 1
+        if opened and depth <= 0:
+            return number
+    return last
+
+
+def _ruby_end(lines: list, start: int) -> int:
+    indent = len(lines[start - 1]) - len(lines[start - 1].lstrip())
+    last = min(len(lines), start + REGION_LINES_MAX - 1)
+    for number in range(start + 1, last + 1):
+        text = lines[number - 1]
+        if not text.strip():
+            continue
+        lead = len(text) - len(text.lstrip())
+        if lead <= indent and text.strip().startswith("end"):
+            return number
+    return last
+
+
+def _regex_region(source: str, path: str, owner: str, name: str) -> tuple:
+    lang = LANG_OF_EXT.get(os.path.splitext(path)[1].lower())
+    if not lang:
+        return None, None, "whole"
+    escaped = re.escape(name)
+    pattern = re.compile(LANG_DEF_RES[lang].replace("%s", escaped))
+    lines = source.split("\n")
+    hits = [n for n, text in enumerate(lines, 1) if pattern.match(text)]
+    if len(hits) > 1 and owner:
+        narrowed = [n for n in hits if owner.split("::")[-1] in lines[n - 1]]
+        hits = narrowed or hits
+    if len(hits) != 1:
+        return None, None, "whole"
+    start = hits[0]
+    end = _ruby_end(lines, start) if lang == "rb" else _brace_end(lines, start)
+    return start, end, "regex"
+
+
+def resolve_region(source: str, path: str, owner: str, name: str) -> tuple:
+    """(start, end, kind): 1-based inclusive lines of the named definition,
+    kind 'ast' for Python, 'regex' for other languages, 'whole' when the
+    name is missing, ambiguous, or the language is unknown."""
+    if not name or not source:
+        return None, None, "whole"
+    if path.endswith(".py"):
+        return _python_region(source, owner, name)
+    return _regex_region(source, path, owner, name)
+
+
+def import_block(source: str, path: str) -> str:
+    if path.endswith(".py"):
+        try:
+            module = parse_python(source)
+            found = []
+            for item in module.body:
+                if isinstance(item, (ast.Import, ast.ImportFrom)):
+                    text = ast.get_source_segment(source, item)
+                    if text:
+                        found.append(text)
+            return "\n".join(found)
+        except (SyntaxError, ValueError):
+            pass
+    kept = []
+    for text in source.split("\n")[:IMPORT_LINES_MAX]:
+        if IMPORT_LINE.match(text):
+            kept.append(text)
+        elif kept:
+            break
+    return "\n".join(kept).strip()
+
+
+def scope_excerpt(tree: "Tree", scope: dict) -> str:
+    parts = []
+    for index, rel in enumerate(scope.get("files") or []):
+        try:
+            source = tree.read(rel)
+        except ToolFault:
+            continue
+        lines = source.split("\n")
+        total = len(lines)
+        if index == 0 and scope.get("region"):
+            start, end = scope["region"]
+            parts.append(
+                "FILE %s (%d lines)\nTARGET %s, lines %d-%d\n\nIMPORTS\n%s\n\n"
+                "DEFINITION (verbatim, current code)\n%s"
+                % (rel, total, scope.get("symbol") or "", start, end,
+                   import_block(source, rel) or "(none)",
+                   "\n".join(lines[start - 1:end])))
+        elif index == 0:
+            parts.append("FILE %s (%d lines), whole file\n\n%s" % (rel, total, source))
+        else:
+            outline = ""
+            if rel.endswith(".py"):
+                try:
+                    outline = "\n".join(outline_source(source))
+                except SyntaxError:
+                    outline = ""
+            parts.append("FILE %s (%d lines)\n\nIMPORTS\n%s\n\nOUTLINE\n%s"
+                         % (rel, total, import_block(source, rel) or "(none)",
+                            outline or "(read it for detail)"))
+    return clip("\n\n".join(parts), SCOPE_EXCERPT_CHARS, "scope excerpt")
+
+
+def _check_line(line: str) -> str:
+    """The command if the line runs a known checker, else ''."""
+    line = line.strip()
+    if line.startswith("$ "):
+        line = line[2:].strip()
+    if not line or line.startswith("#"):
+        return ""
+    try:
+        argv = shlex.split(line)
+    except ValueError:
+        argv = line.split()
+    index = 0
+    while index < len(argv) and ENV_ASSIGN.match(argv[index]):
+        index += 1
+    rest = argv[index:]
+    if not rest or os.path.basename(rest[0]) not in CHECK_RUNNERS:
+        return ""
+    return line
+
+
+def parse_checks(statement: str) -> list:
+    """The commands the statement asks the run to execute, at most four."""
+    found = []
+    text = statement or ""
+    for block in FENCED_BLOCK.findall(text):
+        joined = re.sub(r"\\\r?\n\s*", " ", block)
+        prefix = ""
+        for raw in joined.splitlines():
+            stripped = raw.strip()
+            if stripped.startswith("$ "):
+                stripped = stripped[2:].strip()
+            moved = CD_LINE.match(stripped)
+            if moved:
+                prefix = "cd %s && " % moved.group(1)
+                continue
+            command = _check_line(stripped)
+            if command and prefix + command not in found:
+                found.append(prefix + command)
+    for span in INLINE_SPAN.findall(text):
+        span = " ".join(span.split())
+        tokens = span.split()
+        # An inline mention needs a target to be a command rather than a
+        # tool name: `ruff check --no-cache` alone is advice, not a check.
+        if len(tokens) < 3 or not any("/" in t or "." in t for t in tokens[1:]):
+            continue
+        command = _check_line(span)
+        if command and command not in found:
+            found.append(command)
+    return found[:CHECK_COMMANDS_MAX]
+
+
+def parse_scope(statement: str, tree: "Tree") -> dict:
+    """Everything the statement says about where the change goes and how
+    it is checked. Never raises."""
+    scope = {"files": [], "missing": [], "symbol": "", "owner": "", "name": "",
+             "region": None, "kind": "", "excerpt": "", "checks": []}
+    try:
+        scope["files"], scope["missing"] = named_files(statement, tree.root)
+        scope["symbol"], scope["owner"], scope["name"] = named_symbol(statement)
+        scope["checks"] = parse_checks(statement)
+        if scope["files"]:
+            try:
+                source = tree.read(scope["files"][0])
+            except ToolFault:
+                source = ""
+            start, end, kind = resolve_region(source, scope["files"][0],
+                                              scope["owner"], scope["name"])
+            scope["kind"] = kind
+            if start:
+                scope["region"] = (start, end)
+            scope["excerpt"] = scope_excerpt(tree, scope)
+    except Exception as error:
+        traceback.print_exc()
+        say("[SCOPE] parse failed: %s: %s" % (type(error).__name__, error))
+    say("[SCOPE] files=%s symbol=%s kind=%s region=%s checks=%d missing=%s"
+        % (",".join(scope["files"]) or "-", scope["symbol"] or "-",
+           scope["kind"] or "-", scope["region"] or "-", len(scope["checks"]),
+           ",".join(scope["missing"]) or "-"))
+    return scope
+
+
+def repo_sketch(files: list) -> str:
+    if not files:
+        return "No files found under the working directory."
+    tops, kinds = {}, {}
+    for path in files:
+        top = path.split("/", 1)[0]
+        tops[top] = tops.get(top, 0) + 1
+        ext = os.path.splitext(path)[1] or "(none)"
+        kinds[ext] = kinds.get(ext, 0) + 1
+    return ("%d files.\nTop level: %s\nExtensions: %s"
+            % (len(files),
+               ", ".join("%s (%d)" % (k, v) for k, v in
+                         sorted(tops.items(), key=lambda kv: -kv[1])[:12]),
+               ", ".join("%s (%d)" % (k, v) for k, v in
+                         sorted(kinds.items(), key=lambda kv: -kv[1])[:8])))
+
+
+# =========================================================================
+# Source analysis helpers
+# =========================================================================
+
+def outline_source(source: str) -> list:
+    rows = []
+
+    def walk(node, depth):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                name = f"{prefix}{child.name}"
-                kind = "class" if isinstance(child, ast.ClassDef) else "function"
-                start = min([child.lineno] + [d.lineno for d in child.decorator_list])
-                found.append((name, start, child.end_lineno or child.lineno, kind))
-                walk(child, f"{name}.")
-    walk(tree, "")
-    return found
+                kind = ("class" if isinstance(child, ast.ClassDef)
+                        else "async def" if isinstance(child, ast.AsyncFunctionDef)
+                        else "def")
+                rows.append((child.lineno, getattr(child, "end_lineno", child.lineno),
+                             depth, "%s %s" % (kind, child.name)))
+                walk(child, depth + 1)
+            else:
+                walk(child, depth)
+    walk(parse_python(source), 0)
+    rows.sort()
+    return ["%5d-%-5d %s%s" % (start, end, "  " * depth, name)
+            for start, end, depth, name in rows]
 
 
-_BLOCK_START = re.compile(
-    r"^\s*(?:(?:public|private|protected|static|final|async|export|pub|def|func|function|class|"
-    r"module|type|impl|interface|struct)\b|[\w<>\[\], ]+\s+\w+\s*\()",
-)
-
-
-def generic_blocks(text: str) -> list[tuple[str, int, int, str]]:
-    """Brace-counting block finder for non-Python sources."""
-    lines = text.splitlines()
-    blocks: list[tuple[str, int, int, str]] = []
-    for index, line in enumerate(lines):
-        if not _BLOCK_START.match(line) or "{" not in line:
-            continue
-        depth = 0
-        for end_index in range(index, min(len(lines), index + 400)):
-            depth += lines[end_index].count("{") - lines[end_index].count("}")
-            if depth <= 0 and end_index > index:
-                name = re.sub(r"[^\w]+", " ", line).strip()[:60]
-                blocks.append((name, index + 1, end_index + 1, "block"))
-                break
-    return blocks
-
-
-_RUBY_OPEN = re.compile(r"^(\s*)(?:def|class|module)\s+([A-Za-z_][\w.:?!=]*)")
-
-
-def ruby_definitions(text: str) -> list[tuple[str, int, int, str]]:
-    """`def`/`class`/`module` ... `end`, matched by indentation.
-
-    Ruby closes with `end`, not `}`, so the brace-counter that stands in for a
-    parser everywhere else finds nothing at all in a Ruby file -- not one
-    definition in any of the four Ruby tasks in the corpus, including the very
-    method their solutions change. That left both structural gates with nothing
-    to judge and the file outline empty.
-
-    Matching `end` at the opening line's indentation is the conventional
-    heuristic and holds for conventionally formatted source. It is deliberately
-    the whole of it: a definition this misses is simply not found, and every
-    caller treats "not found" as "cannot judge" rather than as a violation.
-    """
-    lines = text.splitlines()
-    found: list[tuple[str, int, int, str]] = []
-    for index, line in enumerate(lines):
-        opening = _RUBY_OPEN.match(line)
-        if not opening:
-            continue
-        indent, name = opening.group(1), opening.group(2)
-        kind = "class" if line.lstrip().startswith(("class", "module")) else "function"
-        closer = indent + "end"
-        for end_index in range(index + 1, len(lines)):
-            if lines[end_index].rstrip() == closer:
-                found.append((name, index + 1, end_index + 1, kind))
-                break
-    return found
-
-
-def slice_around(repo: Repository, relative: str, hot_lines: Sequence[int],
-                 instruction: Instruction, *, budget_lines: int = 320) -> list[Slice]:
-    """Pick the enclosing definitions of the interesting lines, or a window."""
-    text = repo.read(relative)
-    if text is None:
+def visible_definitions(source: str) -> list:
+    try:
+        tree = parse_python(source)
+    except SyntaxError:
         return []
-    total = len(text.splitlines())
-    if total <= budget_lines:
-        return [Slice(relative, 1, total, "whole file")]
+    found = []
 
-    definitions = Checker._definitions(relative, text)
+    def walk(node, prefix, inside):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                kind = "async" if isinstance(child, ast.AsyncFunctionDef) else "def"
+                if not inside:
+                    found.append("%s %s%s" % (kind, prefix, child.name))
+                walk(child, prefix + child.name + ".", True)
+            elif isinstance(child, ast.ClassDef):
+                if not inside:
+                    found.append("class %s%s" % (prefix, child.name))
+                walk(child, prefix + child.name + ".", inside)
+            else:
+                walk(child, prefix, inside)
+    walk(tree, "", False)
+    return sorted(found)
 
-    chosen: list[Slice] = []
-    used: set[tuple[int, int]] = set()
+# =========================================================================
+# Shell + ShellPool
+# =========================================================================
 
-    # A named method hint wins outright -- but the class it belongs to decides
-    # WHICH one when the name repeats. netbox/ipam/filtersets.py defines
-    # filter_device three times (IPAddressFilterSet, FHRPGroupAssignmentFilterSet,
-    # ServiceFilterSet); matching the bare name picks whichever comes first in
-    # the file, so the model was shown the right method by luck rather than by
-    # the class the instruction actually named. The parser has extracted
-    # class_hint all along; only the slicer was throwing it away.
-    if instruction.method_hint:
-        methods = [(name, start, end, kind) for name, start, end, kind in definitions
-                   if kind != "class" and name.split(".")[-1] == instruction.method_hint]
-        qualified = f"{instruction.class_hint}.{instruction.method_hint}"
-        # Exact qualified match first, then the bare name -- a hint naming a
-        # class the file does not define must still find the method.
-        hit = next((m for m in methods if m[0] == qualified), None) \
-            or next(iter(methods), None)
-        if hit:
-            name, start, end, kind = hit
-            chosen.append(Slice(relative, start, end, f"{kind} {name}"))
-            used.add((start, end))
+STILL_RUNNING = "[still running]"
 
-    for line in hot_lines:
-        enclosing = [
-            (name, start, end, kind)
-            for name, start, end, kind in definitions
-            if start <= line <= end and kind != "class"
-        ]
-        if enclosing:
-            name, start, end, kind = min(enclosing, key=lambda item: item[2] - item[1])
-        else:
-            name, start, end, kind = ("context", max(1, line - 25), min(total, line + 25), "window")
-        if (start, end) in used:
+
+def bounded_output_file(path: str, cap: int, label: str = "output") -> str:
+    """At most cap bytes, keeping both ends. Seeks past the middle."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return ""
+    with open(path, "rb") as fh:
+        if size <= cap:
+            return fh.read().decode("utf-8", "replace")
+        half = max(1, cap // 2)
+        head = fh.read(half)
+        fh.seek(max(0, size - half))
+        tail = fh.read(half)
+    note = "\n... [%d characters of %s elided] ...\n" % (
+        max(0, size - len(head) - len(tail)), label)
+    room = max(0, cap - len(note.encode("utf-8")))
+    left, right = room // 2, room - room // 2
+    data = head[:left] + note.encode("utf-8") + (tail[-right:] if right else b"")
+    return data.decode("utf-8", "replace")
+
+
+# ---- the container's own limits ----------------------------------------
+#
+# The task gives the container a fixed memory limit and CPU count. A child
+# that outgrows the per-process cap is killed on its own; a set of children
+# that outgrows the container is killed by the OOM killer, which may take
+# the agent itself, and then no patch comes back at all.
+
+CGROUP_MEMORY = (
+    ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+    ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
+     "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+)
+CGROUP_CPU = ("/sys/fs/cgroup/cpu.max",
+              "/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+
+
+def _read_text(path: str) -> str:
+    with open(path, "r", encoding="ascii", errors="replace") as fh:
+        return fh.read().strip()
+
+
+def memory_limit_bytes() -> int:
+    """The container's memory limit, or 0 when there is none to be found."""
+    for _, limit_path in CGROUP_MEMORY:
+        try:
+            raw = _read_text(limit_path)
+            if raw == "max":
+                return 0
+            limit = int(raw)
+            if 0 < limit < 1 << 50:
+                return limit
+        except (OSError, ValueError):
             continue
-        used.add((start, end))
-        chosen.append(Slice(relative, start, end, f"{kind} {name}"))
+    return 0
 
-    if not chosen:
-        return [Slice(relative, 1, min(total, budget_lines), "file head")]
 
-    if any(piece.label.startswith(("function", "block")) for piece in chosen):
-        named = [piece for piece in chosen if not piece.label.startswith("window")]
-        if named:
-            chosen = named
+def memory_used_bytes() -> int:
+    for used_path, _ in CGROUP_MEMORY:
+        try:
+            return int(_read_text(used_path))
+        except (OSError, ValueError):
+            continue
+    return 0
 
-    chosen.sort(key=lambda item: item.start)
-    spent = 0
-    kept: list[Slice] = []
-    for piece in chosen:
-        span = piece.end - piece.start + 1
-        if spent + span > budget_lines * 2 and kept:
+
+def memory_share() -> float:
+    """Container memory in use as a fraction of its limit; -1 when unknown."""
+    limit = memory_limit_bytes()
+    if limit <= 0:
+        return -1.0
+    used = memory_used_bytes()
+    return used / float(limit) if used > 0 else -1.0
+
+
+def cpu_quota() -> int:
+    """CPUs the container may use, floored at 1."""
+    try:
+        quota, period = _read_text(CGROUP_CPU[0]).split()[:2]
+        if quota != "max":
+            return max(1, int(round(int(quota) / float(period))))
+    except (OSError, ValueError, IndexError):
+        try:
+            quota, period = int(_read_text(CGROUP_CPU[1])), int(_read_text(CGROUP_CPU[2]))
+            if quota > 0 and period > 0:
+                return max(1, int(round(quota / float(period))))
+        except (OSError, ValueError):
+            pass
+    return max(1, os.cpu_count() or 1)
+
+
+def child_cap(limit: int, jobs: int) -> int:
+    """Address-space cap for one child: the container's limit less the
+    agent's headroom, shared between the jobs allowed at once, kept between
+    a floor a real test run needs and the fixed per-process cap."""
+    if limit <= 0:
+        return CHILD_MEMORY_BYTES
+    share = (limit - MEMORY_HEADROOM_BYTES) // max(1, jobs)
+    return int(min(CHILD_MEMORY_BYTES, max(CHILD_CAP_FLOOR_BYTES, share)))
+
+
+def child_hook(cap: int):
+    """What every child does between fork and exec: lower its priority,
+    volunteer for the OOM killer ahead of the agent, and cap its address
+    space. Each step is best-effort."""
+    def apply() -> None:
+        try:
+            os.nice(CHILD_NICE)
+        except OSError:
+            pass
+        try:
+            with open("/proc/self/oom_score_adj", "w") as fh:
+                fh.write(str(CHILD_OOM_SCORE_ADJ))
+        except OSError:
+            pass
+        try:
+            import resource
+            soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+            wanted = cap
+            if hard != resource.RLIM_INFINITY:
+                wanted = min(wanted, hard)
+            resource.setrlimit(resource.RLIMIT_AS, (wanted, hard))
+        except Exception:
+            pass
+    return apply
+
+
+class Shell:
+    counter = 0
+
+    def __init__(self, command: str, cwd: str, cap: int = CHILD_MEMORY_BYTES,
+                 cpus: int = 2) -> None:
+        Shell.counter += 1
+        self.name = "job%d" % Shell.counter
+        self.command = command
+        self.started = time.monotonic()
+        self.sink = tempfile.NamedTemporaryFile(
+            mode="w+", encoding="utf-8", errors="replace", suffix=".out",
+            delete=False)
+        env = dict(os.environ)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["CI"] = "1"
+        jobs = str(max(1, int(cpus)))
+        for name, value in (("GOMAXPROCS", jobs), ("CARGO_BUILD_JOBS", jobs),
+                            ("MAKEOPTS", "-j" + jobs), ("MAKEFLAGS", "-j" + jobs),
+                            ("npm_config_jobs", jobs), ("BUNDLE_JOBS", jobs)):
+            env.setdefault(name, value)
+        try:
+            self.process = subprocess.Popen(
+                ["bash", "-lc", command], cwd=cwd, env=env,
+                stdout=self.sink, stderr=subprocess.STDOUT,
+                start_new_session=True, preexec_fn=child_hook(cap))
+        except Exception:
+            self.sink.close()
+            try:
+                os.unlink(self.sink.name)
+            except OSError:
+                pass
+            raise
+
+    def _text(self) -> str:
+        try:
+            self.sink.flush()
+            return bounded_output_file(self.sink.name, READ_OUTPUT_CAP)
+        except OSError:
+            return ""
+
+    def wait(self, timeout: float) -> tuple:
+        try:
+            self.process.wait(timeout=max(1.0, timeout))
+            return True, self._text()
+        except subprocess.TimeoutExpired:
+            return False, self._text()
+
+    def finished(self) -> bool:
+        return self.process.poll() is not None
+
+    def drain(self) -> str:
+        if self.process.poll() is None:
+            return self._text() + "\n" + STILL_RUNNING
+        return self._text()
+
+    def stop(self) -> None:
+        if self.process.poll() is None:
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+        try:
+            self.sink.close()
+            os.unlink(self.sink.name)
+        except OSError:
+            pass
+
+
+class ShellPool:
+    def __init__(self, cwd: str) -> None:
+        self.cwd = cwd
+        self.jobs = {}
+        self.limit = memory_limit_bytes()
+        self.cpus = cpu_quota()
+        self.jobs_allowed = (1 if 0 < self.limit < SMALL_CONTAINER_BYTES
+                             else BACKGROUND_JOBS_MAX)
+        self.child_cap = child_cap(self.limit, self.jobs_allowed)
+
+    def describe(self) -> str:
+        limit = ("%dMB" % (self.limit // (1024 * 1024))) if self.limit else "unknown"
+        return ("memory %s, cpus %d, child cap %dMB, %d job(s) at a time"
+                % (limit, self.cpus, self.child_cap // (1024 * 1024), self.jobs_allowed))
+
+    def start(self, command: str, background: bool = False) -> Shell:
+        running = [j for j in self.jobs.values() if not j.finished()]
+        share = memory_share()
+        if background and share > MEMORY_REFUSE_SHARE:
+            raise ToolFault(
+                "memory is at %d%% of the container's limit; a new background "
+                "job would risk the whole run. Collect or stop a running job "
+                "with bash_poll(job, stop=true), or run the command in the "
+                "foreground once memory is back." % (share * 100))
+        allowed = 1 if share > MEMORY_STOP_SHARE else self.jobs_allowed
+        if len(running) >= allowed:
+            raise ToolFault(
+                "%d command(s) still running (%s)%s; collect one with "
+                "bash_poll, or end one with bash_poll(job, stop=true), "
+                "before starting another"
+                % (len(running), ", ".join(j.name for j in running),
+                   " and memory is at %d%% of the limit" % (share * 100)
+                   if share > MEMORY_STOP_SHARE else ""))
+        job = Shell(command, self.cwd, cap=self.child_cap, cpus=self.cpus)
+        self.jobs[job.name] = job
+        return job
+
+    def get(self, name: str) -> Shell:
+        job = self.jobs.get(name)
+        if job is None:
+            raise ToolFault("no background job named %s" % name)
+        return job
+
+    def close(self) -> None:
+        for job in list(self.jobs.values()):
+            try:
+                self._report(job, job.drain())
+                job.stop()
+            except Exception:
+                pass
+        self.jobs.clear()
+
+    @staticmethod
+    def _report(job: Shell, out: str) -> None:
+        tail = ""
+        for line in reversed((out or "").splitlines()):
+            if line.strip() and line.strip() != STILL_RUNNING:
+                tail = line.strip()
+                break
+        say("[SHELL] %.1fs %dc :: %s :: %s"
+            % (time.monotonic() - job.started, len(out or ""),
+               " ".join(job.command.split())[:SHELL_REPORT_CAP],
+               tail[:SHELL_REPORT_CAP]))
+
+
+# =========================================================================
+# Tool schemas — the surface the driver sees
+# =========================================================================
+
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read a file, optionally a line range. Prefer a range once you "
+                "know where you are looking. A read that does not fit stops "
+                "early and the header says where to start again."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string",
+                             "description": "Path relative to the repository root."},
+                    "start": {"type": "integer",
+                              "description": "First line, 1-based."},
+                    "count": {"type": "integer",
+                              "description": "How many lines to return."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_text",
+            "description": (
+                "Extended-regex search across the repository. Use mode=files "
+                "first to see where the matches are, then read narrowly."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string",
+                             "description": "Directory to search under. Defaults to the whole repository."},
+                    "mode": {"type": "string",
+                             "enum": ["content", "files", "count"],
+                             "description": "content returns matching lines; files returns paths only; count returns per-file totals."},
+                    "include": {"type": "string",
+                                "description": "Only search paths matching this glob, e.g. *.py"},
+                    "context": {"type": "integer",
+                                "description": "Lines of surrounding code to return with each match, up to 20."},
+                    "head_limit": {"type": "integer",
+                                   "description": "Stop after this many matching lines."},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": "List files whose path matches a glob, e.g. src/**/*.py",
+            "parameters": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "outline",
+            "description": (
+                "Index one Python file: every class and function in it with "
+                "the lines it spans, and nothing of what they say. Call it "
+                "before reading a long file, then read the range it names."),
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit",
+            "description": (
+                "Replace an exact span of text in a file. Set replace_all when "
+                "the same span occurs several places and every one of them "
+                "needs the same change."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old": {"type": "string",
+                            "description": "Exact text to find, including indentation."},
+                    "new": {"type": "string",
+                            "description": "Replacement text."},
+                    "replace_all": {"type": "boolean",
+                                    "description": "Replace every occurrence instead of requiring a unique one."},
+                },
+                "required": ["path", "old", "new"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_file",
+            "description": "Write a whole file, creating it or overwriting it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": (
+                "Run a shell command in the repository root. Set background "
+                "for anything slow, such as a test suite, and collect it "
+                "later with bash_poll instead of waiting."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "background": {"type": "boolean"},
+                    "timeout": {"type": "integer",
+                                "description": "Seconds to wait when not backgrounded."},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash_poll",
+            "description": ("Collect output from a background command started "
+                            "with bash. Blocks until it finishes or the wait "
+                            "runs out; a test that takes two minutes needs one "
+                            "poll with wait=150, not six short ones."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job": {"type": "string"},
+                    "wait": {"type": "integer",
+                             "description": "Seconds to block for, up to 150. Default 75."},
+                    "stop": {"type": "boolean",
+                             "description": "Kill the job instead of waiting; its output so far is returned and its slot freed."},
+                },
+                "required": ["job"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "restore_file",
+            "description": ("Put one file back exactly as it was when the run "
+                            "started, or remove a file this run created. Use "
+                            "it to undo an edit outside the files the "
+                            "instruction allows."),
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit",
+            "description": (
+                "Finish the run. Call this only once the change is complete, "
+                "the checks the instruction names have been run, and your "
+                "reasoning is against the final code."),
+            "parameters": {
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+        },
+    },
+]
+
+
+# The three stages see different subsets.
+def locator_tools() -> list:
+    names = {"read_file", "search_text", "find_files", "outline"}
+    return [s for s in TOOL_SCHEMAS if s["function"]["name"] in names]
+
+
+def planner_tools() -> list:
+    names = {"read_file", "outline", "search_text"}
+    return [s for s in TOOL_SCHEMAS if s["function"]["name"] in names]
+
+
+# =========================================================================
+# Kit — the dispatcher
+# =========================================================================
+
+class Finished(Exception):
+    """The model called submit and the checks accepted."""
+
+
+class Kit:
+    """Tool dispatch. A read-only call repeated with identical arguments is
+    refused rather than served."""
+
+    def __init__(self, tree: Tree, pool: ShellPool, allowance: Allowance,
+                 warden=None, label: str = "", scope: dict = None) -> None:
+        self.tree = tree
+        self.pool = pool
+        self.allowance = allowance
+        self.warden = warden
+        self.label = label
+        self.scope = scope or {}
+        self.allowed = list(self.scope.get("files") or [])
+        self.polls: dict = {}
+        self.seen: dict = {}
+        self.last_refusal = ""      # "empty" | "warden" after a refused submit
+        self.fence = Beacon("fence")
+        self.bg = Beacon("bgshell")
+        self.statement = getattr(warden, "statement", "") if warden else ""
+
+    # ---- dispatch --------------------------------------------------
+
+    def run(self, name: str, args: dict) -> str:
+        handler = getattr(self, "do_" + name, None)
+        if handler is None:
+            raise ToolFault("no tool named %s" % name)
+        return handler(args)
+
+    def guard_repeat(self, key: str) -> None:
+        self.seen[key] = self.seen.get(key, 0) + 1
+        if self.seen[key] > REPEAT_READ_CEILING:
+            raise ToolFault(
+                "this exact call was already answered %d times and nothing "
+                "has changed since. Scroll up and use the earlier result."
+                % (self.seen[key] - 1))
+
+    def note_read(self, what: str) -> None:
+        say("[READ]%s %s" % (" " + self.label if self.label else "", what))
+
+    def scope_gate(self, path: str) -> None:
+        """Refuse a write outside the files the instruction allows."""
+        if not self.allowed:
+            return
+        rel = self.tree.relative(path)
+        if rel in self.allowed:
+            return
+        raise ToolFault(
+            "the instruction limits production changes to %s; %s is outside "
+            "that scope, and anything outside it is reverted at hand-in. Make "
+            "the change inside the named file%s."
+            % (", ".join(self.allowed), rel, "s" if len(self.allowed) > 1 else ""))
+
+    # ---- read_file -------------------------------------------------
+
+    def do_read_file(self, args: dict) -> str:
+        path = str(args.get("path") or "")
+        start = args.get("start")
+        count = args.get("count")
+        self.guard_repeat("read:%s:%s:%s" % (path, start, count))
+        text = self.tree.read(path)
+        lines = text.splitlines()
+        first = max(1, int(start or 1))
+        wanted = int(count) if count and int(count) > 0 else 0
+        asked = min(len(lines), first + wanted - 1) if wanted else len(lines)
+        rows, used, last = [], 0, first - 1
+        for n in range(first, asked + 1):
+            row = "%6d\t%s" % (n, lines[n - 1])
+            if rows and used + len(row) + 1 > READ_OUTPUT_CAP:
+                break
+            if not rows:
+                row = clip(row, READ_OUTPUT_CAP, "line")
+            rows.append(row)
+            used += len(row) + 1
+            last = n
+        if not rows:
+            served = ("%s is empty" % path if not lines
+                      else "%s has %d line(s); start=%d is past the end"
+                      % (path, len(lines), first))
+            self.note_read("read_file %s:%d- of %d -> %dc"
+                           % (path, first, len(lines), len(served)))
+            return served
+        while True:
+            head = "%s lines %d-%d of %d" % (path, first, last, len(lines))
+            if last < asked:
+                head += " -- pass start=%d to read on" % (last + 1)
+            if len(head) + 1 + used <= READ_OUTPUT_CAP:
+                break
+            if len(rows) > 1:
+                used -= len(rows.pop()) + 1
+                last -= 1
+                continue
+            rows[0] = clip(rows[0], max(0, READ_OUTPUT_CAP - len(head) - 1), "line")
+            used = len(rows[0]) + 1
             break
-        kept.append(piece)
-        spent += span
+        served = head + "\n" + "\n".join(rows)
+        self.note_read("read_file %s:%d-%d of %d -> %dc"
+                       % (path, first, last, len(lines), len(served)))
+        return served
+
+    # ---- outline ---------------------------------------------------
+
+    def do_outline(self, args: dict) -> str:
+        path = str(args.get("path") or "")
+        self.guard_repeat("outline:%s" % path)
+        text = self.tree.read(path)
+        try:
+            rows = outline_source(text)
+        except SyntaxError as bad:
+            raise ToolFault("%s does not parse as Python around line %s, so "
+                            "it has no index; read it instead"
+                            % (path, bad.lineno))
+        if not rows:
+            raise ToolFault("%s defines nothing, so an index of it would be "
+                            "empty; read it instead" % path)
+        served = clip("%s, %d lines, %d definitions\n"
+                      % (path, len(text.splitlines()), len(rows))
+                      + "\n".join(rows), SEARCH_OUTPUT_CAP, "outline")
+        self.note_read("outline %s %d defs -> %dc" % (path, len(rows), len(served)))
+        return served
+
+    # ---- search_text -----------------------------------------------
+
+    def do_search_text(self, args: dict) -> str:
+        pattern = str(args.get("pattern") or "")
+        where = str(args.get("path") or ".")
+        mode = str(args.get("mode") or "content")
+        include = args.get("include")
+        context = int(args.get("context") or 0)
+        head_limit = int(args.get("head_limit") or 250)
+        self.guard_repeat("grep:%s:%s:%s:%s" % (pattern, where, mode, include))
+        if where.strip(" ./"):
+            if not os.path.isdir(self.tree.absolute(where)):
+                raise ToolFault("no such directory: %s" % where)
+            where = self.tree.relative(where)
+        out = search_files(self.tree.root, pattern, mode=mode,
+                           include=include, context=context, timeout=30.0,
+                           where=where)
+        if not out.strip():
+            self.note_read("search_text %r %s -> no matches" % (pattern, mode))
+            return "no matches for %r under %s" % (pattern, where)
+        rows = out.splitlines()
+        if len(rows) > head_limit:
+            out = "\n".join(rows[:head_limit]) + (
+                "\n... %d more matching lines; narrow the pattern or the path\n"
+                % (len(rows) - head_limit))
+        served = clip(out, SEARCH_OUTPUT_CAP, "matches")
+        self.note_read("search_text %r %s -> %dc" % (pattern, mode, len(served)))
+        return served
+
+    # ---- find_files ------------------------------------------------
+
+    def do_find_files(self, args: dict) -> str:
+        pattern = str(args.get("pattern") or "*")
+        self.guard_repeat("glob:%s" % pattern)
+        files = self.tree.current_files()
+        hits = [p for p in files if fnmatch.fnmatch(p, pattern)]
+        if not hits:
+            loose = pattern if pattern.startswith("*") else "*" + pattern
+            hits = [p for p in files if fnmatch.fnmatch(p, loose)]
+        if not hits:
+            return "no file matches %s" % pattern
+        return clip("\n".join(hits[:400]), SEARCH_OUTPUT_CAP, "paths")
+
+    # ---- edit ------------------------------------------------------
+
+    def do_edit(self, args: dict) -> str:
+        path = str(args.get("path") or "")
+        old = str(args.get("old") or "")
+        new = str(args.get("new") or "")
+        every = bool(args.get("replace_all"))
+        if not old:
+            raise ToolFault("old must not be empty; use create_file to write "
+                            "a whole file")
+        self.scope_gate(path)
+        text = self.tree.read(path)
+        # The file keeps its own line endings; the model's text is matched
+        # in that convention so a CRLF file never turns into an LF one.
+        old, new = match_line_endings(text, old, new)
+        hits = text.count(old)
+        if hits == 0:
+            raise ToolFault("that exact text is not in %s; read the file "
+                            "again and copy it verbatim" % path)
+        if hits > 1 and not every:
+            raise ToolFault("that text occurs %d times in %s. Either extend "
+                            "it until it is unique, or pass replace_all=true "
+                            "if all %d should change the same way."
+                            % (hits, path, hits))
+        updated = text.replace(old, new) if every else text.replace(old, new, 1)
+        if updated == text:
+            raise ToolFault("the edit is a no-op")
+        self.tree.write(path, updated)
+        self.allowance.edits += 1
+        note = self._compile_check(path)
+        return ("edited %s (%d occurrence%s)%s"
+                % (path, hits if every else 1, "" if hits == 1 else "s", note))
+
+    def do_create_file(self, args: dict) -> str:
+        path = str(args.get("path") or "")
+        self.scope_gate(path)
+        self.tree.write(path, str(args.get("content") or ""))
+        self.allowance.edits += 1
+        return "wrote %s%s" % (path, self._compile_check(path))
+
+    def do_restore_file(self, args: dict) -> str:
+        rel = self.tree.relative(str(args.get("path") or ""))
+        changed = dict(self.tree.changed_paths())
+        if rel not in changed:
+            return "%s is unchanged since the run started" % rel
+        why = self.tree.put_back(rel, changed[rel])
+        if why:
+            raise ToolFault("could not restore %s: %s" % (rel, why))
+        return "%s is back exactly as it was at the start" % rel
+
+    def _compile_check(self, path: str) -> str:
+        if not path.endswith(".py"):
+            return ""
+        try:
+            compile(self.tree.read_bytes(path), path, "exec", dont_inherit=True)
+        except SyntaxError as bad:
+            return ("\n\nWARNING: the file no longer parses: %s:%s: %s"
+                    % (path, bad.lineno, bad.msg))
+        except (ValueError, RecursionError) as error:
+            return "\n\nWARNING: %s: %s" % (type(error).__name__, error)
+        return ""
+
+    # ---- bash ------------------------------------------------------
+
+    def do_bash(self, args: dict) -> str:
+        command = str(args.get("command") or "")
+        if not command.strip():
+            raise ToolFault("command must not be empty")
+        outward = NETWORK_COMMAND.search(command)
+        if outward:
+            self.fence.fired("refused %r" % outward.group(1))
+            raise ToolFault(
+                "%s is not available here. Everything this task needs is "
+                "already in the tree. Work from the code in front of you."
+                % outward.group(1))
+        blocked = HISTORY_GIT.search(command)
+        if blocked:
+            raise ToolFault(
+                "git %s is not available here. Your changes are collected "
+                "from the working tree as it stands, so moving or discarding "
+                "them loses the work. Read-only git is fine."
+                % blocked.group(1))
+        want_bg = bool(args.get("background"))
+        asked = float(args.get("timeout") or 120)
+        room = self.allowance.clock_left() - WALL_RESERVE_SEC
+        if room < 5.0:
+            raise ToolFault("not enough of the run left to wait on a command; "
+                            "make the change you already have evidence for, "
+                            "or submit")
+        budget = max(5.0, min(asked, SHELL_BUDGET_CEILING_SEC, room))
+        if want_bg:
+            job = self.pool.start(command, background=True)
+            self.bg.fired("started %s: %s" % (job.name, command[:120]))
+            return ("started in the background as %s; collect it with "
+                    "bash_poll" % job.name)
+        job = self.pool.start(command)
+        done, out = job.wait(budget)
+        if done:
+            self.pool.jobs.pop(job.name, None)
+            ShellPool._report(job, out)
+            return clip(out, SHELL_OUTPUT_CAP, "shell output") or "(no output)"
+        self.bg.fired("kept %s alive past %.0fs: %s"
+                      % (job.name, budget, command[:120]))
+        return (clip(out, SHELL_OUTPUT_CAP, "partial output")
+                + "\n\n[still running after %.0fs, moved to the background "
+                  "as %s; keep working and collect it later with bash_poll]"
+                % (budget, job.name))
+
+    def do_bash_poll(self, args: dict) -> str:
+        job = self.pool.get(str(args.get("job") or ""))
+        if args.get("stop"):
+            out = job.drain()
+            was_running = not job.finished()
+            job.stop()
+            self.pool.jobs.pop(job.name, None)
+            ShellPool._report(job, out)
+            body = clip(out.replace(STILL_RUNNING, "").rstrip(),
+                        SHELL_OUTPUT_CAP, "shell output") or "(no output)"
+            return body + ("\n\n[%s stopped; its slot is free]" % job.name
+                           if was_running else "\n\n[%s had already finished]" % job.name)
+        room = self.allowance.clock_left() - WALL_RESERVE_SEC
+        try:
+            asked = float(args.get("wait") or BACKGROUND_POLL_WAIT_SEC)
+        except (TypeError, ValueError):
+            asked = BACKGROUND_POLL_WAIT_SEC
+        window = max(1.0, min(asked, BACKGROUND_POLL_CEILING_SEC, room))
+        if not job.finished() and room > 1.0:
+            job.wait(window)
+        out = job.drain()
+        self.polls[job.name] = self.polls.get(job.name, 0) + 1
+        if not out.endswith(STILL_RUNNING):
+            self.pool.jobs.pop(job.name, None)
+            ShellPool._report(job, out)
+            return clip(out, SHELL_OUTPUT_CAP, "shell output") or "(no output)"
+        note = ("\n[%s has run for %.0fs; poll again, or pass wait=%d to "
+                "block longer]" % (job.name, time.monotonic() - job.started,
+                                   int(BACKGROUND_POLL_CEILING_SEC)))
+        if self.polls[job.name] >= POLLS_PER_JOB_ADVISE:
+            note += ("\n[polled %d times; if its result no longer matters, "
+                     "continue with the evidence you have]" % self.polls[job.name])
+        return clip(out, SHELL_OUTPUT_CAP, "partial output") + note
+
+    # ---- submit ----------------------------------------------------
+
+    def do_submit(self, args: dict) -> str:
+        self.last_refusal = ""
+        changed = None
+        try:
+            changed = self.tree.has_changes(10.0)
+        except BaseException:
+            changed = None
+        if not changed:
+            # An empty patch is rejected outright by the harness, so there
+            # is never a point at which handing one in beats another try.
+            self.last_refusal = "empty"
+            why = ("nothing in the repository has changed" if changed is False
+                   else "the change check could not read the tree")
+            return ("Not handed in: %s, so this would hand in an empty "
+                    "answer. Re-read the requested behaviour, open the "
+                    "definition the statement names, and make the narrowest "
+                    "real edit before submitting again." % why)
+        faults = self.warden.verdict() if self.warden else []
+        if faults:
+            self.last_refusal = "warden"
+            return ("Not handed in. The task states conditions this run can "
+                    "check itself, and they are not met yet:\n\n"
+                    + "\n\n".join(faults[:3])
+                    + "\n\nThere is budget left. Fix this and call submit again.")
+        raise Finished(str(args.get("summary") or ""))
+
+# =========================================================================
+# Seat — the model request layer
+# =========================================================================
+
+class SeatRefused(Exception):
+    """The endpoint will not serve this model at all."""
+
+
+class SeatTimedOut(SeatRefused):
+    """The seat did not answer inside the time this call was given."""
+
+
+class SeatUnreachable(SeatRefused):
+    """No base answered at all: connection or parse failures only. That is
+    the network, not the model, so the cure is waiting, not benching."""
+
+
+def base_urls() -> list:
+    out = []
+    injected = (os.getenv("OPENROUTER_BASE_URL") or "").strip().rstrip("/")
+    if injected:
+        out.append(injected)
+    proxy = (os.getenv("SANDBOX_PROXY_URL") or "").strip().rstrip("/")
+    if proxy:
+        for suffix in ("/api/v1", "/v1"):
+            if proxy + suffix not in out:
+                out.append(proxy + suffix)
+    if not out:
+        out.append(FALLBACK_BASE_URL)
+    return out
+
+
+def recorded_calls(calls: list, turn: int = 0) -> list:
+    """The reply's tool calls in the shape the next request must echo:
+    arguments as a JSON object string, and every call with an id. A call
+    that came without one gets a stable made-up id, since a null id is
+    refused by the endpoint on the next turn."""
+    kept = []
+    for index, call in enumerate(calls):
+        function = dict(call.get("function") or {})
+        written = function.get("arguments")
+        try:
+            if isinstance(written, dict):
+                written = json.dumps(written)
+            if not isinstance(written, str) or not written.strip():
+                raise ValueError("nothing was written")
+            if not isinstance(json.loads(written), dict):
+                raise ValueError("not an object")
+        except Exception:
+            written = "{}"
+        function["arguments"] = written
+        call_id = call.get("id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            call_id = "call_%d_%d" % (turn, index + 1)
+        kept.append({"id": call_id, "type": "function", "function": function})
     return kept
 
 
-def package_map(repo: Repository, relative: str, limit: int = 25) -> str:
-    """One line per module in the target's package: `path: class A, def b`.
+class Seat:
+    roster: list = []
+    patient: bool = True
+    include_usage: bool = True   # ask the endpoint to quote each call's cost
 
-    A function under repair often receives the application's own objects as
-    parameters -- a `client` whose class lives two files away. Nothing in the
-    target file names that class, so the model guesses `.query()` and
-    `.execute()` before reading it (measured: two of three repair rounds on
-    one task). The package map costs ~400 tokens and answers that up front.
-    """
-    parts = Path(relative).parts
-    if len(parts) < 2:
-        return ""
-    # The package is the nearest ancestor directory with other modules in it:
-    # `app/reports/sessions.py` sits alone in reports/, so its package is
-    # `app/`; `proj/pkg/querysets.py` with twenty siblings keeps
-    # `proj/pkg/`, not the whole repository.
-    package = str(Path(relative).parent)
-    while True:
-        siblings = [f for f in repo.files if f.startswith(package + "/") and f != relative
-                    and not _TEST_PATH.search(f.lower()) and "/migrations/" not in f
-                    and Path(f).stem != "__init__"]
-        if len(siblings) >= 2 or "/" not in package:
-            break
-        package = str(Path(package).parent)
-    depth = package.count("/") + 1
-    lines: list[str] = []
-    for other in sorted(siblings, key=lambda f: (f.count("/") - depth, f)):
-        if not other.startswith(package + "/") or other == relative:
-            continue
-        text = repo.read(other)
-        if text is None:
-            continue
-        defs = python_definitions(text) if other.endswith(".py") else generic_blocks(text)
-        names = [f"{'class ' if kind == 'class' else ''}{name}" for name, _, _, kind in defs
-                 if "." not in name][:6]
-        if names:
-            lines.append(f"  {other}: {', '.join(names)}")
-        if len(lines) >= limit:
-            lines.append("  ...")
-            break
-    return ("other modules in this package (request one with read_file if the target uses "
-            "their objects):\n" + "\n".join(lines)) if lines else ""
-
-
-def file_outline(repo: Repository, relative: str, limit: int = 80) -> str:
-    """A compact map of a file so the model knows what else lives there."""
-    text = repo.read(relative)
-    if text is None:
-        return ""
-    definitions = Checker._definitions(relative, text)
-    if not definitions:
-        return ""
-    rows = [f"  L{start:<5} {kind:8} {name}" for name, start, _, kind in definitions[:limit]]
-    imports = ""
-    if relative.endswith(".py"):
-        heads = [line for line in text.splitlines()[:80]
-                 if line.startswith(("import ", "from ")) or re.match(r"^\s+(import|from)\s", line)]
-        if heads:
-            imports = "\nimports available in this file:\n" + "\n".join(f"  {line.strip()}" for line in heads[:40])
-    return f"outline of {relative}:\n" + "\n".join(rows) + imports
-
-
-# ---------------------------------------------------------------------------
-# Live database probe
-# ---------------------------------------------------------------------------
-
-@dataclass
-class DatabaseTarget:
-    engine: str                       # postgresql | clickhouse
-    # Lower sorts first. Django's own settings are exact; a regex over a
-    # settings file is a guess and must never outrank them.
-    priority: int = 5
-    dsn: str | None = None
-    host: str = ""
-    port: str = ""
-    user: str = ""
-    password: str = ""
-    database: str = ""
-
-
-def target_url(target: "DatabaseTarget", *, password: bool = False) -> str:
-    """The target as a connection URL.
-
-    The password is left out unless asked for: the model never connects itself
-    -- it asks this agent for `sql` and `explain` and the agent runs them -- so
-    a secret in the prompt buys nothing and travels to a provider.
-    """
-    credentials = target.user
-    if credentials and password and target.password:
-        credentials += f":{target.password}"
-    return (f"{target.engine}://{credentials + '@' if credentials else ''}"
-            f"{target.host}:{target.port}/{target.database}")
-
-
-class DatabaseProbe:
-    """Discover the application's database and ask it real questions.
-
-    Credentials are read from the application's own configuration -- the same
-    place the app reads them -- so this stays repo-agnostic.
-    """
-
-    def __init__(self, repo: Repository, instruction: Instruction) -> None:
-        self.repo = repo
-        self.instruction = instruction
-        self.targets: list[DatabaseTarget] = []
-        self.notes: list[str] = []
-        # (host, port) -> when it last refused a connection. A host that just
-        # refused will refuse the next call too, and schema_for alone makes
-        # four; re-probing each of them costs the bound again for nothing.
-        # Remembered for a window rather than for the run, so a database that
-        # restarts mid-task comes back on its own.
-        self._refused: dict[tuple[str, str], float] = {}
-        self._discover()
-
-    _REFUSAL_WINDOW = 30.0
-
-    # -- discovery -------------------------------------------------------
-    # A database is guaranteed to exist for every task, so "nothing found" is
-    # never the right answer. Four layers, all run, cheapest first; every
-    # candidate they produce is then pinged and only the reachable ones kept.
-    #
-    # Measured on the 50 generated bench apps: none sets a connection variable
-    # in the agent's container and none ships a config file. Every one of them
-    # falls back to a default written in source -- a DSN literal, a defaults
-    # dict, or `envOr("X_CLICKHOUSE_HOST", "clickhouse")`. Source is therefore
-    # a first-class source here, not an afterthought.
-    def _discover(self) -> None:
-        # (url, reachable) for every candidate the connection test tried, in the
-        # order it tried them. Kept so a harness can show that the test ran and
-        # what it rejected -- the log line alone reaches nobody.
-        self.attempts: list[tuple[str, bool]] = []
-        self._env = self._load_env_files()
-        self._from_env()
-        self._from_django()
-        self._from_source()
-        offline = bool(os.getenv("RIDGES_PROBE_NO_PING"))   # offline harnesses only
-        if not self.targets and not offline:
-            self._from_network()
-        if offline:
-            pass
-        elif self.targets:
-            # Stop at the first candidate that answers. Targets are already in
-            # priority order -- Django's own settings before a regex over a
-            # config file -- and everything downstream reads targets[0] and
-            # nothing else, so verifying the rest buys no evidence and costs up
-            # to the full connect timeout each. A scrape that yields four
-            # candidates spent four timeouts to keep three targets no caller
-            # ever looked at.
-            self.targets = self._first_reachable(self.targets)
-            if not self.targets:
-                self._from_network()
-                self.targets = self._first_reachable(self.targets)
-        trace("DatabaseProbe", "out", tried=[url for url, _ in self.attempts],
-              answered=[url for url, ok in self.attempts if ok],
-              used=target_url(self.targets[0]) if self.targets else None)
-        if self.targets:
-            for target in self.targets:
-                log(f"database: {target_url(target)} (SELECT 1 answered)")
+    def __init__(self, allowance: Allowance, models: list = None,
+                 patient: bool = True) -> None:
+        self.allowance = allowance
+        self.patient = patient
+        if models:
+            self.models = list(models)
         else:
-            log("no database credentials discovered; proceeding on static evidence")
-
-    # Ports that belong to something else entirely. Scraping a config file that
-    # mentions "postgres" somewhere picks up every host:port pair in it, so the
-    # netbox samples yield a Redis candidate at 6379 alongside the real one. The
-    # ping drops those, but each costs up to 8s of connect timeout to find out.
-    #
-    # A denylist, deliberately, not a whitelist of 5432/8123: PostgreSQL runs on
-    # 5433 in multi-instance setups and 6432 behind pgbouncer, and ClickHouse's
-    # native protocol is 9000/9440 -- which _clickhouse() already handles. A
-    # whitelist would refuse databases this agent can actually talk to.
-    _NOT_A_DATABASE_PORT = {
-        "6379", "6380",          # redis
-        "11211",                 # memcached
-        "27017", "27018",        # mongodb
-        "9200", "9300",          # elasticsearch
-        "5672", "15672",         # rabbitmq
-        "2181",                  # zookeeper
-        "9092",                  # kafka
-        "80", "443", "3000", "8000", "8080",   # http
-    }
-
-    def _add(self, target: DatabaseTarget) -> None:
-        if not target.host or not re.fullmatch(r"[\w.-]+", target.host):
-            return                               # scraped junk, not a hostname
-        if target.port and not target.port.isdigit():
-            return                               # an env var that never expanded
-        if target.port in self._NOT_A_DATABASE_PORT:
-            return
-        if target.user and not re.fullmatch(r"[\w.$-]+", target.user):
-            return
-        if target.password and not re.fullmatch(r"[^\s\"'<>{}$]+", target.password):
-            return                               # a template, not a secret
-        key = (target.engine, target.host, target.port, target.database, target.user)
-        for existing in self.targets:
-            if (existing.engine, existing.host, existing.port, existing.database, existing.user) == key:
-                if target.priority < existing.priority:
-                    existing.priority = target.priority
-                    self.targets.sort(key=lambda item: item.priority)
-                return
-        if self.instruction.engine != "unknown" and target.engine != self.instruction.engine:
-            target.priority += 10                # wrong engine: keep, but last
-        self.targets.append(target)
-        self.targets.sort(key=lambda item: item.priority)
-
-    # Layer 1: process environment plus dotenv files -------------------------
-    _ENV_FILES = (".env", ".env.local", ".env.development", ".env.test", ".env.example")
-
-    def _load_env_files(self) -> dict[str, str]:
-        """KEY=VALUE from dotenv files; the real environment wins over files."""
-        merged: dict[str, str] = {}
-        for name in self._ENV_FILES:
-            path = self.repo.root / name
-            if not path.is_file():
-                continue
-            try:
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                continue
-            for line in lines:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key = key.strip().removeprefix("export ").strip()
-                merged.setdefault(key, value.strip().strip('"').strip("'"))
-        merged.update(os.environ)
-        return merged
-
-    def _expand(self, value: str) -> str:
-        """Resolve ${VAR}, ${VAR:-default}, $VAR and env("VAR") references."""
-        env = self._env
-
-        def sub(match: re.Match) -> str:
-            return env.get(match.group("name"), match.group("default") or "")
-
-        value = re.sub(r"\$\{(?P<name>\w+)(?::-(?P<default>[^}]*))?\}", sub, value)
-        value = re.sub(r"\$(?P<name>[A-Za-z_]\w*)(?P<default>)", sub, value)
-        value = re.sub(r'env\(\s*["\'](?P<name>\w+)["\']\s*\)(?P<default>)', sub, value)
-        return value
-
-    _URL_KEY = re.compile(r"(DATABASE_URL|DATABASE_URI|DB_URL|DSN|CLICKHOUSE_URL|POSTGRES_URL|POSTGRESQL_URL)$")
-    _PART_KEY = re.compile(r"^(?P<prefix>.*?)_?(?P<part>HOST|HOSTNAME|PORT|HTTP_PORT|USER|USERNAME|PASSWORD|PASS|DB|DATABASE|DBNAME|NAME)$")
-
-    def _from_env(self) -> None:
-        """Connection variables under any prefix: WELCOME_DATABASE_URL, PGHOST,
-        POSTGRES_HOST, DRIFTWOOD_CLICKHOUSE_HOST. The prefix is the app's, so
-        matching on the suffix is what generalises."""
-        for key, value in self._env.items():
-            if self._URL_KEY.search(key) and value:
-                self._add_url(self._expand(value), priority=1)
-        families: dict[str, dict[str, str]] = {}
-        for key, value in self._env.items():
-            match = self._PART_KEY.match(key)
-            if match and value:
-                families.setdefault(match.group("prefix"), {})[match.group("part")] = value
-        for prefix, parts in families.items():
-            upper = prefix.upper()
-            if upper in ("PG",) or "POSTGRES" in upper or "PGSQL" in upper:
-                engine = "postgresql"
-            elif "CLICKHOUSE" in upper or upper.endswith("CH") or upper == "CH":
-                engine = "clickhouse"
-            elif "DB" in upper or "DATABASE" in upper or "SQL" in upper:
-                engine = "postgresql"
-            else:
-                continue                         # SMTP_HOST, REDIS_HOST, ...
-            host = parts.get("HOST") or parts.get("HOSTNAME")
-            if not host:
-                continue
-            self._add(DatabaseTarget(
-                engine=engine, priority=1, host=self._expand(host),
-                port=parts.get("PORT") or parts.get("HTTP_PORT") or ("8123" if engine == "clickhouse" else "5432"),
-                user=parts.get("USER") or parts.get("USERNAME") or "",
-                password=parts.get("PASSWORD") or parts.get("PASS") or "",
-                database=parts.get("DB") or parts.get("DATABASE") or parts.get("DBNAME") or parts.get("NAME") or ""))
-
-    _URL = re.compile(
-        r"(?P<scheme>[a-z][\w+.-]*)://(?:(?P<user>[^:@/\s]+)(?::(?P<password>[^@/\s]*))?@)?"
-        r"(?P<host>[\w.-]+)(?::(?P<port>\d+))?(?:/(?P<database>[\w.-]*))?(?P<query>\?[^\s\"'`]*)?",
-        re.IGNORECASE)
-
-    def _add_url(self, url: str, priority: int) -> None:
-        match = self._URL.match(url.strip())
-        if not match:
-            return
-        scheme = match.group("scheme").lower().split("+")[0]   # postgresql+psycopg -> postgresql
-        if scheme in ("postgres", "postgresql", "pgsql", "pg"):
-            engine, default_port = "postgresql", "5432"
-        elif scheme in ("clickhouse", "clickhouses", "ch", "chs"):
-            engine, default_port = "clickhouse", "8123"
-        else:
-            return                               # mysql, sqlite, redis, http ...
-        host = match.group("host") or "localhost"
-        port = match.group("port") or default_port
-        user, password = match.group("user") or "", match.group("password") or ""
-        database = (match.group("database") or "").strip("/")
-        # Rebuild with a scheme psql and psycopg accept; keep ?sslmode=... intact.
-        auth = f"{user}:{password}@" if user else ""
-        dsn = f"{engine}://{auth}{host}:{port}/{database}{match.group('query') or ''}"
-        self._add(DatabaseTarget(engine=engine, priority=priority, dsn=dsn if engine == "postgresql" else None,
-                                 host=host, port=port, user=user, password=password, database=database))
-
-    # Layer 2: ask the framework ----------------------------------------------
-    def _from_django(self) -> None:
-        """Ask Django itself, which is exact when it works."""
-        manage = self._find_manage_py()
-        if not manage:
-            return
-        script = (
-            "import json;from django.conf import settings;"
-            "print('RIDGES_DB'+json.dumps({k:{kk:str(vv) for kk,vv in v.items() "
-            "if kk in ('ENGINE','NAME','USER','PASSWORD','HOST','PORT')} "
-            "for k,v in settings.DATABASES.items()}))"
+            self.models = [DRIVER_MODEL]
+            if RELIEF_MODEL and RELIEF_MODEL != DRIVER_MODEL:
+                self.models.append(RELIEF_MODEL)
+        self.roster = list(self.models)
+        self.timeouts: dict = {}
+        self.bases = base_urls()
+        self.key = (
+            os.getenv("OPENROUTER_API_KEY")
+            or os.getenv("RIDGES_OPENROUTER_API_KEY")
+            or os.getenv("AI_PROXY_KEY")
+            or ""
         )
-        result = run_command([app_python(self.repo.root), str(manage), "shell", "-c", script], timeout=120)
-        match = re.search(r"RIDGES_DB(\{.*\})", result.stdout or "")
-        if not match:
-            return
-        try:
-            databases = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            return
-        for name, config in databases.items():
-            engine_string = (config.get("ENGINE") or "").lower()
-            engine = "clickhouse" if "clickhouse" in engine_string else "postgresql"
-            self._add(DatabaseTarget(
-                engine=engine, priority=0, host=config.get("HOST") or "localhost",
-                port=str(config.get("PORT") or ("8123" if engine == "clickhouse" else "5432")),
-                user=config.get("USER") or "", password=config.get("PASSWORD") or "",
-                database=config.get("NAME") or "",
-            ))
-        self.notes.append(f"django databases: {sorted(databases)}")
 
-    def _find_manage_py(self) -> Path | None:
-        for relative in self.repo.files:
-            if Path(relative).name == "manage.py" and relative.count("/") <= 2:
-                return self.repo.root / relative
-        return None
+    def current(self) -> str:
+        return self.models[0]
 
-    # Layer 3: the application's own source and config ---------------------------
-    _DSN_LITERAL = re.compile(
-        r"\b(?:postgres(?:ql)?(?:\+\w+)?|pgsql|clickhouses?(?:\+\w+)?)://[^\s\"'`<>]{6,200}", re.IGNORECASE)
-    # `envOr("X_HOST", "clickhouse")`, `os.environ.get("X_HOST", "clickhouse")`,
-    # `ENV.fetch("X_HOST", "clickhouse")`: the default argument IS the value.
-    _ENV_DEFAULT = re.compile(
-        r"\(\s*[\"']\w*?(?P<part>HOST|HOSTNAME|PORT|HTTP_PORT|USER|USERNAME|PASSWORD|PASS|DB|DATABASE|DBNAME|DB_NAME|NAME)[\"']"
-        r"\s*,\s*[\"'](?P<value>[^\"']*)[\"']\s*\)")
-    # `process.env.X_HOST || "clickhouse"`, `process.env.X_HOST ?? "clickhouse"`
-    _JS_DEFAULT = re.compile(
-        r"process\.env\.\w*?(?P<part>HOST|PORT|USER|USERNAME|PASSWORD|DB|DATABASE)\s*(?:\|\||\?\?)\s*[\"'](?P<value>[^\"']*)[\"']")
-    # `"host": "clickhouse"`, `HOST = 'db'`, `host: postgres`, `Host: "db"`
-    _KEY_VALUE = re.compile(
-        r"(?<![\w.@-])[\"']?(?P<part>host|hostname|port|http_port|user|username|password|db_?name|database|dbname|name)[\"']?"
-        r"\s*[:=]\s*(?:[\"'](?P<quoted>[^\"'\n]*)[\"']|(?P<bare>[\w.-]+)(?!\s*[\(\[]))", re.IGNORECASE)
-    _PART_ALIASES = {"HOSTNAME": "HOST", "HTTP_PORT": "PORT", "USERNAME": "USER", "PASS": "PASSWORD",
-                     "DB": "DATABASE", "DBNAME": "DATABASE", "DB_NAME": "DATABASE", "NAME": "DATABASE"}
+    def retire(self, model: str) -> bool:
+        if model in self.models and len(self.models) > 1:
+            self.models.remove(model)
+            if model in self.roster:
+                self.roster.remove(model)
+            say("[SEAT] retired %s, now on %s" % (model, self.models[0]))
+            return True
+        return False
 
-    def _from_source(self) -> None:
-        """Defaults written in the application's code and config files.
-
-        Two shapes. A DSN literal anywhere in source (`DEFAULT_URL =
-        "postgres://app:pw@postgres:5432/app_dev"`), and a per-field default
-        in the files that mention the engine: a dict, an assignment, a YAML
-        key, or the fallback argument of an env lookup.
-        """
-        candidates: list[tuple[int, str, str]] = []           # (priority, relative, text)
-        for relative in self.repo.files:
-            lowered_path = relative.lower()
-            text = self.repo.read(relative)
-            if text is None or len(text) > 400_000:
-                continue
-            lowered = text.lower()
-            if "postgres" not in lowered and "clickhouse" not in lowered:
-                continue
-            # A DSN in the module that owns the connection outranks one in a
-            # test or an example file; the ping settles any remaining doubt.
-            if _TEST_PATH.search(lowered_path) or "example" in lowered_path or "sample" in lowered_path:
-                priority = 6
-            elif re.search(r"(^|/)(db|database|conn(ection)?|client|store|settings|config)", lowered_path):
-                priority = 3
-            else:
-                priority = 4
-            candidates.append((priority, relative, text))
-        candidates.sort(key=lambda item: (item[0], item[1]))
-
-        for priority, relative, text in candidates[:80]:
-            for literal in self._DSN_LITERAL.findall(text):
-                if "${" in literal or "%s" in literal or "{" in literal:
-                    literal = self._expand(literal)
-                    if "{" in literal or "$" in literal:
-                        continue             # still a template after expansion
-                self._add_url(literal.rstrip(".,;)"), priority=priority)
-
-        for priority, relative, text in candidates[:80]:
-            self._scrape_fields(relative, text, priority)
-
-    def _scrape_fields(self, relative: str, text: str, priority: int) -> None:
-        # DSN literals were handled by _add_url; scrub them so `host:5432`
-        # inside a URL is not read back as a host named 5432.
-        text = self._DSN_LITERAL.sub(" ", text)
-        lowered = text.lower()
-        engine = "clickhouse" if "clickhouse" in lowered else "postgresql"
-        parts: dict[str, str] = {}
-        weak_name: str | None = None                 # `name` only if nothing better names the database
-        for pattern in (self._ENV_DEFAULT, self._JS_DEFAULT):
-            for match in pattern.finditer(text):
-                raw = match.group("part").upper()
-                if raw == "NAME":
-                    weak_name = weak_name or match.group("value")
-                    continue
-                part = self._PART_ALIASES.get(raw, raw)
-                parts.setdefault(part, match.group("value"))
-        # Only look at plain key/value pairs when the file is about a database
-        # connection; `name = "x"` is everywhere otherwise.
-        if re.search(r"(^|/)(db|database|conn(ection)?|client|store|settings|config)", relative.lower()) \
-                or re.search(r"DATABASES\s*=|DEFAULTS\s*=|connection|datasource", text):
-            for match in self._KEY_VALUE.finditer(text):
-                raw = match.group("part").upper().replace("_", "")
-                value = match.group("quoted") if match.group("quoted") is not None else match.group("bare")
-                if not value:
-                    continue
-                if raw == "NAME":
-                    weak_name = weak_name or value
-                    continue
-                part = self._PART_ALIASES.get(raw, raw)
-                if part == "DATABASE" and value.isdigit():
-                    # A Redis database index, not a database name. NetBox's
-                    # configuration.py carries `REDIS = {... 'DATABASE': 0}`
-                    # below its DATABASES block, and because a bare `DATABASE`
-                    # key outranks the weak `NAME`, the scrape produced
-                    # postgresql://solver@postgres:5432/0 -- a URL that cannot
-                    # connect, so the live schema was silently lost whenever
-                    # asking Django directly did not work.
-                    continue
-                if part in ("HOST", "PORT", "USER", "PASSWORD", "DATABASE"):
-                    parts.setdefault(part, value)
-        if "DATABASE" not in parts and weak_name:
-            parts["DATABASE"] = weak_name
-        host = parts.get("HOST")
-        if not host or host.lower() in ("true", "false", "none", "null") or host.isdigit():
-            return
-        if parts.get("DATABASE", "").lower() in ("true", "false", "none", "null"):
-            parts.pop("DATABASE")
-        self._add(DatabaseTarget(
-            engine=engine, priority=priority, host=self._expand(host),
-            port=parts.get("PORT") or ("8123" if engine == "clickhouse" else "5432"),
-            user=parts.get("USER") or "", password=parts.get("PASSWORD") or "",
-            database=parts.get("DATABASE") or ""))
-
-    # Layer 4: the container network ---------------------------------------------
-    _PROBE_HOSTS = ("localhost", "127.0.0.1", "db", "database", "postgres", "postgresql", "pg",
-                    "clickhouse", "ch", "clickhouse-server")
-    _PROBE_CREDS = {
-        "postgresql": (5432, (("postgres", "postgres"), ("postgres", ""), ("app", "app"))),
-        "clickhouse": (8123, (("default", ""), ("clickhouse", "clickhouse"), ("app", "app"))),
-    }
-
-    @staticmethod
-    def _tcp_open(host: str, port: int, timeout: float = 1.0) -> bool:
-        """Connect with a bound that covers DNS too. `create_connection`'s
-        timeout starts after name resolution, and an unknown host on a slow
-        resolver can take ten seconds per name -- measured: the probe of ten
-        conventional names hung a test run for minutes."""
-        import socket
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-
-        def attempt() -> bool:
+    def ask(self, messages: list, tools: list = None) -> dict:
+        budget = self._budget()
+        while True:
+            model = self.current()
             try:
-                with socket.create_connection((host, port), timeout=timeout):
-                    return True
-            except OSError:
-                return False
-
-        pool = ThreadPoolExecutor(max_workers=1)
-        try:
-            return pool.submit(attempt).result(timeout=timeout)
-        except FutureTimeout:
-            return False
-        finally:
-            pool.shutdown(wait=False)
-
-    def _from_network(self) -> None:
-        """Last resort: the sidecar is on the compose network under a
-        conventional name. Knock on the conventional doors."""
-        wanted = [self.instruction.engine] if self.instruction.engine in self._PROBE_CREDS \
-            else list(self._PROBE_CREDS)
-        deadline = time.monotonic() + 15.0          # a safety net, not a scan
-        for engine in wanted:
-            port, creds = self._PROBE_CREDS[engine]
-            for host in self._PROBE_HOSTS:
-                if time.monotonic() > deadline:
-                    break
-                if not self._tcp_open(host, port):
+                return self._attempt(model, messages, tools, budget)
+            except SeatRefused as refusal:
+                say("[SEAT] %s refused: %s" % (model, str(refusal)[:200]))
+                if isinstance(refusal, SeatTimedOut):
+                    # The abandoned calls were charged by estimate; the
+                    # proxy knows what they really cost.
+                    self.allowance.sync()
+                if isinstance(refusal, SeatUnreachable):
+                    if not self.patient:
+                        raise
+                    wait = min(SEAT_REFUSED_WAIT_SEC,
+                               self.allowance.clock_left() - WALL_RESERVE_SEC - 60.0)
+                    if wait <= 0:
+                        raise Spent("endpoint unreachable: %s" % refusal)
+                    say("[SEAT] endpoint unreachable; asking again in %.0fs" % wait)
+                    time.sleep(wait)
+                    budget = self._budget()
                     continue
-                for user, password in creds:
-                    target = DatabaseTarget(engine=engine, priority=8, host=host, port=str(port),
-                                            user=user, password=password,
-                                            database="postgres" if engine == "postgresql" else "default")
-                    if self._ping(target):
-                        if engine == "postgresql":
-                            names = self.sql("SELECT datname FROM pg_database WHERE NOT datistemplate "
-                                             "AND datname <> 'postgres' ORDER BY 1", target=target, timeout=10)
-                            first = next((n.strip() for n in names.splitlines()
-                                          if re.fullmatch(r"[\w-]+", n.strip()) and n.strip() != "datname"), "")
-                            if first:
-                                target.database = first
-                        self._add(target)
-                        break
-                break                            # one reachable host per engine is enough
+                if (isinstance(refusal, SeatTimedOut)
+                        and self.timeouts.get(model, 0) >= 2
+                        and self.retire(model)):
+                    budget = self._budget()
+                    continue
+                if len(self.models) > 1:
+                    self.models.remove(model)
+                    say("[SEAT] benched %s, now on %s"
+                        % (model, self.models[0]))
+                    if isinstance(refusal, SeatTimedOut):
+                        budget = self._budget()
+                    continue
+                if isinstance(refusal, SeatTimedOut):
+                    raise Spent("every seat went quiet: %s" % refusal)
+                if not self.patient:
+                    raise
+                wait = min(SEAT_REFUSED_WAIT_SEC,
+                           self.allowance.clock_left() - WALL_RESERVE_SEC - 60.0)
+                if wait <= 0:
+                    raise Spent("no seat will serve this run")
+                say("[SEAT] every seat refused; asking again in %.0fs" % wait)
+                time.sleep(wait)
+                self.models = list(self.roster)
+                budget = self._budget()
 
-    def _first_reachable(self, candidates: list[DatabaseTarget]) -> list[DatabaseTarget]:
-        """The first candidate that answers SELECT 1, as a one-element list."""
-        for target in candidates:
-            if self._verify(target):
-                return [target]
-            log(f"database candidate unreachable, dropped: {target_url(target)}")
+    def _budget(self):
+        share = self.allowance.clock_left() * CALL_CLOCK_SHARE
+        return share, time.monotonic(), self.allowance.clock_left()
+
+    def _attempt(self, model: str, messages: list, tools: list,
+                 budget=None) -> dict:
+        body = {
+            "model": model,
+            "messages": messages,
+            "temperature": TEMPERATURE,
+            "seed": SEED,
+            "max_tokens": REPLY_TOKEN_CEILING,
+        }
+        if HIGH_REASONING:
+            body["reasoning"] = {"effort": "high", "exclude": True}
+        if Seat.include_usage:
+            body["usage"] = {"include": True}
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        payload = json.dumps(body).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.key:
+            headers["Authorization"] = "Bearer " + self.key
+
+        backoff = 3.0
+        sweep: list = []
+        timed_out = 0
+        walled = 0
+        unreachable = 0
+        asked = 0
+        attempts = REQUEST_ATTEMPTS if self.patient else 1
+        ceiling = SEAT_CALL_TIMEOUT_SEC if self.patient else 60.0
+        share, began, started_with = budget if budget else self._budget()
+        # What the endpoint bills for a request we walk away from: the
+        # prompt it read plus part of a reply. Estimated, then corrected
+        # from the proxy's own total.
+        prompt_chars = len(payload)
+
+        def spent_share() -> float:
+            return max(time.monotonic() - began,
+                       started_with - self.allowance.clock_left())
+
+        for attempt in range(attempts):
+            if self.allowance.clock_left() <= 5:
+                raise Spent("clock ran out mid-request")
+            walled = 0
+            quiet = 0
+            sweep = []
+            # A slow endpoint gets more time on the retry, never less: a
+            # reply that needs 100s cannot arrive in 45.
+            granted = max(SEAT_RETRY_FLOOR_SEC,
+                          ceiling * (SEAT_RETRY_GROWTH ** timed_out))
+            for base in list(self.bases):
+                room = min(share - spent_share(),
+                           self.allowance.clock_left() - 10)
+                if room < SEAT_RETRY_FLOOR_SEC:
+                    break
+                asked += 1
+                try:
+                    request = urllib.request.Request(
+                        base + "/chat/completions", data=payload,
+                        headers=headers)
+                    with urllib.request.urlopen(
+                            request, timeout=min(granted, room)) as response:
+                        parsed = json.loads(
+                            response.read().decode("utf-8", "replace"))
+                    return self._book(model, parsed)
+                except urllib.error.HTTPError as error:
+                    try:
+                        detail = error.read()[:400].decode("utf-8", "replace")
+                    except Exception:
+                        detail = ""
+                    sweep.append("%s %s" % (error.code, foreign(detail)))
+                    if error.code == 404 and len(self.bases) > 1:
+                        # Not a route here; stop paying for it on every call.
+                        self.bases.remove(base)
+                        say("[SEAT] %s is not served; dropped" % base)
+                        continue
+                    if error.code == 403:
+                        walled += 1
+                        continue
+                    if (error.code == 400 and Seat.include_usage
+                            and "usage" in detail.lower()):
+                        Seat.include_usage = False
+                        say("[SEAT] endpoint rejects usage.include; "
+                            "estimating cost from now on")
+                        return self._attempt(model, messages, tools, budget)
+                    if error.code in (400, 402, 413):
+                        raise Spent("endpoint refused the request: "
+                                    + sweep[-1])
+                    if error.code == 429 and (
+                            "budget" in detail.lower()
+                            or "cost" in detail.lower()):
+                        raise Spent("allowance exhausted upstream")
+                    if error.code == 429:
+                        walled += 1
+                        continue
+                except Exception as error:
+                    reason = getattr(error, "reason", None)
+                    if isinstance(error, TimeoutError) or isinstance(
+                            reason, TimeoutError):
+                        timed_out += 1
+                        quiet += 1
+                        sweep.append("timed out after %.0fs"
+                                     % min(granted, room))
+                        charged = self.allowance.charge(model, {
+                            "prompt_tokens": int(prompt_chars / CHARS_PER_TOKEN),
+                            "completion_tokens": ABANDONED_REPLY_TOKENS})
+                        say("[SEAT] charged ~$%.4f for the request that timed "
+                            "out; total=$%.4f" % (charged, self.allowance.spent))
+                    else:
+                        unreachable += 1
+                        sweep.append("%s: %s"
+                                     % (type(error).__name__, foreign(error)))
+            if asked and walled and not quiet:
+                # Nothing but walls in this sweep.
+                if attempt + 1 >= 2:
+                    raise SeatRefused(" | ".join(sweep))
+            if attempt + 1 >= attempts or spent_share() >= share:
+                break
+            nap = min(backoff, max(0.0, self.allowance.clock_left() - 5),
+                      max(0.0, share - spent_share()))
+            if nap <= 0:
+                break
+            time.sleep(nap)
+            backoff = min(backoff * 2, 15.0)
+        said = " | ".join(sweep) or "no base was asked"
+        if timed_out:
+            self.timeouts[model] = self.timeouts.get(model, 0) + 1
+            raise SeatTimedOut("%d timeout(s): %s" % (timed_out, said))
+        if asked and walled and not quiet:
+            raise SeatRefused(said)
+        if asked and unreachable and not walled:
+            raise SeatUnreachable(said)
+        raise Spent("no reply after %d attempts: %s" % (attempt + 1, said))
+
+    def _book(self, model: str, parsed: dict) -> dict:
+        choices = parsed.get("choices") or []
+        if not choices:
+            raise Spent("reply carried no choices")
+        message = choices[0].get("message") or {}
+        usage = parsed.get("usage") or {}
+        cost = self.allowance.charge(model, usage)
+        message["_usage"] = usage
+        message["_model"] = model
+        served = one_line(parsed.get("provider") or parsed.get("served_by"))
+        answered = one_line(parsed.get("model"))
+        aside = ""
+        if served:
+            aside += " via=%s" % served[:40]
+        if answered and answered != model:
+            aside += " answered=%s" % answered[:60]
+        thought = reasoning_tokens(usage)
+        if thought >= 0:
+            aside += " thought=%d" % thought
+        if "cost" in usage:
+            aside += " est=$%.4f" % self.allowance.estimate(model, usage)
+        say("[SEAT] %s call=%d $%.4f total=$%.4f left=%.0fs said=%s%s"
+            % (model, self.allowance.calls, cost, self.allowance.spent,
+               self.allowance.clock_left(), reply_fingerprint(message), aside))
+        finish = choices[0].get("finish_reason") or ""
+        message["_finish"] = finish
+        if finish not in ("stop", "tool_calls", ""):
+            say("[SEAT] %s reply ended on %s after %d token(s)"
+                % (model, finish if finish in
+                   ("stop", "length", "tool_calls", "content_filter", "error")
+                   else "other",
+                   int(usage.get("completion_tokens") or 0)))
+        return message
+
+
+# =========================================================================
+# Warden — the task's own conditions, checked before hand-in
+# =========================================================================
+
+WARDEN_REFUSALS_MAX = 3
+WARDEN_RELEASE_SEC = 150.0
+CHECK_SEC = 360.0            # one named check; the database sidecar has a quarter CPU
+CHECK_GATE_SEC = 480.0       # all of them together
+CHECK_MIN_ROOM_SEC = 60.0
+CHECK_OUTPUT_CHARS = 2000
+
+
+class Warden:
+    """What the instruction itself requires: only the named files change,
+    no test files touched, no definitions dropped, no suppressions added,
+    and the check commands it names exit clean."""
+
+    def __init__(self, tree: Tree, pool: ShellPool, allowance: Allowance,
+                 statement: str = "", scope: dict = None) -> None:
+        self.tree = tree
+        self.pool = pool
+        self.allowance = allowance
+        self.statement = statement
+        self.scope = scope or {}
+        self.allowed = list(self.scope.get("files") or [])
+        self.checks = list(self.scope.get("checks") or [])[:CHECK_COMMANDS_MAX]
+        self.beacon = Beacon("warden")
+        self.refusals = 0
+        self.stood_down = False
+        self.passed_key = None
+
+    def tree_key(self, changed: list = None) -> tuple:
+        """Identifies the exact set of changes on disk."""
+        key = []
+        for rel, kind in (self.tree.changed_paths() if changed is None else changed):
+            digest = ""
+            if kind != "deleted":
+                try:
+                    digest = Tree._digest(self.tree.absolute(rel))
+                except (OSError, ToolFault):
+                    digest = "?"
+            key.append((rel, kind, digest))
+        return tuple(key)
+
+    def scope_faults(self, changed: list = None) -> list:
+        if not self.allowed:
+            return []
+        extras = [p for p in self.changed_paths(changed) if p not in self.allowed]
+        if not extras:
+            return []
+        return ["The instruction limits changes to %s. This run also changed "
+                "%s. Put %s back exactly as at the start (restore_file does "
+                "that in one call) and keep the fix inside the named file%s."
+                % (", ".join(self.allowed), ", ".join(extras[:6]),
+                   "it" if len(extras) == 1 else "them",
+                   "s" if len(self.allowed) > 1 else "")]
+
+    def check_faults(self, changed: list = None) -> list:
+        """Run the commands the instruction names; the first red one is
+        the fault. A check that cannot finish in the time left is skipped,
+        never counted against the run, and never recorded as passed."""
+        if not self.checks:
+            return []
+        room = self.allowance.clock_left() - WALL_RESERVE_SEC
+        if room < CHECK_MIN_ROOM_SEC:
+            self.beacon.skipped("too little of the run left for the named checks")
+            return []
+        key = self.tree_key(changed)
+        ran_all = True
+        if self.passed_key is not None and key == self.passed_key:
+            self.beacon.skipped("checks already passed on this exact tree")
+            return []
+        # The model's own background runs are stale once it submits, and
+        # they hold the pool's slots.
+        for job in list(self.pool.jobs.values()):
+            if not job.finished():
+                self.beacon.fired("stopping %s before the named checks" % job.name)
+            try:
+                ShellPool._report(job, job.drain())
+                job.stop()
+            except Exception:
+                pass
+        self.pool.jobs.clear()
+        deadline = time.monotonic() + min(CHECK_GATE_SEC, room)
+        for command in self.checks:
+            left = deadline - time.monotonic()
+            if left < 10.0:
+                self.beacon.skipped("out of time before: %s" % command[:100])
+                ran_all = False
+                break
+            try:
+                job = self.pool.start(command)
+            except (ToolFault, OSError) as error:
+                self.beacon.skipped("could not start %s: %s" % (command[:80], error))
+                ran_all = False
+                continue
+            granted = min(CHECK_SEC, left)
+            done, out = job.wait(granted)
+            self.pool.jobs.pop(job.name, None)
+            if not done:
+                job.stop()
+                self.beacon.skipped("timed out after %.0fs: %s" % (granted, command[:100]))
+                ran_all = False
+                continue
+            code = job.process.returncode
+            ShellPool._report(job, out)
+            job.stop()
+            if code == 0:
+                self.beacon.fired("clean: %s" % command[:100])
+                continue
+            self.beacon.fired("red (exit %s): %s" % (code, command[:100]))
+            return ["The instruction names this check and it does not pass "
+                    "(exit %s):\n  %s\n\n%s"
+                    % (code, command,
+                       clip(out or "(no output)", CHECK_OUTPUT_CHARS, "check output"))]
+        self.passed_key = key if ran_all else None
         return []
 
-    def _ping(self, target: DatabaseTarget) -> bool:
-        out = self.sql("SELECT 1", target=target, timeout=8)
-        return bool(re.search(r"^\s*1\s*$", out or "", re.MULTILINE))
+    def changed_paths(self, changed: list = None) -> list:
+        if changed is None:
+            changed = self.tree.changed_paths()
+        return [rel for rel, _ in changed]
 
-    def _verify(self, target: DatabaseTarget) -> bool:
-        """_ping, recorded. Only a target that answers SELECT 1 survives, so
-        only a verified URL can ever reach the prompt."""
-        ok = self._ping(target)
-        self.attempts.append((target_url(target), ok))
-        return ok
+    def original(self, path: str):
+        data = self.tree.original(path)
+        return None if data is None else data.decode("utf-8", "replace")
 
-    # -- querying --------------------------------------------------------
-    def available(self) -> bool:
-        return bool(self.targets)
+    def change_faults(self, changed: list = None) -> list:
+        faults = []
+        for path in self.changed_paths(changed):
+            if TEST_PATH.search(path):
+                faults.append(
+                    "This run edited %s. The task is to change the code under "
+                    "repair, not the tests that check it. Put it back exactly "
+                    "as it was and make the source satisfy the test instead."
+                    % path)
+                continue
+            faults.extend(self.file_faults(path))
+        return faults
 
-    def sql(self, query: str, *, target: DatabaseTarget | None = None, timeout: float = 60.0) -> str:
-        """Run a read-only statement and return its text output (or an error)."""
-        chosen = target or (self.targets[0] if self.targets else None)
-        if chosen is None:
-            trace("DatabaseProbe.sql", "out", query=query, rows=0, note="no target")
-            return "[no database target discovered]"
-        # Knock before speaking. Neither client below bounds name resolution:
-        # psql and urlopen both start their timeout after the host resolves, so
-        # an unresolvable hostname costs the resolver's own timeout -- measured
-        # at ~21s per call, and schema_for makes four of them, which turned a
-        # 1ms stage into 85 seconds of a 1500-second budget. _tcp_open is
-        # bounded through DNS and costs a millisecond when the host is there,
-        # so only an unreachable target ever pays for this.
-        door = (chosen.host, chosen.port)
-        refused_at = self._refused.get(door)
-        if refused_at is not None and time.monotonic() - refused_at < self._REFUSAL_WINDOW:
-            return f"[database unreachable: {chosen.host}:{chosen.port}]"
+    def file_faults(self, path: str) -> list:
+        before = self.original(path)
+        if before is None:
+            return []
+        if not path.endswith((".py", ".rb", ".go", ".js", ".ts", ".php")):
+            return []
+        carried = visible_definitions(before) if path.endswith(".py") else []
         try:
-            reachable = self._tcp_open(chosen.host, int(chosen.port or 0), timeout=3.0)
-        except (TypeError, ValueError):
-            reachable = True                     # a port we cannot parse is not evidence
-        if not reachable:
-            self._refused[door] = time.monotonic()
-            trace("DatabaseProbe.sql", "out", query=query, target=target_url(chosen),
-                  note="host did not accept a connection")
-            return f"[database unreachable: {chosen.host}:{chosen.port}]"
-        self._refused.pop(door, None)
-        started = time.monotonic()
-        out = (self._clickhouse(chosen, query, timeout) if chosen.engine == "clickhouse"
-               else self._postgres(chosen, query, timeout))
-        trace("DatabaseProbe.sql", "out", query=query, target=target_url(chosen),
-              seconds=time.monotonic() - started, chars=len(out or ""),
-              usable=self._usable(out))
+            after = self.tree.read(path)
+        except ToolFault:
+            if not carried:
+                return []
+            return ["This run deleted %s, and callers of %s lose it with the "
+                    "file. Keep the file and the names in it."
+                    % (path, carried[0])]
+        out = []
+        if carried:
+            import collections
+            gone = sorted((collections.Counter(carried)
+                           - collections.Counter(visible_definitions(after))).elements())
+            if gone:
+                out.append(
+                    "These definitions were in %s when the run started and "
+                    "are not there now: %s. A refactor may not drop a name "
+                    "callers can use." % (path, ", ".join(gone[:6])))
+        added = (len(NOQA_DIRECTIVE.findall(after))
+                 - len(NOQA_DIRECTIVE.findall(before)))
+        if added > 0:
+            out.append(
+                "This run added %d suppression comment(s) to %s. Silencing "
+                "the check is the one answer the task rules out."
+                % (added, path))
         return out
 
-    def _postgres(self, target: DatabaseTarget, query: str, timeout: float) -> str:
-        dsn = target.dsn or (
-            f"postgresql://{target.user}:{target.password}@{target.host}:{target.port}/{target.database}"
-        )
-        if shutil.which("psql"):
-            result = run_command(["psql", dsn, "-X", "-A", "-F", " | ", "-c", query], timeout=timeout)
-            if result.returncode == 0:
-                return result.stdout
-            error = result.stdout
-        else:
-            error = "[psql not installed]"
-        return self._postgres_via_python(target, query, timeout) or error
-
-    def _postgres_via_python(self, target: DatabaseTarget, query: str, timeout: float) -> str:
-        script = f"""
-import json, sys
-try:
-    import psycopg
-    connect = psycopg.connect
-except Exception:
-    try:
-        import psycopg2 as psycopg
-        connect = psycopg.connect
-    except Exception:
-        sys.exit("[no postgres driver]")
-with connect({target.dsn!r} or "dbname={target.database} user={target.user} "
-             "password={target.password} host={target.host} port={target.port}") as conn:
-    with conn.cursor() as cur:
-        cur.execute({query!r})
-        rows = cur.fetchall()
-for row in rows[:200]:
-    print(" | ".join("" if v is None else str(v) for v in row))
-"""
-        result = run_command([sys.executable, "-c", script], timeout=timeout)
-        return result.stdout if result.returncode == 0 else ""
-
-    def _clickhouse(self, target: DatabaseTarget, query: str, timeout: float) -> str:
-        if shutil.which("clickhouse-client"):
-            command = ["clickhouse-client", "--host", target.host, "--query", query]
-            if target.user:
-                command += ["--user", target.user]
-            if target.password:
-                command += ["--password", target.password]
-            if target.database:
-                command += ["--database", target.database]
-            result = run_command(command, timeout=timeout)
-            if result.returncode == 0:
-                return result.stdout
-        # HTTP interface, always present on a ClickHouse server.
-        http_port = "8123" if target.port in ("9000", "9440", "") else target.port
-        url = f"http://{target.host}:{http_port}/?database={target.database}"
-        try:
-            request = urllib.request.Request(url, data=query.encode("utf-8"), method="POST")
-            if target.user:
-                import base64
-                token = base64.b64encode(f"{target.user}:{target.password}".encode()).decode()
-                request.add_header("Authorization", f"Basic {token}")
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read().decode("utf-8", "replace")
-        except Exception as exc:
-            return f"[clickhouse query failed: {exc}]"
-
-    # -- structured evidence --------------------------------------------
-    # Every failure path in sql() returns its complaint as text: "[psql not
-    # installed]", "[no postgres driver]", "[clickhouse query failed: ...]".
-    # Those are truthy, so they used to be rendered under a "Live schema
-    # (columns and existing indexes)" header -- the prompt asserting it had
-    # read the database when it had not.
-    _QUERY_ERROR = re.compile(
-        r"^\s*\[(?:no |psql |clickhouse |could not |database unreachable)", re.IGNORECASE)
-
-    @classmethod
-    def _usable(cls, output: str) -> bool:
-        return bool(output and output.strip() and not cls._QUERY_ERROR.match(output))
-
-    def schema_for(self, names: Iterable[str], limit: int = 8) -> str:
-        """DDL-ish description of the tables the instruction talks about."""
-        if not self.available():
-            trace("schema_for", "out", chars=0, note="no verified database")
-            return ""
-        target = self.targets[0]
-        wanted = [name for name in names if re.fullmatch(r"[A-Za-z_][\w]{2,}", name)][:limit]
-        trace("schema_for", "in", asked=list(names)[:12], kept=wanted)
-        if not wanted:
-            return ""
-        blocks: list[str] = []
-        if target.engine == "postgresql":
-            pattern = "|".join(re.escape(name.lower()) for name in wanted)
-            columns = self.sql(
-                "SELECT table_name, column_name, data_type FROM information_schema.columns "
-                f"WHERE table_schema='public' AND table_name ~ '{pattern}' "
-                "ORDER BY table_name, ordinal_position LIMIT 400"
-            )
-            indexes = self.sql(
-                f"SELECT tablename, indexname, indexdef FROM pg_indexes "
-                f"WHERE schemaname='public' AND tablename ~ '{pattern}' ORDER BY tablename LIMIT 200"
-            )
-            if self._usable(columns):
-                blocks.append("columns (table | column | type):\n" + truncate(columns, 4000))
-            if self._usable(indexes):
-                blocks.append("indexes (table | name | definition):\n" + truncate(indexes, 4000))
-        else:
-            for name in wanted[:4]:
-                ddl = self.sql(f"SHOW CREATE TABLE {name}")
-                if self._usable(ddl) and "failed" not in ddl[:40]:
-                    blocks.append(truncate(ddl, 2500))
-        rendered = "\n\n".join(blocks)
-        trace("schema_for", "out", blocks=len(blocks), chars=len(rendered))
-        return rendered
-
-    def clickhouse_work(self, query: str) -> str:
-        """Rows and bytes a ClickHouse query actually read.
-
-        EXPLAIN alone does not say how much data was touched; system.query_log
-        does, and read_rows/read_bytes are the ClickHouse equivalent of the
-        buffer counts an optimisation task is graded on.
-        """
-        if not self.available() or self.targets[0].engine != "clickhouse":
-            return ""
-        marker = f"ridges_probe_{int(time.time()*1000)}"
-        self.sql(f"SELECT 1 AS {marker} SETTINGS log_comment = '{marker}'")
-        self.sql(f"{query} SETTINGS log_comment = '{marker}'")
-        self.sql("SYSTEM FLUSH LOGS")
-        stats = self.sql(
-            "SELECT read_rows, read_bytes, result_rows, "
-            "query_duration_ms, ProfileEvents['SelectedParts'] AS parts, "
-            "ProfileEvents['SelectedMarks'] AS marks "
-            "FROM system.query_log "
-            f"WHERE log_comment = '{marker}' AND type = 'QueryFinish' "
-            "ORDER BY event_time DESC LIMIT 1")
-        first = stats.strip().splitlines()[0] if stats.strip() else ""
-        # A permission or missing-table error comes back as text too; do not
-        # hand the model an error message dressed up as a measurement.
-        if not first or not re.match(r"^\s*\d+\s*\|", first):
-            return ""
-        return ("read_rows | read_bytes | result_rows | duration_ms | parts | marks\n"
-                + truncate(stats, 800))
-
-    def explain(self, query: str) -> str:
-        if not self.available():
-            return ""
-        target = self.targets[0]
-        if target.engine == "postgresql":
-            return truncate(self.sql(f"EXPLAIN (ANALYZE, BUFFERS, SUMMARY OFF) {query}"), 4000)
-        return truncate(self.sql(f"EXPLAIN indexes = 1 {query}"), 4000)
-
-
-# ---------------------------------------------------------------------------
-# Patch generation
-# ---------------------------------------------------------------------------
-
-def _diff_lines(text: str) -> list[str]:
-    return text.splitlines(keepends=True)
-
-
-def _annotate_no_newline(diff: Iterable[str]) -> list[str]:
-    """Insert git's '\\ No newline at end of file' markers where needed."""
-    output: list[str] = []
-    for line in diff:
-        if line.startswith(("---", "+++", "@@", "diff ", "new file", "index ")):
-            output.append(line if line.endswith("\n") else line + "\n")
-            continue
-        if line.endswith("\n"):
-            output.append(line)
-        else:
-            output.append(line + "\n")
-            output.append("\\ No newline at end of file\n")
-    return output
-
-
-def build_patch(repo: Repository, files: Sequence[str]) -> str:
-    """A unified diff `git apply` accepts, built without a git repository."""
-    parts: list[str] = []
-    for relative in files:
-        original = repo.original(relative)
-        path = repo.root / relative
-        try:
-            current = read_source(path) if path.exists() else None
-        except (OSError, UnicodeDecodeError) as exc:
-            # exists() answered a moment ago and is not a promise: the file can
-            # be unreadable, binary, or gone by the time it is opened. Losing
-            # one file from the diff is bad; losing the whole run to an
-            # exception raised while assembling it is worse.
-            log(f"cannot read {relative} to diff it ({exc}); omitted from the patch")
-            continue
-        if current == original:
-            continue
-
-        if original is None:
-            header = f"diff --git a/{relative} b/{relative}\nnew file mode 100644\n"
-            from_label, to_label = "/dev/null", f"b/{relative}"
-            original = ""
-        elif current is None:
-            header = f"diff --git a/{relative} b/{relative}\ndeleted file mode 100644\n"
-            from_label, to_label = f"a/{relative}", "/dev/null"
-            current = ""
-        else:
-            header = f"diff --git a/{relative} b/{relative}\n"
-            from_label, to_label = f"a/{relative}", f"b/{relative}"
-
-        body = difflib.unified_diff(
-            _diff_lines(original), _diff_lines(current),
-            fromfile=from_label, tofile=to_label, n=3,
-        )
-        rendered = "".join(_annotate_no_newline(body))
-        if rendered.strip():
-            parts.append(header + rendered)
-            trace("build_patch", "out", path=relative, bytes=len(header + rendered),
-                  added=sum(1 for l in rendered.splitlines() if l.startswith("+")
-                            and not l.startswith("+++")),
-                  removed=sum(1 for l in rendered.splitlines() if l.startswith("-")
-                              and not l.startswith("---")))
-    patch = "".join(parts)
-    trace("build_patch", "out", files=len(parts), bytes=len(patch))
-    return patch
-
-
-def verify_patch_applies(patch: str, repo: Repository) -> tuple[bool, str]:
-    """Dry-run the patch against a pristine copy, the way the checker will."""
-    if not patch.strip():
-        return False, "empty patch"
-    if not shutil.which("git"):
-        return True, "git unavailable; skipped apply check"
-
-    staging = Path("/tmp/ridges-patch-check")
-    touched = re.findall(r"^diff --git a/(\S+) b/\S+$", patch, re.MULTILINE)
-    patch_file = Path("/tmp/ridges-candidate.diff")
-    try:
-        shutil.rmtree(staging, ignore_errors=True)
-        staging.mkdir(parents=True, exist_ok=True)
-        for relative in touched:
-            original = repo.original(relative)
-            if original is None:
-                continue
-            destination = staging / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            write_source(destination, original)
-        patch_file.write_text(patch, encoding="utf-8")
-    except OSError as exc:
-        # /tmp full, read-only, or a path in the patch that cannot be staged.
-        # This is a check, and a check that cannot run must not fail the run --
-        # the same call it already makes when git itself is missing.
-        shutil.rmtree(staging, ignore_errors=True)
-        log(f"could not stage the patch for the apply check ({exc}); skipping it")
-        return True, f"apply check could not run: {exc}"
-    result = run_command(["git", "apply", "--check", "-v", str(patch_file)], cwd=staging, timeout=60)
-    shutil.rmtree(staging, ignore_errors=True)
-    trace("verify_patch_applies", "out", applies=result.returncode == 0, files=len(touched),
-          detail=truncate(result.stdout, 200) if result.returncode else "")
-    return result.returncode == 0, truncate(result.stdout, 1500)
-
-
-# ---------------------------------------------------------------------------
-# Verification
-# ---------------------------------------------------------------------------
-
-@dataclass
-class CheckResult:
-    """A check's verdict, in three states rather than two.
-
-    `passed` alone conflates "I looked and it was fine" with "I could not
-    look" -- and the second is the dangerous one, because it reads as success
-    while removing the only defence the agent has. A probe that fails to report
-    a query count on an optimisation task is not a passing patch; it is an
-    unmeasured one, on the very dimension the task is about.
-
-    `verified=False` says the check did not run. It is not a failure -- there
-    is nothing to tell the model to fix about the code -- but it must not count
-    towards `clean`, or the agent stops early on a claim it never tested.
-    """
-
-    name: str
-    passed: bool
-    detail: str
-    verified: bool = True
-
-
-class Checker:
-    """Everything this agent can check for itself before committing to a patch.
-
-    Ordered cheapest-first so a syntax slip never costs a six-minute test run.
-    """
-
-    def __init__(self, repo: Repository, instruction: Instruction,
-                 candidates: Sequence[str] = (), probe: "DatabaseProbe | None" = None) -> None:
-        self.repo = repo
-        self.instruction = instruction
-        self.probe = probe
-        # Files we independently judged relevant. When the instruction names no
-        # editable path this is the only thing bounding the blast radius.
-        self.candidates = list(candidates)
-        # Probe signature -> (counts, fingerprint) for the unedited code, so
-        # the baseline costs one shell run per run, not one per repair round.
-        self._baselines: dict[str, tuple | None] = {}
-
-    def run_all(self, changed: Sequence[str], *, include_tests: bool = True) -> list[CheckResult]:
-        trace("Checker", "in", changed=changed, include_tests=include_tests,
-              gates=[name for name, on in (("scope", True), ("protected", True), ("syntax", True),
-                                           ("single-method", self.instruction.single_method),
-                                           ("style", bool(self.instruction.style_constraints)),
-                                           ("contract", self.instruction.single_method)) if on],
-              commands=len(self.instruction.commands))
-        results = [self.check_scope(changed)]
-        results.append(self.check_protected(changed))
-        results.append(self.check_syntax(changed))
-        if self.instruction.single_method:
-            results.append(self.check_single_method(changed))
-        if self.instruction.style_constraints:
-            results.append(self.check_style(changed))
-        if self.instruction.single_method:
-            results.append(self.check_method_contract(changed))
-        if any(self._MIGRATION_PATH.search(p) for p in changed):
-            results.append(self.check_migration_contract(changed))
-        if all(check.passed for check in results):
-            results.extend(self.check_lint(changed))
-            if include_tests:
-                if not self.instruction.commands:
-                    found = self.discovered_commands(changed)
-                    if found:
-                        log(f"instruction named no checks; running the repository's own: {found}")
-                        self.instruction.commands = found
-                results.extend(self.run_task_commands())
-        for check in results:            # each gate's own verdict, in order
-            _traced(check)
-        trace("Checker", "out",
-              passed=[c.name for c in results if c.passed],
-              failed=[c.name for c in results if not c.passed])
-        return results
-
-    # -- scope -----------------------------------------------------------
-    # Never editable unless the instruction explicitly names them: touching any
-    # of these fails source-tree conservation, whatever else is correct.
-    # Two tiers, because they need different amounts of trust.
-    #
-    # ABSOLUTE: no instruction in this category legitimately asks for these to
-    # change -- "you change the query, not the test" is the scoring rule, and
-    # the checker hashes every file it did not authorise. There is therefore
-    # no exemption path at all, so no parsing mistake can open one. That
-    # matters: `named_paths` collects every path-looking token in the prose
-    # regardless of what its sentence says, so "Do not change tests/x.py" and
-    # a `python manage.py test ...` invocation both used to land there and
-    # both used to grant an exemption. Measured on the netbox samples: the
-    # prefix-hierarchy statement writes its checks inline rather than fenced,
-    # which put `netbox/manage.py` in named_paths and exempted it.
-    #
-    # CONDITIONAL: migrations and project config are legitimately edited when
-    # a task asks for it (the cached-value-index sample is exactly that), but
-    # only on an explicit permission -- edit_only or the lint command's target,
-    # never a passing mention.
-    _NEVER_EDIT_ABSOLUTE = re.compile(
-        r"(^|/)(tests?|testing|spec|fixtures?|conftest\.py)(/|$)"
-        r"|(^|/)test_[^/]*$|_test\.[a-z]+$"
-        r"|(^|/)(setup|conftest|manage)\.py$"
-        r"|\.lock$",
-        re.IGNORECASE)
-    _NEVER_EDIT_UNLESS_PERMITTED = re.compile(
-        r"(^|/)migrations(/|$)|\.(cfg|ini)$", re.IGNORECASE)
-    # Kept for callers that only ask "is this path sensitive at all".
-    _NEVER_EDIT = re.compile(
-        _NEVER_EDIT_ABSOLUTE.pattern + "|" + _NEVER_EDIT_UNLESS_PERMITTED.pattern,
-        re.IGNORECASE)
-
-    def allowed_paths(self) -> set[str] | None:
-        if self.instruction.edit_only:
-            return set(self.instruction.edit_only)
-        if self.instruction.lint_paths:
-            return set(self.instruction.lint_paths)
-        # No named target: fall back to the files we ranked as candidates plus
-        # anything the prose mentioned. Unbounded is not an option -- an edit
-        # outside this set is far more likely to be a mistake than the fix.
-        inferred = set(self.candidates) | set(self.instruction.named_paths)
-        return inferred or None
-
-    def check_protected(self, changed: Sequence[str]) -> CheckResult:
-        # Only an explicit permission counts. A path the prose merely mentions
-        # is evidence for the ranker, never authority to edit it.
-        permitted = set(self.instruction.edit_only) | set(self.instruction.lint_paths)
-        forbidden = [p for p in changed if self._NEVER_EDIT_ABSOLUTE.search(p)]
-        unpermitted = [p for p in changed if p not in permitted
-                       and self._NEVER_EDIT_UNLESS_PERMITTED.search(p)]
-        if forbidden:
-            return CheckResult(
-                "protected paths", False,
-                "tests, fixtures and project scripts are not yours to change, however the "
-                f"instruction is worded; these were modified: {forbidden}. Fix the production "
-                "code instead: a change to a test does not fix the behaviour the test describes.")
-        if unpermitted:
-            return CheckResult(
-                "protected paths", False,
-                "migrations and project config may only be changed when the instruction "
-                f"explicitly permits that file; these were modified without one: {unpermitted}. "
-                "Fix the production code instead.")
-        return CheckResult("protected paths", True, "no test or fixture files touched")
-
-    def check_scope(self, changed: Sequence[str]) -> CheckResult:
-        allowed = self.allowed_paths()
-        if allowed is None:
-            return CheckResult("scope", True, f"changed: {list(changed)}")
-        stray = [path for path in changed if path not in allowed]
-        if stray:
-            return CheckResult(
-                "scope", False,
-                f"the instruction permits edits only to {sorted(allowed)}, "
-                f"but these files were modified: {stray}",
-            )
-        return CheckResult("scope", True, f"changed: {list(changed)}")
-
-    def check_syntax(self, changed: Sequence[str]) -> CheckResult:
-        problems = []
-        for relative in changed:
-            if not relative.endswith(".py"):
-                continue
-            text = self.repo.read(relative)
-            if text is None:
-                continue
-            try:
-                # parse() misses what only the compiler rejects -- a repeated
-                # keyword argument reached ruff before this check caught it.
-                compile(text, relative, "exec", dont_inherit=True)
-            except SyntaxError as exc:
-                problems.append(f"{relative}:{exc.lineno}: {exc.msg}")
-            except (ValueError, RecursionError) as exc:
-                problems.append(f"{relative}: {exc}")
-        if problems:
-            return CheckResult("syntax", False, "; ".join(problems))
-        return CheckResult("syntax", True, "parsed")
-
-    @staticmethod
-    def _definitions(relative: str, text: str) -> list[tuple[str, int, int, str]]:
-        """Definitions in any language this agent can find them in.
-
-        Python gets a real parser; everything else gets the brace-counter,
-        which is approximate. Callers must treat an empty list as "cannot
-        judge", never as "nothing is defined here".
-        """
-        try:
-            if relative.endswith(".py"):
-                return python_definitions(text)
-            if relative.endswith((".rb", ".rake")):
-                return ruby_definitions(text)
-            return generic_blocks(text)
-        except Exception:
+    def verdict(self) -> list:
+        if self.refusals >= WARDEN_REFUSALS_MAX:
+            self.stood_down = True
+            self.beacon.skipped("already sent the run back %d times"
+                                % self.refusals)
             return []
-
-    def check_single_method(self, changed: Sequence[str]) -> CheckResult:
-        """Enforce 'change only that method': everything else byte-identical.
-
-        This used to skip every file that was not Python, which meant it fired
-        on none of the 21 JavaScript, Go and Ruby tasks in the corpus -- all 21
-        of which state the rule, and every one of whose graders enforces it
-        with a source digest and a signature check. Those tasks ran with four
-        checks where a Python task runs eight.
-
-        The brace-counter that stands in for a parser outside Python is
-        approximate, so the rule here is asymmetric on purpose. Finding no
-        enclosing block is treated as "cannot judge" and passes, because an
-        arrow function or a wrapped signature the counter cannot see would
-        otherwise fail a correct patch. Text changing *outside* a block the
-        counter did find is a real violation and still fails.
-        """
-        for relative in changed:
-            original = self.repo.original(relative)
-            current = self.repo.read(relative)
-            if original is None or current is None:
-                continue
-            current_defs = self._definitions(relative, current)
-            python = relative.endswith(".py")
-            if not python and not current_defs:
-                continue                    # no definitions found: nothing to judge against
-
-            original_lines = original.splitlines(keepends=True)
-            current_lines = current.splitlines(keepends=True)
-            matcher = difflib.SequenceMatcher(None, original_lines, current_lines, autojunk=False)
-            edited = [op for op in matcher.get_opcodes() if op[0] != "equal"]
-            if not edited:
-                continue
-
-            first_line = min(op[3] for op in edited) + 1
-            last_line = max(op[4] for op in edited)
-            enclosing = [
-                (name, start, end) for name, start, end, kind in current_defs
-                if kind != "class" and start <= first_line and last_line <= end
-            ]
-            if not enclosing and not python:
-                # The finder outside Python is approximate, so "no enclosing
-                # definition" has two causes: the edit really is at top level,
-                # or it sits in a function the finder could not see (an arrow
-                # function, a wrapped signature). Indentation separates them.
-                # A require, an import block, an export list -- every top-level
-                # statement in these languages starts at column 0, and adding
-                # one is the most common way to fail these tasks. A line inside
-                # a function the finder missed is indented, and is left alone.
-                # Gated on the instruction actually forbidding new names. One
-                # task in the corpus permits imports outright -- "unchanged
-                # apart from imports it genuinely needs" -- and its reference
-                # solution adds two, so enforcing this everywhere would reject
-                # the correct answer. Only what the statement says is enforced.
-                if "names the file does not import" not in self.instruction.style_constraints:
-                    continue
-                top_level = [n for n in self._changed_lines(original, current)
-                             if n <= len(current_lines)
-                             and current_lines[n - 1].strip()
-                             and not current_lines[n - 1][:1].isspace()]
-                if not top_level:
-                    continue
-                return CheckResult(
-                    "single-method", False,
-                    f"{relative}: line {top_level[0]} is outside any function and was changed. "
-                    "The instruction bounds this change to one function, so imports, exports "
-                    "and every other top-level line must stay byte-identical -- build the fix "
-                    "from names the file already has.")
-            if not enclosing:
-                return CheckResult(
-                    "single-method", False,
-                    f"{relative}: edits at lines {first_line}-{last_line} fall outside a single "
-                    "function body; the instruction bounds the change to one method, so imports "
-                    "and every other line in the file must stay byte-identical",
-                )
-            name, start, end = min(enclosing, key=lambda item: item[2] - item[1])
-            if original_lines[: start - 1] != current_lines[: start - 1]:
-                return CheckResult("single-method", False,
-                                   f"{relative}: source above {name} changed")
-            before = next(((s0, e0) for n0, s0, e0, k0 in self._definitions(relative, original)
-                           if n0 == name and k0 != "class"), None)
-            if before and original_lines[before[1]:] != current_lines[end:]:
-                return CheckResult("single-method", False,
-                                   f"{relative}: source below {name} changed")
-        return CheckResult("single-method", True, "confined to one method")
-
-    # Constructs the instruction rules out inside the edited region.  Cheap to
-    # check here, expensive to discover from a checker's AST audit.
-    _STYLE_NODES: dict[str, tuple[type, ...]] = {
-        "loops": (ast.For, ast.AsyncFor, ast.While),
-        "comprehensions": (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
-        "lambdas": (ast.Lambda,),
-        "exception handling": (ast.Try,),
-        "context managers": (ast.With, ast.AsyncWith),
-    }
-
-    def check_style(self, changed: Sequence[str]) -> CheckResult:
-        forbidden: tuple[type, ...] = tuple(
-            node
-            for label in self.instruction.style_constraints
-            for node in self._STYLE_NODES.get(label, ())
-        )
-        problems: list[str] = []
-        for relative in changed:
-            if not relative.endswith(".py"):
-                continue
-            original = self.repo.original(relative) or ""
-            current = self.repo.read(relative) or ""
-            try:
-                tree = ast.parse(current)
-            except SyntaxError:
-                continue
-            edited = self._edited_line_range(original, current)
-            if edited is None:
-                continue
-            first, last = edited
-            for node in ast.walk(tree):
-                line = getattr(node, "lineno", None)
-                if line is None or not (first <= line <= last):
-                    continue
-                if forbidden and isinstance(node, forbidden):
-                    problems.append(f"{relative}:{line}: {type(node).__name__}")
-                if "raw SQL" in self.instruction.style_constraints and isinstance(node, ast.Name) \
-                        and node.id in {"RawSQL", "raw"}:
-                    problems.append(f"{relative}:{line}: raw SQL is ruled out for this change")
-                if "materialising rows in Python" in self.instruction.style_constraints \
-                        and isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
-                        and node.func.id in {"list", "tuple", "set", "sorted"}:
-                    problems.append(f"{relative}:{line}: {node.func.id}() pulls the rows into "
-                                    "Python; the instruction requires the work stay in the database")
-            if "names the file does not import" in self.instruction.style_constraints:
-                problems.extend(self._undefined_names(relative, tree, first, last))
-        if problems:
-            return CheckResult(
-                "style constraints", False,
-                "the instruction forbids "
-                f"{', '.join(self.instruction.style_constraints)} in the changed code, but found: "
-                + "; ".join(sorted(set(problems))[:10]),
-            )
-        return CheckResult("style constraints", True,
-                           f"none of {self.instruction.style_constraints} present")
-
-    @staticmethod
-    def _undefined_names(relative: str, tree: ast.AST, first: int, last: int) -> list[str]:
-        """Names the edited region uses that this file does not have.
-
-        "Use only names the file already imports" is stated in five of the six
-        netbox samples and was checked by nothing: a model reaching for `Cast`
-        or `Coalesce` that the file never imported produced a NameError at test
-        time, or an added import that then failed the single-method gate. F401
-        leads ERROR_HINTS for exactly this reason.
-
-        Deliberately conservative -- it reports a name only when every binding
-        site in the file has been ruled out, so a false positive would need the
-        name to be genuinely absent. Attributes, keywords and locals are not
-        names in this sense and are never reported.
-        """
-        bound: set[str] = set(dir(__builtins__) if isinstance(__builtins__, type(ast))
-                              else __builtins__) | {"self", "cls", "__name__"}
-        edited: list[ast.AST] = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                for alias in node.names:
-                    bound.add((alias.asname or alias.name).split(".")[0])
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                bound.add(node.name)
-                if first <= node.lineno <= last or node.lineno <= first <= (node.end_lineno or 0):
-                    args = node.args if not isinstance(node, ast.ClassDef) else None
-                    for arg in (args.posonlyargs + args.args + args.kwonlyargs if args else []):
-                        bound.add(arg.arg)
-                    for extra in ((args.vararg, args.kwarg) if args else ()):
-                        if extra:
-                            bound.add(extra.arg)
-            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-                bound.add(node.id)
-            elif isinstance(node, (ast.comprehension,)):
-                for target in ast.walk(node.target):
-                    if isinstance(target, ast.Name):
-                        bound.add(target.id)
-            elif isinstance(node, ast.ExceptHandler) and node.name:
-                bound.add(node.name)
-            if getattr(node, "lineno", None) is not None and first <= node.lineno <= last:
-                edited.append(node)
-
-        missing: list[str] = []
-        for node in edited:
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in bound:
-                message = (f"{relative}:{node.lineno}: `{node.id}` is not imported or defined in "
-                           "this file, and the instruction allows only names it already has")
-                if message not in missing:
-                    missing.append(message)
-        return missing
-
-    @staticmethod
-    def _changed_lines(original: str, current: str) -> list[int]:
-        """1-indexed lines of `current` that the edit introduced.
-
-        _edited_line_range spans first-to-last, which merges two separate edits
-        into one region covering every untouched line between them. One
-        reference solution adds an import near the top and rewrites a function
-        near the bottom; judged as a single span it appeared to have rewritten
-        the declarations in between, which it does not touch.
-        """
-        matcher = difflib.SequenceMatcher(
-            None, original.splitlines(keepends=True), current.splitlines(keepends=True),
-            autojunk=False)
-        return [n + 1 for tag, _, _, j1, j2 in matcher.get_opcodes() if tag != "equal"
-                for n in range(j1, j2)]
-
-    @staticmethod
-    def _edited_line_range(original: str, current: str) -> tuple[int, int] | None:
-        matcher = difflib.SequenceMatcher(
-            None, original.splitlines(keepends=True), current.splitlines(keepends=True), autojunk=False
-        )
-        edited = [op for op in matcher.get_opcodes() if op[0] != "equal"]
-        if not edited:
-            return None
-        return min(op[3] for op in edited) + 1, max(max(op[4] for op in edited), 1)
-
-    # The checker audits the edited method structurally, and any violation is a
-    # zero for the whole problem however correct the SQL is. These mirror the
-    # checks in the sample verify.py and are applied whenever the change is
-    # bounded to one method -- not only when the prose happens to mention them.
-    _DANGEROUS_NAMES = {"__import__", "breakpoint", "compile", "eval", "exec",
-                        "getattr", "globals", "locals", "open", "setattr", "vars"}
-    # Measured against the six sample tasks' own structural checks: everything
-    # they rule out beyond this tuple -- comprehensions, Try, With -- is already
-    # caught by check_style, because the instructions that carry those checks
-    # state the rule in prose and the parser reads it. `Raise` is the exception:
-    # four of six sample tasks reject it, no instruction mentions it, and neither
-    # gate looked for it. A pre-existing `raise` is not flagged, because
-    # _method_violations only reports what the edit introduced.
-    _FORBIDDEN_NODES = (ast.AsyncFunctionDef, ast.Await, ast.ClassDef, ast.Delete,
-                        ast.Global, ast.Lambda, ast.Match, ast.Nonlocal, ast.Raise,
-                        ast.While, ast.Yield, ast.YieldFrom)
-    # The strictest byte budget any sample task sets. Safe as a constant: the largest
-    # target method in the corpus is 1,560 bytes, so no reference solution comes
-    # near it.
-    _MAX_METHOD_BYTES = 4500
-    # Node budgets range from 240 to 400 and the agent cannot read which one
-    # applies -- task.toml never reaches this container. A flat 240 would be
-    # wrong: bulk-tag-assignment's `add` is already 224 nodes before any edit
-    # and its own limit is 400, so 240 would reject a winning patch over 16
-    # nodes of headroom. Such a budget has to accommodate the reference
-    # solution, which starts from the method as it stands, so the floor is
-    # taken from the original and the strictest budget applies only when the
-    # method is small enough for it to be plausible.
-    _MIN_METHOD_NODES = 240
-    _MAX_METHOD_NODES = 400
-    _NODE_HEADROOM = 100
-
-    @classmethod
-    def _node_budget(cls, original_nodes: int | None) -> int:
-        if original_nodes is None:
-            return cls._MAX_METHOD_NODES
-        return max(cls._MIN_METHOD_NODES,
-                   min(cls._MAX_METHOD_NODES, original_nodes + cls._NODE_HEADROOM))
-
-    def _method_violations(self, method: ast.FunctionDef) -> list[str]:
-        """Forbidden constructs in a method body, as position-independent keys.
-
-        Keys omit line numbers so the same construct in the original and the
-        edited method compares equal even after lines shift.
-        """
-        found: list[str] = []
-        for node in ast.walk(ast.Module(body=method.body, type_ignores=[])):
-            if isinstance(node, ast.FunctionDef) and node is not method:
-                found.append(f"nested function definition `{node.name}`")
-            elif isinstance(node, self._FORBIDDEN_NODES):
-                found.append(f"{type(node).__name__} is not allowed")
-            elif isinstance(node, ast.ImportFrom):
-                found.append(f"import inside the method: from {node.module} import "
-                             f"{', '.join(a.name for a in node.names)}")
-            elif isinstance(node, ast.Import):
-                found.append(f"import inside the method: import "
-                             f"{', '.join(a.name for a in node.names)}")
-            elif isinstance(node, ast.Name) and (node.id in self._DANGEROUS_NAMES or "__" in node.id):
-                found.append(f"forbidden name {node.id}")
-            elif isinstance(node, ast.Attribute) and "__" in node.attr:
-                found.append(f"forbidden attribute {node.attr}")
-        return found
-
-    @staticmethod
-    def _method_named(tree: ast.AST, name: str) -> ast.FunctionDef | None:
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == name:
-                return node
-        return None
-
-    def check_method_contract(self, changed: Sequence[str]) -> CheckResult:
-        problems: list[str] = []
-        for relative in changed:
-            if not relative.endswith(".py"):
-                continue
-            current = self.repo.read(relative) or ""
-            original = self.repo.original(relative) or ""
-            try:
-                tree = ast.parse(current)
-                original_tree = ast.parse(original)
-            except SyntaxError:
-                continue
-            edited = self._edited_line_range(original, current)
-            if edited is None:
-                continue
-            first, last = edited
-
-            enclosing = [n for n in ast.walk(tree)
-                         if isinstance(n, ast.FunctionDef)
-                         and n.lineno <= first and (n.end_lineno or n.lineno) >= last]
-            if not enclosing:
-                continue
-            method = min(enclosing, key=lambda n: (n.end_lineno or 0) - n.lineno)
-
-            body = "\n".join(current.splitlines()[method.lineno - 1 : method.end_lineno])
-            if len(body.encode()) > self._MAX_METHOD_BYTES:
-                problems.append(f"method is {len(body.encode())} bytes (limit {self._MAX_METHOD_BYTES})")
-            before_method = self._method_named(original_tree, method.name)
-            original_nodes = (len(list(ast.walk(ast.Module(body=before_method.body,
-                                                           type_ignores=[]))))
-                              if before_method else None)
-            budget = self._node_budget(original_nodes)
-            nodes = list(ast.walk(ast.Module(body=method.body, type_ignores=[])))
-            if len(nodes) > budget:
-                problems.append(f"method has {len(nodes)} AST nodes (limit {budget})")
-
-            # Only constructs the EDIT introduced count. A task accommodates
-            # what was already there (one task's verify.py skips the method's
-            # first statement precisely because it is a pre-existing local
-            # import); flagging pre-existing code sent a correct one-token fix
-            # into three repair rounds and shipped a worse patch.
-            inherited = set(self._method_violations(before_method)) if before_method else set()
-            for violation in self._method_violations(method):
-                if violation not in inherited:
-                    problems.append(f"{relative}: {violation}"
-                                    + (" -- use only names the file already imports"
-                                       if violation.startswith("import inside") else ""))
-        if problems:
-            return CheckResult(
-                "method contract", False,
-                "these break the structural constraints the task sets on the change, however "
-                "correct the query is: "
-                + "; ".join(sorted(set(problems))[:8]))
-        return CheckResult("method contract", True, "method body within the stated limits")
-
-    # A migration is bounded structurally rather than by the method contract
-    # above: `single_method` is false for these, so check_method_contract never
-    # runs and nothing else looked at the patch's shape at all -- on the tasks
-    # that constrain the change most tightly.
-    #
-    # The rule such tasks state is one thing, said many ways: a migration
-    # edit may change VALUES, never STRUCTURE. Same imports, same Migration class
-    # and base, same assignments, same dependencies, the same operations calling
-    # the same constructors with the same keywords. Only the literals inside may
-    # differ -- which for the cached-value task is exactly the index `fields`.
-    #
-    # Everything here is derived by diffing against the original file, so no
-    # task-specific name is hardcoded: whatever the migration was, that is what
-    # it must remain.
-    _MIGRATION_PATH = re.compile(r"(^|/)migrations/", re.IGNORECASE)
-
-    @classmethod
-    def _dotted(cls, node: ast.AST) -> str:
-        if isinstance(node, ast.Name):
-            return node.id
-        if isinstance(node, ast.Attribute):
-            return f"{cls._dotted(node.value)}.{node.attr}"
-        return type(node).__name__
-
-    @classmethod
-    def _call_shape(cls, node: ast.AST):
-        """A call with its literal values erased: what it calls, and with which
-        keywords, recursively. `models.Index(fields=[...], name='x')` and
-        `models.Index(fields=[...other...], name='y')` share a shape; renaming a
-        keyword or swapping the constructor does not."""
-        if not isinstance(node, ast.Call):
-            return None
-        keywords = tuple(sorted((keyword.arg, cls._call_shape(keyword.value))
-                                for keyword in node.keywords))
-        return (cls._dotted(node.func), len(node.args), keywords)
-
-    @classmethod
-    def _migration_shape(cls, text: str) -> dict:
-        tree = ast.parse(text)
-        shape: dict = {"statements": tuple(type(n).__name__ for n in tree.body)}
-        shape["imports"] = tuple(
-            ast.dump(n, include_attributes=False) for n in tree.body
-            if isinstance(n, (ast.Import, ast.ImportFrom)))
-        for node in tree.body:
-            if not isinstance(node, ast.ClassDef):
-                continue
-            shape["class"] = node.name
-            shape["bases"] = tuple(cls._dotted(b) for b in node.bases)
-            shape["body"] = tuple(type(n).__name__ for n in node.body)
-            for statement in node.body:
-                if not (isinstance(statement, ast.Assign) and len(statement.targets) == 1
-                        and isinstance(statement.targets[0], ast.Name)):
-                    continue
-                name = statement.targets[0].id
-                if name == "operations" and isinstance(statement.value, (ast.List, ast.Tuple)):
-                    shape["operations"] = tuple(cls._call_shape(e) for e in statement.value.elts)
-                elif name == "dependencies":
-                    # Values, not shape: a migration applied at a different point
-                    # in the graph is a different migration.
-                    try:
-                        shape["dependencies"] = repr(ast.literal_eval(statement.value))
-                    except (ValueError, SyntaxError):
-                        shape["dependencies"] = ast.dump(statement.value)
-                shape.setdefault("assigned", set()).add(name)
-        shape["assigned"] = tuple(sorted(shape.get("assigned", ())))
-        return shape
-
-    _MIGRATION_BYTE_HEADROOM = 600
-
-    def check_migration_contract(self, changed: Sequence[str]) -> CheckResult:
-        problems: list[str] = []
-        for relative in changed:
-            if not (relative.endswith(".py") and self._MIGRATION_PATH.search(relative)):
-                continue
-            original = self.repo.original(relative)
-            current = self.repo.read(relative)
-            if original is None or current is None:
-                continue
-            try:
-                before, after = self._migration_shape(original), self._migration_shape(current)
-            except SyntaxError:
-                continue                          # check_syntax owns that failure
-            for key in sorted(set(before) | set(after)):
-                if before.get(key) != after.get(key):
-                    problems.append(f"{relative}: the migration's {key} changed")
-            budget = max(1600, len(original.encode()) + self._MIGRATION_BYTE_HEADROOM)
-            if len(current.encode()) > budget:
-                problems.append(f"{relative}: {len(current.encode())} bytes exceeds the "
-                                f"bounded migration budget ({budget})")
-        if problems:
-            return CheckResult(
-                "migration contract", False,
-                "a migration may change the values inside its operations, not its structure. "
-                "These change its structure, however correct the index is: "
-                + "; ".join(sorted(set(problems))[:8]))
-        return CheckResult("migration contract", True, "structure preserved")
-
-    def check_lint(self, changed: Sequence[str]) -> list[CheckResult]:
-        python_files = [path for path in changed if path.endswith(".py")]
-        if not python_files or not shutil.which("ruff"):
+        if self.allowance.clock_left() < WARDEN_RELEASE_SEC:
+            self.stood_down = True
+            self.beacon.skipped("too little of the run left to act on a refusal")
             return []
-        result = run_command(["ruff", "check", "--no-cache", *python_files], timeout=120)
-        return [CheckResult(
-            "ruff", result.returncode == 0, truncate(result.stdout, 2000),
-        )]
+        # One walk of the tree serves all three gates.
+        changed = self.tree.changed_paths()
+        faults = (self.scope_faults(changed) or self.change_faults(changed)
+                  or self.check_faults(changed))
+        if faults:
+            self.refusals += 1
+            self.beacon.fired("refused hand-in #%d: %s"
+                              % (self.refusals, faults[0][:120]))
+        return faults
 
-    # -- measuring database work -----------------------------------------
-    # Optimisation is graded on the work the query performs, and the hidden
-    # tests measure query count with CaptureQueriesContext at two selection
-    # sizes. Passing a test suite says nothing about that, so measure it here:
-    # a fix that still scales with input is a zero we can detect ourselves.
-    # Three things this template gets right that the obvious version does not.
-    #
-    # It repoints the connection at the TEST database first. `manage.py shell`
-    # opens the default one, which in these projects has no tables at all --
-    # migrations are applied to the database Django builds for a test run. Every
-    # probe until now died on `relation "..." does not exist` and reported
-    # nothing, which is why an optimisation task could ship unmeasured. The
-    # task's own `manage.py test` runs before this and leaves that database in
-    # place, so by the time the probe runs it exists.
-    #
-    # And it measures inside a transaction, rolled back at the end. That is not
-    # only tidiness: a Django TestCase wraps each test in a transaction too, so
-    # the query count seen here is taken under the same conditions the task's
-    # own tests take theirs -- outside one, Django's per-statement transaction
-    # management would inflate the count. The rollback then leaves the database
-    # exactly as it was found.
-    #
-    # And it can fingerprint the result, so the same two runs answer the other
-    # half of the question. Fewer statements returning different rows is not an
-    # optimisation, and a test suite that passed before the edit is no evidence
-    # about the rewrite that replaced the code it was testing.
-    _DJANGO_PROBE = """
-import json, traceback
-from django.db import connection, transaction
-from django.test.utils import CaptureQueriesContext
+# =========================================================================
+# Shared loop helpers
+# =========================================================================
 
-_cfg = connection.settings_dict
-_cfg["NAME"] = (_cfg.get("TEST") or {{}}).get("NAME") or ("test_" + _cfg["NAME"])
-connection.close()
-
-def _fingerprint(value):
-    # Order-insensitive, because a filter rewrite is not required to preserve
-    # ordering and the task's own tests cover it when it is.
+def extract_tool_call(call: dict) -> tuple:
+    """Returns (name, args_dict, args_error). Never raises. Some endpoints
+    hand the arguments over already parsed; both shapes are accepted."""
+    function = call.get("function") or {}
+    name = str(function.get("name") or "")
+    written = function.get("arguments")
     try:
-        if hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
-            return sorted(repr(item) for item in value)
-    except Exception:
-        pass
-    return [repr(value)]
-
-counts = {{}}
-_fp = None
-try:
-    with transaction.atomic():
-{setup}
-        for _n in ({small}, {large}):
-            N = _n
-            with CaptureQueriesContext(connection) as _ctx:
-{call}
-            counts[_n] = len(_ctx)
-{result}
-        transaction.set_rollback(True)
-except Exception:
-    traceback.print_exc()
-else:
-    print("RIDGES_QC" + json.dumps(counts))
-    print("RIDGES_QS" + json.dumps([q["sql"] for q in _ctx.captured_queries[:6]]))
-    if _fp is not None:
-        print("RIDGES_QR" + json.dumps(_fp))
-"""
-
-    def _probe_run(self, manage: str, setup: str, call: str, result: str,
-                   small: int, large: int) -> tuple[dict[int, int] | None, list | None, str]:
-        """Run the probe script once.
-
-        Returns (counts, fingerprint, stdout). counts is None if the script died
-        or printed something we could not read; fingerprint is None unless the
-        model supplied a `result` expression to compare across the edit.
-        """
-        # The blocks are nested now, so each is indented to its own level and an
-        # empty setup still has to be a body.
-        script = self._DJANGO_PROBE.format(
-            setup="\n".join(f"        {line}" for line in setup.splitlines()) or "        pass",
-            call="\n".join(f"                {line}" for line in call.splitlines()),
-            result=f"        _fp = _fingerprint({result})" if result else "        pass",
-            small=small, large=large)
-        interpreter = app_python(self.repo.root)
-        run = run_command([interpreter, manage, "shell", "-c", script],
-                          timeout=min(300.0, max(60.0, remaining_seconds() - 200)))
-        stdout = run.stdout or ""
-        # A probe that says nothing at all is the one failure with no evidence
-        # in it. Every path through the script prints something -- the counts,
-        # or the traceback -- and run_command labels its own timeouts and
-        # exec failures, so silence means the process died without writing:
-        # killed by a signal, or a shell that never ran the code. Reporting
-        # only "the probe produced no query count" left a real run with
-        # nothing to diagnose from, so say what little there is to say.
-        if not stdout.strip():
-            stdout = (f"[the probe wrote nothing and exited {run.returncode}; "
-                      f"a negative status is a signal, and 127 or 126 means "
-                      f"{interpreter} could not run {manage}]")
-        fingerprint = None
-        found = re.search(r"RIDGES_QR(\[.*\])", stdout)
-        if found:
-            try:
-                # Sorted on the way in, so the comparison downstream can never
-                # fail a correct patch over the order two runs happened to
-                # produce. The script sorts too; this makes it independent of
-                # that, because a spurious failure here costs a repair round.
-                fingerprint = sorted(json.loads(found.group(1)))
-            except (json.JSONDecodeError, TypeError):
-                pass
-        match = re.search(r"RIDGES_QC(\{.*\})", stdout)
-        if not match:
-            return None, fingerprint, stdout
-        try:
-            counts = {int(k): int(v) for k, v in json.loads(match.group(1)).items()}
-        except (ValueError, json.JSONDecodeError):
-            return None, fingerprint, stdout
-        return counts, fingerprint, stdout
-
-    def _baseline_probe(self, manage: str, setup: str, call: str, result: str,
-                        small: int, large: int) -> tuple[dict[int, int], list | None] | None:
-        """The same probe, run against the code as it was before the edit.
-
-        A count on its own does not say much: three queries may be two too many
-        or one fewer than the code started with. Taking the same measurement
-        either side of the change turns the check into a delta, which is what
-        an optimisation task is actually graded on -- and it makes a rewrite
-        that reshuffles the code without reducing the work visible at once. The
-        same two runs also answer the other half of the question for free: did
-        the faster version still return what the slower one returned?
-
-        The sequence is revert, probe, put back. That is safe here because the
-        edit is on disk and read back first, and because the probe only reads:
-        it runs inside a transaction that is rolled back. Restoring is done in
-        a finally, so a probe that times out cannot cost us the patch.
-
-        `result` is part of the cache key, not just the script. A model that
-        answers a spurious mismatch by supplying a better expression must get a
-        fresh baseline; comparing the new expression against a fingerprint
-        taken with the old one would compare two different things.
-        """
-        signature = hashlib.sha1(
-            f"{setup}\x00{call}\x00{result}\x00{small}\x00{large}".encode()).hexdigest()
-        if signature in self._baselines:
-            return self._baselines[signature]
-        # Two shell runs plus the repair round that reads their result; below
-        # that the delta is a luxury and the time belongs to the fix.
-        if remaining_seconds() < 420:
-            return None
-        ran, measured = self._with_original_source(
-            lambda: self._probe_run(manage, setup, call, result, small, large))
-        if not ran:
-            return None
-        # Remember the attempt even if it failed, so a baseline that cannot be
-        # taken is not re-taken on every subsequent round.
-        self._baselines[signature] = None
-        counts, fingerprint, _ = measured
-        if counts is None:
-            return None
-        self._baselines[signature] = (counts, fingerprint)
-        return self._baselines[signature]
-
-    def _with_original_source(self, action):
-        """Run `action()` against the code as it was before the edit.
-
-        Revert, act, put the edit back. Safe because the edit is read off disk
-        first and because everything measured this way only reads. Restoring
-        happens in a `finally`, so an action that times out or raises cannot
-        cost us the patch.
-
-        Returns `(False, None)` when there is nothing to revert or the edit
-        could not be read back -- never a partial restore. The caller has to
-        distinguish that from an action that ran and produced nothing, because
-        only the second is worth remembering as attempted.
-        """
-        edited: dict[str, str | None] = {}
-        for relative in self.repo.changed_files():
-            path = self.repo.root / relative
-            try:
-                edited[relative] = read_source(path) if path.exists() else None
-            except (OSError, UnicodeDecodeError):
-                return False, None   # cannot put it back, so do not take it away
-        if not edited:
-            return False, None
-        try:
-            self.repo.revert_all()
-            value = action()
-        finally:
-            for relative, text in edited.items():
-                try:
-                    if text is None:
-                        (self.repo.root / relative).unlink(missing_ok=True)
-                        self.repo.forget(relative)
-                    else:
-                        self.repo.write(relative, text)
-                except OSError as exc:
-                    log(f"WARNING: could not restore {relative} after measuring the "
-                        f"original ({exc}); the patch may be incomplete")
-        return True, value
-
-    def measure_query_scaling(self, probe: dict) -> CheckResult | None:
-        """Measure the database work this change performs, on either engine.
-
-        The two engines are graded on different numbers and expose them in
-        different places, so there are two measurements rather than one with
-        branches inside it. Both answer the same question and both report under
-        the same check name, because `solve` treats a failure here as evidence
-        the fix is wrong -- worth a repair round and a change of model family --
-        and that is true whichever engine produced it.
-        """
-        return self._measure_django_queries(probe) or self._measure_clickhouse_work(probe)
-
-    def _measure_django_queries(self, probe: dict) -> CheckResult | None:
-        """Run the model's probe at two sizes and compare query counts."""
-        setup = (probe.get("setup") or "").strip()
-        call = (probe.get("call") or "").strip()
-        result_expr = " ".join((probe.get("result") or "").split())
-        if not call:
-            return None
-        manage = next((p for p in self.repo.files
-                       if Path(p).name == "manage.py" and p.count("/") <= 2), None)
-        if not manage:
-            return None
-        try:
-            small = int(probe.get("small") or 1)
-            large = int(probe.get("large") or 10)
-        except (TypeError, ValueError):
-            small, large = 1, 10
-
-        counts, fingerprint, stdout = self._probe_run(
-            manage, setup, call, result_expr, small, large)
-        if counts is None:
-            return CheckResult("query scaling", True,
-                               self._probe_failed(stdout), verified=False)
-
-        trace("measure_query_scaling", "out", counts=counts,
-              limit=self.instruction.targets.get("max_queries"))
-        low, high = counts.get(small), counts.get(large)
-        if low is None or high is None:
-            return CheckResult("query scaling", True, f"incomplete measurement: {counts}",
-                               verified=False)
-        # A probe whose call selected nothing counted a path the task does not
-        # take. Measured: a probe matching no rows made the guard at the top of
-        # the method return early, so it issued three statements where the real
-        # selection issues four -- under the stated limit of three, reported as
-        # bounded, and the run stopped at 43% of its budget on a patch that
-        # fails. Two empty results also compare equal, so the differential
-        # below would have confirmed "unchanged" on nothing at all.
-        if fingerprint is not None and not fingerprint:
-            return CheckResult(
-                "query scaling", True,
-                f"the probe ran but `result` came back empty, so `call` selected no rows. The "
-                f"counts it produced ({low} at N={small}, {high} at N={large}) are of a "
-                f"short-circuit path, not the one the task exercises, and two empty results "
-                f"prove nothing about whether the rows still match. Build fixtures in `setup` "
-                f"that the code actually selects, exercise it the way the task's own tests do "
-                f"-- through the same entry point, with the same kind of argument -- and make "
-                f"sure `result` comes back non-empty.", verified=False)
-
-        # Now the same measurement on the code we started from.
-        baseline = self._baseline_probe(manage, setup, call, result_expr, small, large)
-        base, base_fp = baseline if baseline else (None, None)
-        base_low = base.get(small) if base else None
-        base_high = base.get(large) if base else None
-        before = (f" Before the edit the same probe issued {base_low} at N={small} and "
-                  f"{base_high} at N={large}." if base_high is not None else "")
-
-        limit = self.instruction.targets.get("max_queries")
-        failure = None
-        if limit and high > limit:
-            failure = (f"the instruction allows at most {limit} queries; measured {low} at "
-                       f"N={small} and {high} at N={large}.")
-        # Bounded means the count does not grow with the selection. Allow one
-        # extra statement for a larger IN list or an added round trip.
-        elif high > low + 1:
-            failure = (f"query count still grows with input: {low} queries at N={small}, "
-                       f"{high} at N={large}. The work must be bounded -- fold the per-item "
-                       f"statements into one set-based query.")
-        # A task whose subject is how much work the change does, where the
-        # change does more of it, is wrong however well it scales. Only a
-        # strict increase: a fix that legitimately costs one more statement on
-        # a task that never asked for fewer must not be failed for it.
-        elif base_high is not None and high > base_high and self.instruction.bounded_work:
-            failure = (f"this change increased the database work it was meant to reduce: "
-                       f"{base_high} queries at N={large} before it, {high} after.")
-        # Fewer statements returning different rows is not an optimisation.
-        # Last, deliberately: the counts above are certain, this comparison
-        # depends on an expression the model wrote, so it must never displace
-        # feedback that does not.
-        elif base_fp is not None and fingerprint is not None and base_fp != fingerprint:
-            failure = self._differential_failure(base_fp, fingerprint)
-        if failure:
-            return CheckResult("query scaling", False,
-                               failure + before + self._explain_captured(stdout))
-        if base_high is not None:
-            detail = (f"bounded: {base_high} -> {high} queries at N={large}, "
-                      f"{base_low} -> {low} at N={small}")
-        else:
-            detail = f"bounded: {low} queries at N={small}, {high} at N={large}"
-        if base_fp is not None and fingerprint is not None:
-            detail += f"; `result` unchanged ({len(fingerprint)} item(s))"
-        return CheckResult("query scaling", True, detail + (f" (limit {limit})" if limit else ""))
-
-    _EXCEPTION = re.compile(r"^(?:[\w.]+(?:Error|Exception|Warning)|\w+Error)\b.*$", re.MULTILINE)
-
-    @classmethod
-    def _probe_failed(cls, stdout: str) -> str:
-        """Why nothing was measured, phrased as something the model can fix.
-
-        This used to open with "the probe produced no query count" and then
-        paste the output -- which reads as "the harness could not run your
-        probe" when what actually happened is that the probe itself raised.
-        Measured on three runs of one task: the model was told the number was
-        missing, was asked for a probe it had already supplied, and sent the
-        same broken one back. The exception was in the text the whole time,
-        under a 2,000-character traceback whose middle gets elided.
-
-        So lead with the exception line and name the field the model has to
-        correct. The traceback still follows for anyone who needs it.
-        """
-        raised = cls._EXCEPTION.findall(stdout or "")
-        if raised:
-            return ("the `measure` probe itself raised, so the database work this change "
-                    "performs was never measured -- this says nothing about whether the edit "
-                    f"is right. Fix the probe, not the patch:\n\n    {truncate(raised[-1], 600)}"
-                    "\n\nCheck that `call` passes arguments the code actually accepts: a field "
-                    "name must be one the model defines, and a filterset method takes the "
-                    "field it filters on, not its own parameter name. Reply with the same "
-                    "edit and a corrected `measure`.\n\nFull output:\n"
-                    + truncate(stdout, 1500))
-        return (f"the probe produced no query count, so the database work this change performs "
-                f"is unmeasured. Output was:\n{truncate(stdout, 2000)}")
-
-    @staticmethod
-    def _differential_failure(before: list, after: list) -> str:
-        """Say what the two `result` values disagree about, not just that they do.
-
-        A whole-list diff of a hundred rows tells the model nothing it can act
-        on, so show the rows that appear on only one side. And name the benign
-        cause explicitly: the two runs are separate transactions, so a database
-        sequence does not rewind between them, and an expression built out of
-        auto-assigned ids differs even when the rows are identical. The model
-        can answer that by narrowing `result`, which re-baselines.
-        """
-        gone = [item for item in before if item not in after][:5]
-        added = [item for item in after if item not in before][:5]
-        detail = (f"`result` changed: the code before this edit produced {len(before)} item(s), "
-                  f"this version produces {len(after)}. Reducing the query count is only "
-                  f"correct if the rows come back the same.")
-        if gone:
-            detail += "\n  only before: " + truncate(", ".join(gone), 400)
-        if added:
-            detail += "\n  only after:  " + truncate(", ".join(added), 400)
-        detail += ("\n  If the values differ only by database ids, that is this measurement's "
-                   "own artefact -- the two runs are separate transactions and the id sequence "
-                   "does not rewind. Supply a `result` expression that does not depend on ids.")
-        return detail
-
-    # -- measuring database work on ClickHouse ---------------------------
-    # ClickHouse is graded on the data a query reads, not on how many
-    # statements it issues, and its hidden tests read exactly that out of
-    # system.query_log: statements, read_rows and result_rows for the queries
-    # the application issued. There is no CaptureQueriesContext to borrow and
-    # the application need not be Python at all -- every ClickHouse app in the
-    # corpus is Node -- so the measurement is taken from the server side,
-    # around a shell command that exercises the change once.
-    #
-    # Two details this gets right that the obvious version does not.
-    #
-    # The watermark is read from the server (`now64(3)`), never from this
-    # container's clock. The two need not agree, and a skewed watermark either
-    # drops the queries being measured or picks up somebody else's.
-    #
-    # And it excludes this agent's own statements twice over. `SYSTEM FLUSH
-    # LOGS` is issued after the watermark and is itself logged, so without
-    # `NOT ILIKE 'SYSTEM %'` every measurement would count one statement that
-    # the application never made; the `system.` test then drops the summary
-    # query and anything else reading the server's own tables.
-    _CH_WORK = (
-        "SELECT count(), sum(read_rows), sum(result_rows) FROM system.query_log "
-        "WHERE type = 'QueryFinish' "
-        "AND event_time_microseconds >= toDateTime64('{marker}', 3) "
-        "AND query NOT ILIKE 'SYSTEM %' "
-        "AND positionCaseInsensitive(query, 'system.') = 0{user}")
-
-    def _clickhouse_ready(self) -> bool:
-        return bool(self.probe and self.probe.available()
-                    and self.probe.targets[0].engine == "clickhouse")
-
-    def _clickhouse_measure(self, command: str) -> tuple[dict | None, str]:
-        """Run the command once and read what ClickHouse did for it.
-
-        Returns (work, output). `work` carries statements, read_rows and
-        result_rows, or is None when the command failed or the log could not be
-        read -- in which case `output` says why, in words the model can act on.
-        """
-        marker = ((self.probe.sql("SELECT now64(3)") or "").strip().splitlines() or [""])[0].strip()
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?", marker):
-            return None, f"the server's clock could not be read: {truncate(marker, 200)}"
-        run = run_command(command, timeout=min(300.0, max(60.0, remaining_seconds() - 200)))
-        if run.returncode != 0:
-            return None, (f"the command exited {run.returncode}:\n"
-                          f"{truncate(run.stdout, 1500)}")
-        self.probe.sql("SYSTEM FLUSH LOGS")
-        user = self.probe.targets[0].user or ""
-        summary = self.probe.sql(self._CH_WORK.format(
-            marker=marker,
-            user=f" AND user = '{user}'" if re.fullmatch(r"[\w.$-]+", user) else ""))
-        first = ((summary or "").strip().splitlines() or [""])[0]
-        numbers = re.findall(r"\d+", first)
-        if len(numbers) < 3 or numbers[0] == "0":
-            return None, ("ClickHouse logged no queries for that command, so it may not have "
-                          "reached the database at all. The command's own output was:\n"
-                          + truncate(run.stdout, 1000))
-        work = dict(zip(("statements", "read_rows", "result_rows"),
-                        (int(value) for value in numbers[:3])))
-        trace("clickhouse_work", "out", command=command, **work)
-        return work, run.stdout or ""
-
-    def _clickhouse_baseline(self, command: str) -> tuple[dict, str] | None:
-        """The same command, run against the code as it was before the edit."""
-        signature = "clickhouse:" + hashlib.sha1(command.encode()).hexdigest()
-        if signature in self._baselines:
-            return self._baselines[signature]
-        if remaining_seconds() < 420:
-            return None
-        ran, measured = self._with_original_source(lambda: self._clickhouse_measure(command))
-        if not ran:
-            return None
-        self._baselines[signature] = None
-        work, output = measured
-        if work is None:
-            return None
-        self._baselines[signature] = (work, output)
-        return self._baselines[signature]
-
-    # Part merges move granule boundaries, so two runs of an unchanged query
-    # need not read byte-identical row counts. A tenth is far below any real
-    # regression and far above that noise.
-    _CH_NOISE = 1.1
-
-    def _measure_clickhouse_work(self, probe: dict) -> CheckResult | None:
-        """Compare the data ClickHouse reads either side of the change.
-
-        The failure this catches is the one the counts cannot: a rewrite whose
-        rows are right and whose reads went up is strictly worse than the code
-        it replaced, and a rewrite whose reads went down but whose rows changed
-        is not an optimisation at all. Neither needs the task classified, and
-        neither needs a budget this agent has no way to know -- both follow
-        from comparing the command against itself before the edit.
-        """
-        command = " ".join((probe.get("command") or "").split())
-        if not command or not self._clickhouse_ready():
-            return None
-        work, output = self._clickhouse_measure(command)
-        if work is None:
-            return CheckResult("query scaling", True,
-                               "the data this change reads was not measured, so the work it "
-                               "performs is unknown: " + output, verified=False)
-        # The same hole on this side: a command that prints nothing compares
-        # equal to itself before and after, and would confirm the rows are
-        # unchanged without ever having seen one.
-        if not self._flatten(output):
-            return CheckResult(
-                "query scaling", True,
-                f"the command ran and printed nothing, so there is no result to compare across "
-                f"the change and the {work['read_rows']:,} rows it read are of a path that "
-                f"returned no output. Exercise the change the way the task's own tests do and "
-                f"have the command print what it returns.", verified=False)
-
-        baseline = self._clickhouse_baseline(command)
-        before, before_output = baseline if baseline else (None, None)
-        if before is None:
-            return CheckResult("query scaling", True,
-                               f"{work['statements']} statement(s), {work['read_rows']:,} rows "
-                               f"read, {work['result_rows']:,} returned")
-
-        delta = (f"{before['read_rows']:,} -> {work['read_rows']:,} rows read, "
-                 f"{before['statements']} -> {work['statements']} statement(s), "
-                 f"{work['result_rows']:,} rows returned")
-        if self._flatten(before_output) != self._flatten(output):
-            return CheckResult("query scaling", False,
-                               self._output_changed(before_output, output) + f" ({delta})")
-        # Same answer, more work. No correctness argument can justify that, so
-        # this needs no view on what kind of task it is.
-        if work["read_rows"] > before["read_rows"] * self._CH_NOISE:
-            return CheckResult(
-                "query scaling", False,
-                f"this change returns exactly what the code it replaced returned, and reads "
-                f"more data to do it: {delta}. Read the plan of the new statement and find "
-                f"what it scans that the old one did not -- a missing PREWHERE, a predicate "
-                f"that no longer matches the primary key order, or a table it now reads whole.")
-        return CheckResult("query scaling", True, delta)
-
-    @staticmethod
-    def _flatten(text: str) -> str:
-        return " ".join((text or "").split())
-
-    @staticmethod
-    def _output_changed(before: str, after: str) -> str:
-        """What the command printed either side of the edit, when they differ."""
-        return (f"this change altered what the command returns. Reducing the work is only "
-                f"correct if the rows come back the same.\n  before: "
-                f"{truncate(Checker._flatten(before), 600)}\n  after:  "
-                f"{truncate(Checker._flatten(after), 600)}")
-
-    def unmeasured_bounded_work(self, supplied: dict) -> CheckResult | None:
-        """A bounded-work task with no probe is unmeasured, not finished.
-
-        measure_query_scaling returns None when the model supplied nothing to
-        run, so no check was appended and `clean` went true on a task whose
-        whole subject is how many statements the change issues. That is the same
-        hole as a probe that fails, reached by a different route -- and it is the
-        route that actually occurred: two of three runs on the device-filter task
-        supplied no probe at all, so the mechanism meant to catch them never had
-        anything to catch.
-
-        Silent when the project has no Django runner: there is no measurement to
-        ask for, and asking would spend a call on something the model cannot give.
-        """
-        supplied = supplied or {}
-        # On ClickHouse the unmeasured number is how much each statement reads,
-        # not how many are issued, and the guard has to ask for the thing that
-        # engine can actually be asked for.
-        if self._clickhouse_ready():
-            if supplied.get("command") or not self.instruction.reduces_work:
-                return None
-            return CheckResult(
-                "query scaling", True,
-                "this task asks the query to read less data, and no `measure` command was "
-                "supplied, so the amount it reads was never taken", verified=False)
-        if not self.instruction.bounded_work or supplied.get("call"):
-            return None
-        if not any(Path(p).name == "manage.py" and p.count("/") <= 2 for p in self.repo.files):
-            return None
-        return CheckResult(
-            "query scaling", True,
-            "this task is about the number of statements the change issues, and no `measure` "
-            "probe was supplied, so that number was never taken", verified=False)
-
-    def _explain_captured(self, stdout: str) -> str:
-        """The plan of the statements the probe captured, so a scaling failure
-        arrives with the evidence the model would otherwise have to ask for."""
-        match = re.search(r"RIDGES_QS(\[.*\])", stdout)
-        if not match or self.probe is None or not self.probe.available():
-            return ""
-        try:
-            statements = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            return ""
-        shown: list[str] = []
-        for sql in statements[:3]:
-            if is_read_only_sql(sql):
-                shown.append(f"$ EXPLAIN {truncate(sql, 300)}\n{truncate(self.probe.explain(sql), 1500)}")
-        return ("\n\nStatements issued at N=large, with their plans:\n" + "\n\n".join(shown)) if shown else ""
-
-    # -- discovering tests when the instruction names none ---------------
-    def discovered_commands(self, changed: Sequence[str]) -> list[str]:
-        """Find the repository's own tests for the code we just changed.
-
-        An instruction may name its checks in a format we cannot parse, in
-        another language, or not at all. The repository always knows how to test
-        itself, so derive the command from the project layout instead of from
-        prose. Narrow to the package containing the edit: running everything is
-        usually too slow for the agent's time budget.
-        """
-        root = self.repo.root
-        for relative in changed:
-            path = Path(relative)
-            parts = path.parts
-
-            # Django: <...>/<app>/<module>.py next to a manage.py
-            manage = next((p for p in self.repo.files
-                           if Path(p).name == "manage.py" and p.count("/") <= 2), None)
-            if manage and path.suffix == ".py":
-                app = next((parts[i] for i in range(len(parts) - 2, -1, -1)
-                            if (root / Path(*parts[: i + 1]) / "tests").is_dir()
-                            or (root / Path(*parts[: i + 1]) / "tests.py").is_file()), None)
-                if app:
-                    return [f"{app_python(root)} {manage} test {app} --keepdb --noinput"]
-
-            # pytest: the nearest tests/ directory above the changed file
-            if path.suffix == ".py":
-                for i in range(len(parts) - 1, 0, -1):
-                    candidate = root / Path(*parts[:i]) / "tests"
-                    if candidate.is_dir():
-                        return [f"{app_python(root)} -m pytest {candidate.relative_to(root)} -x -q"]
-
-            # Go / Rust / Ruby, by the package or crate holding the change
-            if path.suffix == ".go":
-                return [f"go test ./{path.parent.as_posix()}/..."]
-            if path.suffix == ".rs":
-                return ["cargo test"]
-            if path.suffix == ".rb":
-                return ["bundle exec rspec"]
-            if path.suffix in (".ex", ".exs") and (root / "mix.exs").is_file():
-                return ["mix test"]
-            # JavaScript / TypeScript: whatever the project's own test script is
-            if path.suffix in (".js", ".ts", ".tsx", ".jsx") and (root / "package.json").is_file():
-                try:
-                    scripts = json.loads((root / "package.json").read_text()).get("scripts", {})
-                except (OSError, json.JSONDecodeError):
-                    scripts = {}
-                if "test" in scripts:
-                    return ["npm test --silent"]
-                return ["node --test"]
-            if path.suffix in (".java", ".kt"):
-                if (root / "pom.xml").is_file():
-                    return ["mvn -q test"]
-                if (root / "build.gradle").is_file() or (root / "build.gradle.kts").is_file():
-                    return ["gradle test -q"]
-            if path.suffix == ".php" and (root / "vendor/bin/phpunit").exists():
-                return ["vendor/bin/phpunit"]
-            if path.suffix == ".cs":
-                return ["dotnet test"]
-        return []
-
-    # -- the task's own commands ----------------------------------------
-    def selected_commands(self) -> list[str]:
-        commands = []
-        for command in self.instruction.commands:
-            if command.startswith("ruff "):
-                continue  # already covered, and cheaper, in check_lint
-            commands.append(command)
-        return commands
-
-    def run_task_commands(self) -> list[CheckResult]:
-        results: list[CheckResult] = []
-        for command in self.selected_commands():
-            if remaining_seconds() < 180:
-                results.append(CheckResult(f"$ {command}", True, "skipped: out of time",
-                                           verified=False))
-                continue
-            log(f"running task check: {command}")
-            result = run_command(command, timeout=min(600.0, max(60.0, remaining_seconds() - 120)))
-            passed = result.returncode == 0
-            results.append(CheckResult(f"$ {command}", passed, truncate(result.stdout, 6000, head_ratio=0.25)))
-            if not passed:
-                break  # the first failure is the one worth reporting
-        return results
-
-
-def _traced(check: CheckResult) -> CheckResult:
-    """A gate's verdict as it is produced, with the detail it would have to
-    explain to the model. Aggregated pass/fail hides which rule fired."""
-    trace("gate", "out", name=check.name, passed=check.passed,
-          detail="" if check.passed else check.detail)
-    return check
-
-
-def summarise(checks: Sequence[CheckResult]) -> str:
-    lines = []
-    for check in checks:
-        state = "FAIL" if not check.passed else ("PASS" if check.verified else "UNMEASURED")
-        lines.append(f"[{state}] {check.name}")
-        if (not check.passed or not check.verified) and check.detail:
-            lines.append(truncate(check.detail, 5000, head_ratio=0.3))
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Prompting
-# ---------------------------------------------------------------------------
-
-# The four elements a prompt is built from (promptingguide.ai/introduction/elements)
-# map onto this agent's turns as:
-#
-#   instruction       DIRECTIVE, below -- the procedure, stated once, up front
-#   context           what this agent found: verified database URL, ranked shortlist
-#   input data        the task statement verbatim, the source slices, the live schema
-#   output indicator  EDIT_PROTOCOL, last -- the exact shape of the reply
-#
-# Three rules from that guide shape the wording throughout, and each is easy to
-# undo by accident:
-#
-#   * Instructions go first and lead with a command verb. The task statement is
-#     input data, not the instruction: it says what is wrong with the
-#     application, never what to do with this prompt.
-#   * State what to do, not what to avoid. Prohibitions are reported to measure
-#     against ("DO NOT ASK FOR INTERESTS" backfires); the desired behaviour and
-#     its fallback are what actually steer the reply.
-#   * Replace vague limits with exact ones -- "keep it short" becomes a
-#     sentence count -- because a limit the model cannot measure is not a limit.
-
-SYSTEM_PROMPT = """\
-You are a database query engineer. You fix, author, and optimise the queries a \
-real application issues against PostgreSQL or ClickHouse, working inside the \
-application's own repository: raw SQL, ORM code, or query-builder code.
-
-How you work:
-
-* Edit production query code, and write the fix so it holds for data you have \
-not seen. Implement the general rule the task states, in terms of the columns \
-and relations it names, rather than anything that happens to suit the rows in \
-front of you.
-* Reduce the database work the query performs -- statements issued, rows and \
-buffers touched, index usage. Remove work the query genuinely does not need, \
-rather than moving it somewhere less visible.
-* Keep everything outside the blast radius the instruction sets byte-identical, \
-imports included, and build the fix from names already in scope.
-* Make the smallest change that fixes the underlying cause.
-
-Reasoning you should apply, by symptom:
-
-* Work that grows with input size -- a statement per element, per row, or per \
-iteration -- becomes one set-based statement: a single bulk insert/update, one \
-`IN`/`ANY` predicate, a join, or a CTE. Compute the set difference in the \
-database, and keep any signal/callback contract firing exactly once with the \
-same payload.
-* A slow or unselective plan usually means the predicate the application \
-actually issues is not the one the index serves. Match index column order and \
-partiality to the real predicate, including equality columns first.
-* Wrong aggregates over a hierarchy or a many-to-many usually mean fan-out: \
-rows multiplied by a join. Fix it with DISTINCT on the counted key, a \
-subquery/lateral, or a nested-set/recursive descendant predicate, keeping the \
-correction in the database rather than in application code.
-* Percentages and ratios should be computed in the database with explicit \
-numeric casting and a zero-denominator guard.
-* On ClickHouse, favour the primary key order and PREWHERE, prefer set-based \
-expressions over per-row subqueries, and remember that JOIN semantics and \
-nullability differ from PostgreSQL. An `explain` request there also returns \
-read_rows, read_bytes, selected parts and marks -- the amount of data the query \
-actually touched, so check it fell. Build a series with numbers(N) or \
-arrayJoin(range(...)) rather than by selecting from system.numbers: a report \
-should not depend on the server's own introspection tables.
-
-You answer only with a single JSON object, described in the user message."""
-
-# The instruction element: first in the user turn, one command verb per step.
-# The statement that follows it is input data -- it describes a defect in an
-# application and knows nothing about this protocol -- so the procedure has to
-# be stated here or it is not stated at all. Before this existed the only
-# directive in the prompt was EDIT_PROTOCOL, which the model reached some
-# fifteen thousand characters after the material it governs.
-DIRECTIVE = """\
-# Instructions
-
-Diagnose the database defect described in the task statement below, then reply \
-with one JSON object in the format given at the end of this message.
-
-Work in this order:
-
-1. Read the task statement. It is the authority on what to change, which files \
-you may edit, and which checks to run.
-2. Locate the code that issues the query in question, using the source \
-provided below.
-3. Name the database-level cause in at most two sentences.
-4. Write the smallest edit that fixes that cause.
-5. Reply with the JSON object.
-
-When the statement does not name the file to edit and the provided source does \
-not settle which file issues the query, reply with the `need_context` object \
-and request what would settle it. Request context whenever you are unsure \
-rather than editing a file you have not read."""
-
-EDIT_PROTOCOL = """\
-Reply with ONE JSON object and nothing else. Begin the reply with `{` and end \
-it with `}`. Two shapes are allowed.
-
-To gather more evidence before deciding (the agent tells you how many rounds remain; \
-an unnamed target allows more than a named one, and each failed attempt grants another):
-
-{"action": "need_context",
- "why": "<one sentence>",
- "requests": [
-   {"kind": "read_file", "path": "<repo-relative path>", "start": 1, "end": 200},
-   {"kind": "grep", "pattern": "<python regex>", "path_filter": "<optional substring>"},
-   {"kind": "sql", "query": "<read-only statement to run against the live database>"},
-   {"kind": "explain", "query": "<SELECT ... to EXPLAIN on the live database>"},
-   {"kind": "read_file", "path": "<repo-relative path>", "symbol": "<def or class name: returns that definition whole>"},
-   {"kind": "schema", "tables": ["<table name>", "..."]},
-   {"kind": "callers", "symbol": "<function or class name: who defines and who references it>"},
-   {"kind": "count", "setup": "<Django shell setup>", "call": "<one line using N>", "small": 1, "large": 10}
- ]}
-`count` measures the query count at two sizes BEFORE you edit -- use it on \
-bounded-work tasks so you know the number you are trying to change.
-
-To make the change:
-
-{"action": "edit",
- "diagnosis": "<the database-level cause, one or two sentences>",
- "verify": ["<any shell command the instruction says to run before finishing, copied verbatim; [] if it names none>"],
- "constraints": {"editable_files": ["<repo-relative paths the instruction allows you to change>"],
-                 "bounded_to_method": "<Class.method the instruction restricts the change to, or null>"},
- "edits": [
-   {"path": "<repo-relative path>",
-    "search": "<exact contiguous text from the current file, unique within it>",
-    "replace": "<replacement text>"}
- ]}
-
-A complete `edit` reply, to copy the shape of:
-
-{"action": "edit",
- "diagnosis": "share_pct divides two integer columns, so the fraction is truncated before Round() runs.",
- "verify": ["python manage.py test shop.tests.test_reports --keepdb --noinput"],
- "constraints": {"editable_files": ["shop/reports/querysets.py"],
-                 "bounded_to_method": "OrderQuerySet.annotate_share"},
- "edits": [
-   {"path": "shop/reports/querysets.py",
-    "search": "        return self.annotate(\\n            share_pct=Round(F('paid') * 100 / F('total'), 2),",
-    "replace": "        return self.annotate(\\n            share_pct=Round(F('paid') * 100.0 / F('total'), 2),"}
- ]}
-
-Rules for edits:
-* `search` must reproduce the existing file byte for byte, including \
-indentation. Include 2 to 5 surrounding lines, enough to appear exactly once in \
-the file.
-* Give the smallest `search`/`replace` pair that expresses the change -- one \
-edit per distinct change, each covering the lines that change plus that much \
-context.
-* Change only what the fix requires. Leave docstrings, comments, formatting, \
-blank lines and import order exactly as they are unless the task asks for them \
-to change -- an unnecessary edit is a way to fail a scope check, never a way to \
-pass one.
-* Keep `diagnosis` to at most 2 sentences and the whole reply under 2000 \
-characters unless the edit itself is longer. Reason as far as naming the cause \
-and writing the edit; deliberation past that point is billed and is not read.
-* `constraints` is read only when the instruction named no file and no method: \
-state what it DOES allow, exactly as written. The agent enforces it against your \
-own edits, so claim only what the instruction grants.
-* After a failed attempt you may request context again -- the failure output \
-usually points at something worth reading before the next edit.
-* `verify` matters: those commands are run against the live database and their \
-output comes back to you if they fail. Copy every check the instruction names, \
-wherever it states them -- fenced block, inline text, or prose.
-* When the task is about work that must not grow with input size, add a probe \
-so the agent can measure it before submitting:
-    "measure": {"setup": "<imports and fixture creation, Django shell>",
-                "call": "<one line exercising the change, using N as the size>",
-                "result": "<expression the change must NOT alter, e.g. \
-sorted(x.name for x in qs)>",
-                "small": 1, "large": 10}
-  Use `N` as the selection size in `call`. The agent runs it at both sizes, on \
-your edit and again on the code it replaced, and reports both counts. If they \
-grow with N the fix is not bounded; if they did not drop, the rewrite moved \
-code without removing work.
-  `result` is optional but worth supplying: it is evaluated after `call` on \
-both versions and compared, which is the only evidence that fewer statements \
-still return the same rows. Make it independent of database ids -- the two \
-runs are separate transactions, so ids do not repeat.
-  On ClickHouse, and in any project without a Django shell, give a shell \
-command instead:
-    "measure": {"command": "<one command that exercises the change and prints its result>"}
-  The agent runs it on your edit and again on the code it replaced, reads from \
-the server how many statements each version issued and how many rows each one \
-read, and compares what the command printed. Fewer rows read with the same \
-output is the improvement; more rows read with the same output is a \
-regression, and different output is a broken rewrite.
-* To create a new file instead, use {"path": ..., "new_file": true, \
-"content": "<full text>"}.
-* Escape newlines properly -- the whole reply must parse as JSON."""
-
-
-class PromptBuilder:
-    """Assembles the first user turn: instruction, findings, code, schema.
-
-    One method per section, and a section that has nothing to say returns "".
-    That shape is the point: what reaches the model is now enumerable, and the
-    reason each section exists can sit on the method that produces it.
-
-    The governing rule is that the instruction speaks for itself. It is printed
-    whole and first, and nothing below it restates a rule it already states --
-    measured on the six netbox samples, the old fact list restated nine things
-    the prose said, one of them less accurately than the prose said it. What
-    remains is what the statement cannot contain: what this agent found by
-    reading the repository and connecting to the database, and how to drive
-    machinery the statement knows nothing about.
-    """
-
-    def __init__(self, repo: Repository, instruction: Instruction,
-                 candidates: Sequence[tuple[str, list[int]]], probe: DatabaseProbe) -> None:
-        self.repo = repo
-        self.instruction = instruction
-        self.candidates = candidates
-        self.probe = probe
-        # Whether the statement pointed at a file. It decides how much of each
-        # candidate is worth showing and whether the shortlist needs explaining.
-        self.named_target = bool(instruction.edit_only or instruction.lint_paths)
-
-    # Characters per token, the divisor affordable_cap() prices calls with.
-    CHARS_PER_TOKEN = 3.5
-
-    # Between elements. Costs three tokens and removes the one ambiguity a
-    # heading cannot: whether a `#` line belongs to the task statement or to
-    # this agent.
-    SEPARATOR = "###"
-
-    def build(self) -> str:
-        trace("PromptBuilder", "in", candidates=[path for path, _ in self.candidates],
-              named_target=self.named_target, database=self.probe.available())
-        named = ("directive", "task statement", "what this agent found",
-                 "relevant source", "live schema")
-        sections = (DIRECTIVE, self._task_instruction(), self._agent_findings(),
-                    self._relevant_source(), self._live_schema())
-        # Sections are separated by a rule as well as a heading. A statement
-        # can contain any markdown it likes, fenced blocks and headings
-        # included, so a heading alone does not reliably mark where the
-        # statement stops and this agent's own findings start.
-        prompt = f"\n\n{self.SEPARATOR}\n\n".join(s for s in sections if s)
-        # Section by section, because "the prompt is too long" is never
-        # actionable until you know which part of it is long.
-        for label, section in zip(named, sections):
-            if section:
-                trace("PromptBuilder", "out", section=label, chars=len(section),
-                      tokens=int(len(section) / self.CHARS_PER_TOKEN),
-                      share=len(section) / max(1, len(prompt)))
-        trace("PromptBuilder", "out", section="TOTAL", chars=len(prompt),
-              tokens=int(len(prompt) / self.CHARS_PER_TOKEN))
-        return prompt
-
-    def _task_instruction(self) -> str:
-        """The statement, verbatim and unabridged. The model's authority.
-
-        Input data, not the instruction element: it describes a defect in an
-        application and says nothing about this prompt or the reply it wants.
-        The heading says so, because a statement that opens with its own `#
-        Repair ...` title otherwise reads as the top of the document.
-        """
-        return f"# Task statement (the authority on what to change)\n\n{self.instruction.text.strip()}"
-
-    def _agent_findings(self) -> str:
-        """Only what the statement cannot know.
-
-        Everything else -- the editable file, the bounded method, the
-        forbidden constructs -- is parsed to ENFORCE it, not to retell it.
-        """
-        facts: list[str] = []
-        if self.probe.available():
-            # Only a target that answered SELECT 1 survives discovery, so this
-            # URL is a connection this agent made, not a scraped guess.
-            facts.append(f"live database (this agent connected to it and it answered "
-                         f"SELECT 1): {target_url(self.probe.targets[0])}")
-        if not (self.instruction.edit_only or self.instruction.lint_paths
-                or self.instruction.named_paths):
-            # The one case where the statement is genuinely silent: it names no
-            # file, so the ranked shortlist below is the only guidance there is.
-            facts.append("the instruction names no file to edit: the candidates below are this "
-                         "agent's ranking, not the task's -- identify which one actually issues "
-                         "the query, and fill `constraints` with what the instruction does permit")
-        # Which probe to ask for is decided by the engine, not by the shape of
-        # the task. A ClickHouse task that happens to read as bounded_queries
-        # would otherwise be asked for a Django `call` it has no shell to run,
-        # and the ask would be unanswerable rather than merely unnecessary.
-        clickhouse = (self.probe.available()
-                      and self.probe.targets[0].engine == "clickhouse")
-        if not clickhouse and ("bounded_queries" in self.instruction.kinds
-                               or self.instruction.targets.get("max_queries")):
-            facts.append("supply a `measure` probe with your edit: this agent runs it at two "
-                         "selection sizes, before and after your change, and reports both counts "
-                         "back to you -- so a fix that still scales with input, or that does not "
-                         "actually issue fewer statements than the code it replaced, is caught "
-                         "before you finish")
-        elif clickhouse and self.instruction.reduces_work:
-            facts.append("supply `measure.command` with your edit -- one shell command that "
-                         "exercises the change and prints its result. This agent runs it on your "
-                         "edit and on the code it replaced, and reports how many rows ClickHouse "
-                         "read for each, so a rewrite that reads more than what it replaced, or "
-                         "returns something different, is caught before you finish")
-        # What this agent tried to read and could not. The model has the same
-        # statement in front of it and can simply be asked -- which is cheaper
-        # and far more reliable than the parser silently defaulting.
-        facts.extend(self.instruction.unparsed)
-        if self.instruction.targets.get("create_paths"):
-            facts.append(f"these paths named by the instruction do not exist yet: "
-                         f"{self.instruction.targets['create_paths']} -- create them with a "
-                         f"new_file edit")
-        if not facts:
-            return ""
-        return ("# What this agent found (not stated in the instruction)\n\n"
-                + "\n".join(f"- {fact}" for fact in facts))
-
-    def _imports_are_frozen(self) -> bool:
-        """Whether the instruction rules out reaching for anything not already
-        in scope.
-
-        package_map lists the target's sibling modules so the model can find
-        the class behind an object it was handed -- worth ~900 tokens when the
-        model may act on it. When the statement says to use only names the file
-        already imports and bounds the change to one method, it cannot: every
-        name in that list is unreachable, and the agent's own _undefined_names
-        gate would reject an edit that used one. Sending it is paying to offer
-        options the task forbids taking.
-        """
-        return (self.instruction.single_method
-                and "names the file does not import" in self.instruction.style_constraints)
-
-    def _budget_for(self, position: int, length: int) -> int:
-        """How many lines of this candidate are worth sending.
-
-        Context is the dominant cost of a run. When the statement names the
-        file, spend the budget there. When it does not, rank 1 is only a guess,
-        so budget by size instead: query code usually lives in compact
-        managers and querysets, and showing a short file whole costs less than
-        a slice of a long one.
-        """
-        if self.named_target:
-            return 320
-        if length <= 140:
-            return length + 10           # small enough to show entirely
-        return 160 if position == 0 else 40
-
-    def _relevant_source(self) -> str:
-        """The code itself, with an outline and the target's neighbours."""
-        blocks: list[str] = []
-        for position, (relative, hot) in enumerate(self.candidates):
-            length = len((self.repo.read(relative) or "").splitlines())
-            budget = self._budget_for(position, length)
-            outline = file_outline(self.repo, relative, limit=80 if self.named_target else 20)
-            if outline:
-                blocks.append(outline)
-                trace("file_outline", "out", rank=position + 1, path=relative, chars=len(outline))
-            if position == 0 and not self._imports_are_frozen():
-                neighbours = package_map(self.repo, relative)
-                if neighbours:
-                    blocks.append(neighbours)
-                    trace("package_map", "out", path=relative, chars=len(neighbours))
-            pieces = slice_around(self.repo, relative, hot or [], self.instruction,
-                                  budget_lines=budget)
-            kept = pieces if budget > 40 else pieces[:1]
-            for piece in kept:
-                blocks.append(piece.render(self.repo))
-            trace("slice_around", "out", rank=position + 1, path=relative, file_lines=length,
-                  budget=budget, slices=[f"{s.start}-{s.end} {s.label}" for s in kept],
-                  shown=sum(s.end - s.start + 1 for s in kept),
-                  chars=sum(len(b) for b in blocks[-len(kept):]) if kept else 0)
-        return f"{self._source_header()}\n\n" + "\n\n".join(blocks)
-
-    def _source_header(self) -> str:
-        header = "# Relevant source"
-        if self.instruction.traced_hint:
-            header += ("\n\nReference tracing from the task's vocabulary also reached these files, "
-                       "not shown below; request one with need_context if the candidates above "
-                       f"do not contain the query: {self.instruction.traced_hint}")
-        if not self.named_target and len(self.candidates) > 1:
-            header += (
-                "\n\nThe instruction does not name a file. These are the strongest candidates, "
-                "best first; identify which one actually issues the query in question -- request "
-                "more of it with need_context if the excerpt is not enough."
-            )
-        return header
-
-    def _live_schema(self) -> str:
-        """Columns and existing indexes, read from the database itself.
-
-        schema_for returns "" when the lookup failed, so a connection error is
-        never dressed up under this header.
-        """
-        schema = self.probe.schema_for(
-            _table_candidates(self.repo, self.instruction, self.candidates))
-        return ("# Live schema (columns and existing indexes)\n\n" + schema) if schema else ""
-
-
-def render_evidence(
-    repo: Repository,
-    instruction: Instruction,
-    candidates: Sequence[tuple[str, list[int]]],
-    probe: DatabaseProbe,
-) -> str:
-    """The first user turn. See PromptBuilder."""
-    return PromptBuilder(repo, instruction, candidates, probe).build()
-
-
-def _table_candidates(repo: Repository, instruction: Instruction,
-                      candidates: Sequence[tuple[str, list[int]]]) -> list[str]:
-    """Table-ish names to look up: from the instruction and from the code."""
-    names: list[str] = []
-    for relative, _ in candidates:
-        text = repo.read(relative) or ""
-        names.extend(re.findall(r"\bFROM\s+([A-Za-z_][\w.]*)", text, re.IGNORECASE))
-        names.extend(re.findall(r"\bJOIN\s+([A-Za-z_][\w.]*)", text, re.IGNORECASE))
-        names.extend(re.findall(r"\b(?:db_table|table_name)\s*=\s*['\"]([\w.]+)['\"]", text))
-    names.extend(instruction.identifiers)
-    ordered: list[str] = []
-    for name in names:
-        clean = name.split(".")[-1].strip('"')
-        if clean and clean not in ordered:
-            ordered.append(clean)
-    return ordered[:12]
-
-
-def extract_json(content: str) -> dict | None:
-    """Pull the first JSON object out of a model reply, fences or not."""
-    candidates: list[str] = []
-    fenced = re.findall(r"```(?:json)?\s*\n(.*?)```", content, re.DOTALL)
-    candidates.extend(fenced)
-    candidates.append(content)
-    for text in candidates:
-        text = text.strip()
-        start = text.find("{")
-        if start == -1:
+        args = written if isinstance(written, dict) else json.loads(written or "{}")
+        if not isinstance(args, dict):
+            raise ValueError("arguments were not an object")
+    except Exception as error:
+        return name, None, "could not read the arguments: %s" % error
+    return name, args, ""
+
+
+def dispatch(kit: Kit, name: str, args: dict) -> tuple:
+    """Run one tool. Returns (result_text, faulted_bool)."""
+    try:
+        result = kit.run(name, args)
+        return str(result), False
+    except Finished:
+        raise
+    except ToolFault as fault:
+        return "error: %s" % fault, True
+    except BaseException as error:
+        traceback.print_exc()
+        return "error: %s: %s" % (type(error).__name__, error), True
+
+
+def shrink_transcript(messages: list, cap: int, beacon: Beacon) -> bool:
+    """Blank the oldest bulky tool results so the transcript fits."""
+    total = sum(len(str(m.get("content") or "")) for m in messages)
+    if total <= cap:
+        return False
+    beacon.fired("transcript %dB over cap %dB" % (total, cap))
+    freed = 0
+    for message in messages[2: max(2, len(messages) - 12)]:
+        if message.get("role") != "tool":
             continue
-        depth = 0
-        in_string = False
-        escaped = False
-        for index in range(start, len(text)):
-            char = text[index]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    in_string = False
-                continue
-            if char == '"':
-                in_string = True
-            elif char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        payload = json.loads(text[start : index + 1])
-                        trace("extract_json", "out", ok=True, keys=sorted(payload)
-                              if isinstance(payload, dict) else None, reply_chars=len(content))
-                        return payload
-                    except json.JSONDecodeError:
-                        break
-    trace("extract_json", "out", ok=False, reply_chars=len(content),
-          head=content[:120])
-    return None
-
-
-_READ_ONLY_START = re.compile(
-    r"^\s*(?:\(\s*)*(SELECT|WITH|EXPLAIN|SHOW|DESCRIBE|DESC|TABLE|VALUES)\b", re.IGNORECASE)
-_MUTATING = re.compile(
-    r"\b(INSERT|UPDATE|DELETE|MERGE|UPSERT|REPLACE|CREATE|ALTER|DROP|TRUNCATE|RENAME|GRANT|REVOKE"
-    r"|COPY|VACUUM|ANALYZE\s+\w|REINDEX|CLUSTER|LOCK|SET\s+(?!TRANSACTION)|RESET|DO|CALL|EXECUTE"
-    # `SYSTEM` must not match the `system.` database. ClickHouse keeps its
-    # introspection there -- system.tables, system.parts, system.query_log --
-    # which is exactly where a ClickHouse engineer looks and exactly what this
-    # agent measures work with, and reading it mutates nothing. Without the
-    # lookahead the word boundary lands on the dot and every one of those
-    # SELECTs was refused, while PostgreSQL's pg_indexes and information_schema
-    # were readable throughout. The `SYSTEM ...` command itself is still denied:
-    # it is followed by a verb, not a dot.
-    r"|OPTIMIZE|ATTACH|DETACH|KILL|SYSTEM\b(?!\s*\.)|INTO\s+OUTFILE"
-    r"|pg_terminate|pg_cancel|lo_)\b",
-    re.IGNORECASE)
-
-
-def is_read_only_sql(query: str) -> bool:
-    """Only statements that cannot change data or schema may run during investigation.
-
-    An allowlist on the leading keyword, plus a denylist for anything mutating
-    smuggled inside (a CTE with a data-modifying statement, SELECT ... INTO,
-    a semicolon-separated second statement). The database is disposable, but a
-    write here would corrupt the agent's own subsequent test run.
-    """
-    body = re.sub(r"--[^\n]*|/\*.*?\*/", " ", query, flags=re.DOTALL).strip()
-    if not body or ";" in body.rstrip(";"):
+        body = str(message.get("content") or "")
+        if len(body) <= 400:
+            continue
+        message["content"] = ("[%d characters of earlier tool output dropped "
+                              "to fit the context]" % len(body))
+        freed += len(body)
+        total -= len(body)
+        if total <= cap * 0.7:
+            break
+    if not freed:
+        beacon.skipped("nothing bulky enough to drop")
         return False
-    if not _READ_ONLY_START.match(body):
-        return False
-    # SHOW / DESCRIBE never mutate, and "SHOW CREATE TABLE" would otherwise trip
-    # the CREATE check below.
-    if re.match(r"^\s*(SHOW|DESCRIBE|DESC)\b", body, re.IGNORECASE):
-        return True
-    return not _MUTATING.search(body)
+    say("[TRIM] freed %dB, transcript now ~%dB" % (freed, total))
+    return True
 
 
-def _request_key(kind: str, request: dict) -> str:
-    fields = {k: v for k, v in request.items() if k != "kind"}
-    return kind + ":" + json.dumps(fields, sort_keys=True, default=str)
+# =========================================================================
+# Stage 1: the Locator
+# =========================================================================
+
+LOCATOR_BRIEF = """You are locating, not editing. You can read the code in front of you but you cannot change it. A separate planner will take your target list and decide how to solve the task; the driver after that will make the edit. Your job is to hand them the right file.
+
+The instruction is below. Its goal is the thing to change; its constraints are the bounds on what may change. Neither is a filename.
+
+HOW TO FIND THE TARGET
+
+The code sits in the working directory and holds tens of thousands of files. You cannot read them all. For every distinctive term the instruction uses -- an entity, an operation, a symptom, a parameter name -- search for it:
+
+  search_text(pattern="discount_code", mode="files")
+  search_text(pattern="order_total", mode="files")
+
+The target is the file that mentions several of these terms. Intersect the results in your own reasoning; do not read a file because it sounds plausible. Read it because a search put it in front of you.
+
+When a search returns more than 60 files, the pattern is too common. Add a second term, or narrow with include="*.py" or path="src/".
+
+Once you have two or three candidate files, use outline() before reading: it tells you which lines hold which function, so a read costs 40 lines instead of 400. Then read only the function the instruction is about.
+
+WHAT TO RECORD
+
+Call set_targets with the files you believe are the target. Each row needs:
+  path       -- the file's path, relative to the working directory
+  symbol     -- the class.method or function the change will land in, if you can tell
+  lines      -- the line range of that symbol
+  why        -- one sentence: what this code does that the task names
+  confidence -- high / medium / low
+
+Keep it short. Three high-confidence rows beat ten guesses. The planner reads this list, not your conversation.
+
+Call done_locating as soon as you have a hypothesis worth handing over. You are not required to spend the whole budget; a wrong list handed early is recoverable, a right list handed too late is not."""
 
 
-def fulfil_requests(repo: Repository, probe: DatabaseProbe, requests: Sequence[dict],
-                    graph: "CallGraph | None" = None, checker: "Checker | None" = None,
-                    served: "set[str] | None" = None) -> str:
-    """Answer the model's context requests deterministically and cheaply.
+LOCATOR_TOOLS = locator_tools() + [
+    {
+        "type": "function",
+        "function": {
+            "name": "set_targets",
+            "description": ("Record the target files, replacing any earlier "
+                            "list. Call this as soon as you have a hypothesis "
+                            "worth handing to the planner, and again whenever "
+                            "it improves. This list IS your output."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "targets": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "lines": {"type": "string"},
+                                "symbol": {"type": "string"},
+                                "why": {"type": "string"},
+                                "confidence": {"type": "string",
+                                               "enum": ["high", "medium", "low"]},
+                            },
+                            "required": ["path", "why"],
+                        },
+                    },
+                    "note": {"type": "string"},
+                },
+                "required": ["targets"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "done_locating",
+            "description": "Stop locating and hand the target list to the planner.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
 
-    `served` remembers what earlier rounds already returned. Asking for the
-    same thing twice yields "already shown" instead of a second copy: the
-    round is still spent, so a model that loops runs out of rounds rather than
-    running up the bill.
-    """
-    trace("fulfil_requests", "in", asked=len(requests),
-          kinds=[(r.get("kind") or "?") for r in requests[:6]])
-    blocks: list[str] = []
-    for request in requests[:6]:
-        kind = (request.get("kind") or "").lower()
-        key = _request_key(kind, request)
-        if served is not None:
-            if key in served:
-                blocks.append(f"{kind}: already shown in an earlier round -- it has not changed; "
-                              "request something new or reply with the edit")
-                continue
-            served.add(key)
-        try:
-            if kind == "callers":
-                # The call graph, on request: who defines and who references a
-                # symbol. Used this way it expands what the model can see without
-                # perturbing the ranking -- the integration that measured well.
-                symbol = (request.get("symbol") or "").strip()
-                if not symbol or graph is None:
-                    blocks.append(f"callers: {'no symbol given' if not symbol else 'unavailable'}")
-                    continue
-                defined = graph.defined_in.get(symbol, [])
-                where = [f"{f}:{line}" for f, line in graph.defined_at.get(symbol, [])[:6]]
-                referenced = sorted(f for f, names in graph.mentions.items()
-                                    if symbol in names and f not in defined)
-                blocks.append(f"callers {symbol}:\n  defined at: {where or 'nowhere found'}"
-                              f"\n  referenced by {len(referenced)} file(s): {referenced[:20]}")
-                continue
-            if kind == "count":
-                # Query count at two sizes, BEFORE editing -- the baseline number
-                # the model should be trying to move.
-                if checker is None:
-                    blocks.append("count: unavailable"); continue
-                measured = checker.measure_query_scaling(request)
-                blocks.append("count: " + (measured.detail if measured else
-                              "needs a Django project and a `call` using N"))
-                continue
-            if kind == "schema":
-                tables = request.get("tables") or request.get("table") or []
-                if isinstance(tables, str):
-                    tables = [tables]
-                detail = probe.schema_for(tables, limit=8) if probe and tables else ""
-                blocks.append("schema " + ", ".join(map(str, tables)) + ":\n"
-                              + (detail or "[no database, or no such tables]"))
-                continue
-            if kind == "read_file":
-                relative = normalize_repo_path(request.get("path") or "") or ""
-                text = repo.read(relative) if relative else None
-                if text is None:
-                    blocks.append(f"read_file {relative}: not found")
-                    continue
-                lines = text.splitlines()
-                symbol = (request.get("symbol") or "").strip()
-                if symbol:
-                    # The definition, whole, without the model guessing line numbers.
-                    defs = python_definitions(text) if relative.endswith(".py") else generic_blocks(text)
-                    hit = next(((st, en) for name, st, en, kind_ in defs
-                                if kind_ != "class" and name.split(".")[-1] == symbol), None) \
-                        or next(((st, en) for name, st, en, kind_ in defs
-                                 if re.search(rf"\b{re.escape(symbol)}\b", name)), None)
-                    if hit is None:
-                        blocks.append(f"read_file {relative}: no definition named {symbol!r}; "
-                                      f"definitions here: {[d[0] for d in defs][:30]}")
-                        continue
-                    request = dict(request, start=max(1, hit[0] - 3), end=min(len(lines), hit[1] + 3))
-                start = max(1, int(request.get("start") or 1))
-                end = min(len(lines), int(request.get("end") or min(len(lines), start + 200)))
-                body = "\n".join(f"{number:5d}| {lines[number - 1]}" for number in range(start, end + 1))
-                blocks.append(f"read_file {relative} lines {start}-{end}:\n{truncate(body, 12000)}")
-            elif kind == "grep":
-                pattern = request.get("pattern") or ""
-                path_filter = request.get("path_filter") or ""
-                compiled = re.compile(pattern)
-                hits: list[str] = []
-                for relative in repo.files:
-                    if path_filter and path_filter not in relative:
-                        continue
-                    text = repo.read(relative)
-                    if text is None or not compiled.search(text):
-                        continue
-                    for number, line in enumerate(text.splitlines(), start=1):
-                        if compiled.search(line):
-                            hits.append(f"{relative}:{number}: {line.strip()[:200]}")
-                            if len(hits) >= 60:
-                                break
-                    if len(hits) >= 60:
-                        break
-                blocks.append(f"grep {pattern!r}:\n" + ("\n".join(hits) or "no matches"))
-            elif kind in ("sql", "explain"):
-                query = (request.get("query") or "").strip().rstrip(";")
-                if not is_read_only_sql(query):
-                    blocks.append(f"{kind}: refused -- investigation queries must be read-only "
-                                  "(SELECT / WITH ... SELECT / EXPLAIN / SHOW / DESCRIBE)")
-                    continue
-                if kind == "explain":
-                    output = probe.explain(query)
-                    work = probe.clickhouse_work(query)
-                    if work:
-                        output += "\n\ndata actually read (system.query_log):\n" + work
+
+def normalise_targets(raw, root: str) -> list:
+    out = []
+    seen = set()
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip().lstrip("./")
+        if not path or path in seen:
+            continue
+        if not os.path.isfile(os.path.join(root, path)):
+            continue
+        seen.add(path)
+        out.append({
+            "path": path,
+            "symbol": str(item.get("symbol") or "")[:120],
+            "lines": str(item.get("lines") or "")[:40],
+            "why": str(item.get("why") or "")[:300],
+            "confidence": str(item.get("confidence") or "medium")[:10],
+        })
+    return out[:8]
+
+
+def locator_opening(statement: str, tree: "Tree", seed_paths: list,
+                    missing: list = None) -> str:
+    blocks = [
+        "Task instruction:\n\n" + statement.strip(),
+        "\nThe code at a glance:\n" + repo_sketch(tree.files()),
+    ]
+    if missing:
+        blocks.append(
+            "\nThe instruction names %s, but nothing is at that path. Find "
+            "where that file lives now; a search for its base name is the "
+            "quickest start." % ", ".join("`%s`" % m for m in missing))
+    if seed_paths:
+        blocks.append(
+            "\nFiles whose contents overlap the rare terms in the instruction, "
+            "most overlap first. This is a text-matching starting point, not "
+            "an answer:\n" + "\n".join("  " + p for p in seed_paths))
+    blocks.append(
+        "\nFind the file(s) the change belongs in. Use search_text to look "
+        "for the instruction's own terms, then outline and read narrowly. "
+        "When you have a hypothesis worth handing to the planner, call "
+        "set_targets, then done_locating.")
+    return "\n".join(blocks)
+
+
+def run_locator(statement: str, tree: Tree, pool: ShellPool,
+                allowance: Allowance, beacon: Beacon,
+                missing: list = None) -> dict:
+    """Returns {"targets": [...], "note": "..."}. Never raises."""
+    beacon.reached(0, allowance.spent, allowance.clock_left())
+    spent_at_entry = allowance.spent
+    calls_at_entry = allowance.calls
+    ceiling = spent_at_entry + allowance.soft_usd * LOCATOR_SPEND_SHARE
+
+    kit = Kit(tree, pool, allowance, label="LOCATE")
+    seat = Seat(allowance, models=[LOCATOR_MODEL], patient=False)
+
+    seed = candidate_paths(tree.root, statement, limit=30)
+    beacon.fired("seed: %d path(s)" % len(seed))
+
+    messages = [
+        {"role": "system", "content": LOCATOR_BRIEF},
+        {"role": "user", "content": locator_opening(statement, tree, seed,
+                                                    missing)},
+    ]
+
+    targets: list = []
+    note = ""
+    read = 0
+    step = 0
+    stop = "turns"
+
+    try:
+        while step < LOCATOR_TURN_CAP:
+            step += 1
+            if read >= LOCATOR_READ_BUDGET:
+                stop = "budget"
+                break
+            if allowance.spent >= ceiling or allowance.money_left() <= 0:
+                stop = "spend"
+                break
+            if (allowance.clock_left() < 120 or allowance.elapsed()
+                    > allowance.run_length() * LOCATOR_CLOCK_SHARE):
+                stop = "clock"
+                break
+
+            reply = seat.ask(messages, LOCATOR_TOOLS)
+            calls = reply.get("tool_calls") or []
+            entry = {"role": "assistant",
+                     "content": str(reply.get("content") or "")}
+            if calls:
+                entry["tool_calls"] = recorded_calls(calls)
+            messages.append(entry)
+            if not calls:
+                stop = "silent"
+                break
+
+            finished = False
+            for call in calls:
+                name, args, arg_err = extract_tool_call(call)
+                if arg_err:
+                    result = arg_err
+                elif name == "done_locating":
+                    finished = True
+                    result = "locating ended"
+                elif name == "set_targets":
+                    targets = normalise_targets(args.get("targets") or [],
+                                                tree.root)
+                    note = str(args.get("note") or "")[:LOCATOR_NOTE_CHARS]
+                    result = "recorded %d target(s)" % len(targets)
                 else:
-                    output = truncate(probe.sql(query), 4000)
-                blocks.append(f"{kind} {truncate(query, 400)}:\n{output or '[no output]'}")
-            else:
-                blocks.append(f"unsupported request kind: {kind!r}")
-        except Exception as exc:
-            blocks.append(f"{kind} request failed: {exc}")
-        trace("fulfil_requests", "out", kind=kind, chars=len(blocks[-1]) if blocks else 0)
-    answer = "\n\n".join(blocks) if blocks else "no context returned"
-    # This is appended to the message stack and re-sent on every later call
-    # until _compact_old_context shrinks it, so its size is a running cost.
-    trace("fulfil_requests", "out", blocks=len(blocks), chars=len(answer))
-    return answer
+                    result, _ = dispatch(kit, name, args)
+                served = clip(str(result), READ_OUTPUT_CAP)
+                read += len(served)
+                messages.append({"role": "tool",
+                                 "tool_call_id": call.get("id"),
+                                 "content": served})
+            if finished:
+                stop = "done"
+                break
+            messages.append({"role": "user", "content":
+                "Reading budget: %d used, %d left."
+                % (read, max(0, LOCATOR_READ_BUDGET - read))})
+    except Exception as error:
+        stop = "error"
+        say("[LOCATE] gave up: %s: %s"
+            % (type(error).__name__, str(error)[:200]))
+
+    # Fallback: if the model produced nothing, use the seed.
+    if not targets and seed:
+        targets = [{"path": p, "why": "ranked by term overlap",
+                    "confidence": "low"} for p in seed[:5]]
+        stop += "+seed"
+
+    allowance.sync()
+    beacon.calls = allowance.calls - calls_at_entry
+    beacon.usd = allowance.spent - spent_at_entry
+    beacon.fired("stopped=%s steps=%d read=%dc targets=%d note=%dB"
+                 % (stop, step, read, len(targets), len(note)))
+    if targets:
+        say("[LOCATE] targets: " + ", ".join(t["path"] for t in targets[:6]))
+    if note:
+        say("[LOCATE] note %s" % note.replace("\n", " | ")[:500])
+    beacon.bill()
+    return {"targets": targets, "note": note}
 
 
-def apply_edits(repo: Repository, edits: Sequence[dict]) -> tuple[list[str], list[str]]:
-    """Apply search/replace edits. Returns (changed_files, errors)."""
-    trace("apply_edits", "in", edits=len(edits),
-          paths=[e.get("path") for e in edits],
-          bytes=sum(len(str(e.get("replace", "") or e.get("content", ""))) for e in edits))
-    changed: list[str] = []
-    errors: list[str] = []
-    for edit in edits:
-        raw_path = edit.get("path") or ""
-        if not raw_path:
-            errors.append("an edit is missing its 'path'")
-            continue
-        relative = normalize_repo_path(raw_path)
-        if relative is None:
-            errors.append(f"refusing to edit path outside the repository: {raw_path}")
-            continue
+# =========================================================================
+# Stage 2: the Planner
+# =========================================================================
 
-        if edit.get("new_file"):
-            content = edit.get("content")
-            if not isinstance(content, str):
-                errors.append(f"{relative}: new_file edit has no 'content' string")
-                continue
-            try:
-                repo.write(relative, content)
-            except OSError as exc:
-                errors.append(f"{relative}: could not be created ({exc}). Check the "
-                              "directory part of the path -- a component of it may be a file.")
-                continue
-            changed.append(relative)
-            continue
+PLANNER_BRIEF = """You are planning, not editing. You can read the code in front of you but you cannot change it. A driver will make the edit from your plan.
 
-        text = repo.read(relative)
-        if text is None:
-            errors.append(f"{relative}: file not found")
-            continue
-        search = edit.get("search")
-        replace = edit.get("replace")
-        if not isinstance(search, str) or not isinstance(replace, str):
-            errors.append(f"{relative}: edit needs both 'search' and 'replace' strings")
-            continue
+The locator seat already found the target file(s). They are below. Trust the locator enough to start there; verify enough that you do not plan against the wrong code.
 
-        occurrences = text.count(search)
-        if occurrences == 0:
-            relaxed = _relaxed_find(text, search)
-            if relaxed is None:
-                errors.append(
-                    f"{relative}: the 'search' text was not found. It must reproduce the current "
-                    "file byte for byte, including indentation."
-                )
-                continue
-            start, end = relaxed
-            updated = text[:start] + replace + text[end:]
-        elif occurrences > 1:
-            errors.append(f"{relative}: the 'search' text appears {occurrences} times; make it unique")
-            continue
+YOUR JOB
+
+Read the target file(s) and the code around them. Then answer, concretely:
+
+  1. What the current code does -- one or two sentences, in terms of the columns, the relations, and the operation the instruction names.
+  2. Which function or method the change belongs in, with its line range.
+  3. What the code must do instead -- the specific condition, ordering, join, aggregate, or guard that changes. Not "fix the bug"; the new shape.
+  4. Which constraints from the instruction apply to the fix: the files it permits, the method it bounds, the names the file already imports, the constructs it forbids, the row/semantics it requires on ties, NULLs, empty groups, or boundaries.
+  5. One concrete check the driver can run to prove the change is correct.
+
+Record it with set_plan. The plan MAY BE READ AT ANY MOMENT by the driver, so keep it worth reading from the first call onward. Call done_planning when it is good enough.
+
+A good plan names a file and a line range and says what must become true. It does not restate the instruction and it does not narrate your reading."""
+
+
+PLANNER_TOOLS = planner_tools() + [
+    {
+        "type": "function",
+        "function": {
+            "name": "set_plan",
+            "description": ("Record the current best plan, replacing any "
+                            "earlier one. Call this as soon as you have "
+                            "something worth handing over, and again whenever "
+                            "it improves."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "done_planning",
+            "description": ("Stop planning and hand the note over. Call this "
+                            "as soon as the plan is good enough."),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
+
+
+def planner_opening(statement: str, targets: list) -> str:
+    if not targets:
+        return ("Task instruction:\n\n" + statement.strip()
+                + "\n\nThe locator found no target file. Read the instruction, "
+                  "search for its terms, and plan against whatever the search "
+                  "turns up.")
+    rows = []
+    for t in targets:
+        row = "- %s" % t["path"]
+        if t.get("symbol"):
+            row += " :: %s" % t["symbol"]
+        if t.get("lines"):
+            row += " (lines %s)" % t["lines"]
+        if t.get("confidence"):
+            row += " [%s]" % t["confidence"]
+        row += "\n    %s" % t.get("why", "")
+        rows.append(row)
+    return ("Task instruction:\n\n" + statement.strip()
+            + "\n\nThe locator seat found these target(s):\n\n"
+            + "\n".join(rows)
+            + "\n\nRead the target(s), verify the locator's reading, then "
+              "write the plan with set_plan and call done_planning.")
+
+
+def run_planner(statement: str, tree: Tree, pool: ShellPool,
+                allowance: Allowance, targets: list,
+                beacon: Beacon) -> str:
+    """Returns the plan note. Never raises."""
+    beacon.reached(0, allowance.spent, allowance.clock_left())
+    spent_at_entry = allowance.spent
+    calls_at_entry = allowance.calls
+    ceiling = spent_at_entry + allowance.soft_usd * PLANNER_SPEND_SHARE
+
+    kit = Kit(tree, pool, allowance, label="PLAN")
+    seat = Seat(allowance, models=[PLANNER_MODEL], patient=False)
+
+    messages = [
+        {"role": "system", "content": PLANNER_BRIEF},
+        {"role": "user", "content": planner_opening(statement, targets)},
+    ]
+
+    note = ""
+    read = 0
+    step = 0
+    stop = "turns"
+
+    try:
+        while step < PLANNER_TURN_CAP:
+            step += 1
+            if read >= PLANNER_READ_BUDGET:
+                stop = "budget"
+                break
+            if allowance.spent >= ceiling or allowance.money_left() <= 0:
+                stop = "spend"
+                break
+            if (allowance.clock_left() < 120 or allowance.elapsed()
+                    > allowance.run_length() * PLANNER_CLOCK_SHARE):
+                stop = "clock"
+                break
+
+            reply = seat.ask(messages, PLANNER_TOOLS)
+            calls = reply.get("tool_calls") or []
+            entry = {"role": "assistant",
+                     "content": str(reply.get("content") or "")}
+            if calls:
+                entry["tool_calls"] = recorded_calls(calls)
+            messages.append(entry)
+            if not calls:
+                stop = "silent"
+                break
+
+            finished = False
+            for call in calls:
+                name, args, arg_err = extract_tool_call(call)
+                if arg_err:
+                    result = arg_err
+                elif name == "done_planning":
+                    finished = True
+                    result = "planning ended"
+                elif name == "set_plan":
+                    note = str(args.get("text") or "")[:PLAN_NOTE_CHARS]
+                    result = "plan recorded, %d characters" % len(note)
+                else:
+                    result, _ = dispatch(kit, name, args)
+                served = clip(str(result), READ_OUTPUT_CAP)
+                read += len(served)
+                messages.append({"role": "tool",
+                                 "tool_call_id": call.get("id"),
+                                 "content": served})
+            if finished:
+                stop = "done"
+                break
+            messages.append({"role": "user", "content":
+                "Reading budget: %d used, %d left."
+                % (read, max(0, PLANNER_READ_BUDGET - read))})
+    except Exception as error:
+        stop = "error"
+        say("[PLAN] gave up: %s: %s"
+            % (type(error).__name__, str(error)[:200]))
+
+    allowance.sync()
+    beacon.calls = allowance.calls - calls_at_entry
+    beacon.usd = allowance.spent - spent_at_entry
+    beacon.fired("stopped=%s steps=%d read=%dc note=%dB"
+                 % (stop, step, read, len(note)))
+    if note:
+        say("[PLAN] note %s" % note.replace("\n", " | ")[:PLAN_NOTE_CHARS])
+    beacon.bill()
+    return note.strip()
+
+
+# =========================================================================
+# Stage 3: the Driver
+# =========================================================================
+
+DRIVER_BRIEF = """You are changing how a real application fetches data from its database. You have shell access, file tools, and the ability to run the checks the instruction names. When you are done, the working tree is the answer: your changes are read straight off it, so leave the change in place and call submit.
+
+Work inside the repository as it is. Do not add dependencies and do not rewrite unrelated code. When the task limits the change to one file or one method, everything else in that file stays byte-for-byte as it was, including imports: use only names the file already imports. Fix the cause in the code the application actually runs; a private snippet that never sits on that path changes nothing.
+
+CRITICAL -- spend turns carefully. Every reply costs one exchange with the model, and exchanges are the scarcest thing you have. Put every tool call that does not depend on another one into the SAME reply. Reading four files is four calls in one reply, not four replies. Searching for three patterns is three calls in one reply. Only wait for a result when the next thing you do genuinely depends on it.
+
+Do not sit idle while a slow command runs. Start a long check with background=true, keep reading code, and collect it with bash_poll when you need the answer. Run only the checks the instruction names; a whole-project build or test run is neither asked for nor affordable.
+
+HOW TO WORK
+
+1. Read the target's current code before you change it. Use read_file with a range, and outline first if the file is long.
+
+2. Decide the change: what does one output row stand for, what does each JOIN do to the row count, what the code must do instead. The plan names this; verify it against the code before trusting it.
+
+3. Make the narrowest edit the instruction requires. Change only the body of the function the problem is about. Never change a function's signature, parameter defaults, decorators, docstring, imports, class attributes or module-level lines.
+
+4. Do not introduce numeric constants, index constants such as result[0], or new literals; unpack results into named variables and reuse the values the code already has.
+
+5. Run the checks the instruction names, exactly as written, and read their output.
+
+6. Read your own diff before submitting. Ask whether it changes anything the problem did not ask for.
+
+BEFORE YOU SUBMIT
+
+Run the checks the instruction names. Then read your own diff and confirm it stays inside any scope the instruction sets. Call submit with a one-line summary of what you changed. submit runs the instruction's named checks itself and refuses a failing one with its output, so a clean submit is the proof."""
+
+
+def driver_opening(statement: str, tree: "Tree", located: dict,
+                   plan_note: str, scope: dict = None) -> str:
+    scope = scope or {}
+    blocks = [
+        "Task:\n\n" + statement.strip(),
+        "\nThe code at a glance:\n" + repo_sketch(tree.files()),
+    ]
+    files = scope.get("files") or []
+    if files:
+        blocks.append(
+            "\nThe instruction limits changes to: %s. An edit anywhere else "
+            "is refused, and anything outside these files is reverted at "
+            "hand-in." % ", ".join(files))
+        if scope.get("excerpt"):
+            blocks.append(
+                "\nCurrent code of the named scope, verbatim, so you can copy "
+                "spans from it straight into edit. This is the code as it "
+                "stands now, not a proposed answer:\n\n" + scope["excerpt"])
+    targets = located.get("targets") or []
+    if targets and not files:
+        rows = []
+        for t in targets:
+            row = "  - %s" % t["path"]
+            if t.get("symbol"):
+                row += " :: %s" % t["symbol"]
+            if t.get("lines"):
+                row += " (lines %s)" % t["lines"]
+            rows.append(row)
+        blocks.append(
+            "\nA locating pass read the instruction and searched the code. "
+            "These are the files it believes the change belongs in. Verify "
+            "them with read_file before trusting:\n" + "\n".join(rows))
+    locate_note = located.get("note") or ""
+    if locate_note:
+        blocks.append("\nLocator note:\n" + locate_note)
+    if plan_note:
+        blocks.append(
+            "\nA planning pass read the targets and left this plan. It did "
+            "not run anything and may be wrong -- check it against the file "
+            "before you act on it.\n\n" + plan_note)
+    checks = scope.get("checks") or []
+    if checks:
+        blocks.append(
+            "\nAt submit these commands are run and must exit 0; a failure "
+            "sends the run back with the output:\n"
+            + "\n".join("  " + c for c in checks))
+    blocks.append(
+        "\nWork the plan: read the target's current code, make the narrowest "
+        "edit the instruction requires, run the checks the instruction names, "
+        "and submit.")
+    return "\n".join(blocks)
+
+
+def edit_press(turn: int, pressed: int) -> str:
+    return (
+        "No edit yet. Narrow down and change something now; an imperfect fix "
+        "in the tree beats a perfect one you never wrote. Reading more before "
+        "the first edit cannot help: nothing you have learned so far is in "
+        "the answer until it is in the file. Do not submit while the tree is "
+        "unchanged.")
+
+
+def wrap_up() -> str:
+    return (
+        "You are near the end of the run. Finish the change you are on, "
+        "re-run the checks the instruction names, and call submit.")
+
+
+def drive(statement: str, tree: Tree, pool: ShellPool, allowance: Allowance,
+          located: dict, plan_note: str, warden: Warden,
+          scope: dict = None) -> None:
+    seat = Seat(allowance)
+    kit = Kit(tree, pool, allowance, warden=warden, scope=scope)
+
+    messages = [
+        {"role": "system", "content": DRIVER_BRIEF},
+        {"role": "user", "content": driver_opening(statement, tree,
+                                                   located, plan_note, scope)},
+    ]
+    cap = transcript_cap_chars(seat.current(), allowance.ceiling_usd)
+    say("[LOOP] transcript cap set for %s" % seat.current())
+
+    turn = 1
+    blanks = 0
+    tool_faults = 0
+    refusals = 0
+    pressed = 0
+    wrapped_up = False
+    last_fingerprint = ""
+    identical = 0
+    history: list = []
+
+    while True:
+        # --- exits, unconditional, at the top of every turn ---
+        if allowance.clock_left() <= 0:
+            say("[LOOP] wall clock at turn %d" % turn)
+            return
+        if allowance.money_left() <= 0:
+            say("[LOOP] budget at turn %d" % turn)
+            return
+        if blanks >= BLANK_REPLY_CEILING:
+            say("[LOOP] %d blank replies" % blanks)
+            return
+        if tool_faults >= TOOL_FAULT_CEILING:
+            say("[LOOP] %d tool faults" % tool_faults)
+            return
+        if identical >= IDENTICAL_REPLY_CEILING:
+            say("[LOOP] %d identical replies" % identical)
+            return
+        if refusals >= SUBMIT_REFUSAL_CEILING:
+            say("[LOOP] %d submit refusals" % refusals)
+            return
+
+        # --- the proxy's total is the one that counts ---
+        if turn % COST_SYNC_TURNS == 0:
+            allowance.sync()
+
+        # --- dynamic round ceiling ---
+        transcript_chars = sum(len(str(m.get("content") or "")) for m in messages)
+        budget_rounds = rounds_left(allowance, seat.current(),
+                                    transcript_chars, history)
+        if turn > TURN_CEILING:
+            say("[LOOP] hard turn ceiling at %d" % TURN_CEILING)
+            return
+
+        # --- nudges, once each ---
+        if (allowance.edits == 0 and turn > FIRST_EDIT_DEADLINE_TURN
+                and pressed < EDIT_PRESSES_MAX):
+            pressed += 1
+            say("[LOOP] %d turns without an edit; pressing (#%d)"
+                % (turn - 1, pressed))
+            messages.append({"role": "user",
+                             "content": edit_press(turn, pressed)})
+        if (not wrapped_up and (turn >= WRAPUP_TURN
+                                or budget_rounds <= 2
+                                or allowance.clock_left() < WRAPUP_CLOCK_SEC
+                                or allowance.money_left() < allowance.soft_usd * 0.15)):
+            wrapped_up = True
+            say("[LOOP] wrapping up at turn %d: ~%d round(s) in $%.4f, %.0fs left"
+                % (turn, budget_rounds, allowance.money_left(),
+                   allowance.clock_left()))
+            messages.append({"role": "user", "content": wrap_up()})
+
+        if transcript_chars > cap:
+            shrink_transcript(messages, cap, Beacon("trim"))
+
+        # --- one model turn ---
+        answering = seat.current()
+        reply = seat.ask(messages, TOOL_SCHEMAS)
+        if seat.current() != answering:
+            cap = transcript_cap_chars(seat.current(), allowance.ceiling_usd)
+            say("[LOOP] seat changed to %s" % seat.current())
+
+        calls = reply.get("tool_calls") or []
+        text = str(reply.get("content") or "")
+
+        # A reply that only polls a background job is legitimately the same
+        # as the last one; it neither counts as a repeat nor clears one.
+        poll_only = bool(calls) and all(
+            extract_tool_call(c)[0] == "bash_poll" for c in calls)
+        fingerprint = reply_fingerprint(reply)
+        if poll_only:
+            pass
+        elif fingerprint == last_fingerprint:
+            identical += 1
         else:
-            updated = text.replace(search, replace, 1)
+            identical = 0
+            last_fingerprint = fingerprint
 
-        if updated == text:
-            errors.append(f"{relative}: the edit is a no-op")
-            continue
-        try:
-            repo.write(relative, updated)
-        except OSError as exc:
-            errors.append(f"{relative}: could not be written ({exc})")
-            continue
-        if relative not in changed:
-            changed.append(relative)
-    trace("apply_edits", "out", changed=changed, errors=errors)
-    return changed, errors
+        entry = {"role": "assistant", "content": text}
+        recorded = recorded_calls(calls, turn) if calls else []
+        if calls:
+            entry["tool_calls"] = recorded
+        messages.append(entry)
 
-
-def _relaxed_find(text: str, search: str) -> tuple[int, int] | None:
-    """Locate `search` ignoring trailing whitespace differences per line."""
-    def normalise(value: str) -> list[str]:
-        return [line.rstrip() for line in value.splitlines()]
-
-    haystack = text.splitlines(keepends=True)
-    needle = normalise(search)
-    if not needle:
-        return None
-    flat = [line.rstrip() for line in haystack]
-    for index in range(len(flat) - len(needle) + 1):
-        if flat[index : index + len(needle)] == needle:
-            start = sum(len(line) for line in haystack[:index])
-            end = start + sum(len(line) for line in haystack[index : index + len(needle)])
-            # keep any trailing newline outside the replaced span
-            replaced = "".join(haystack[index : index + len(needle)])
-            if replaced.endswith("\n") and not search.endswith("\n"):
-                end -= 1
-            return start, end
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Solve loop
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Candidate:
-    patch: str
-    checks: list[CheckResult]
-    diagnosis: str
-
-    @property
-    def score(self) -> tuple[int, int, int]:
-        # A candidate the tests actually exercised outranks one that merely
-        # passed static gates, whatever the raw counts say.
-        passed = sum(1 for check in self.checks if check.passed)
-        failed = sum(1 for check in self.checks if not check.passed)
-        return (int(self.verified), -failed, passed)
-
-    @property
-    def verified(self) -> bool:
-        """Did anything actually exercise the change against the database?"""
-        return any(c.name.startswith("$ ") and c.passed and c.verified for c in self.checks)
-
-    @property
-    def unmeasured(self) -> list[CheckResult]:
-        """Checks that reported no problem because they could not run.
-
-        This was the gap that lost a solvable task: a query-count probe printed
-        nothing, `query scaling` reported success, `clean` went true, and the
-        agent returned after one attempt with three quarters of its budget and
-        two repair rounds unspent -- on a patch one redundant statement away
-        from correct.
-        """
-        return [check for check in self.checks if check.passed and not check.verified]
-
-    @property
-    def clean(self) -> bool:
-        # all([]) is True, so an empty check list would otherwise read as
-        # success. A patch nothing executed is not a verified patch, and
-        # neither is one whose measurement never reported.
-        return (bool(self.patch.strip())
-                and all(check.passed for check in self.checks)
-                and not self.unmeasured
-                and self.verified)
-
-
-class Solver:
-    def __init__(self, repo: Repository, instruction: Instruction, probe: DatabaseProbe, llm: LLM) -> None:
-        self.repo = repo
-        self.instruction = instruction
-        self.probe = probe
-        self.llm = llm
-        self.checker = Checker(repo, instruction, candidates=[], probe=probe)
-        self.best: Candidate | None = None
-        self._graph_cache: CallGraph | None = None
-        self._served: set[str] = set()          # context requests already answered
-        # Run counters. Nothing in the agent reads these; they are what
-        # routing_lab.telemetry_record() needs when routing is being measured
-        # locally, and they cost nothing to keep.
-        self.attempts = 0
-        self.first_attempt_clean: bool | None = None
-        self.final_clean = False
-        self.failures_seen = 0
-        self.slips_seen = 0
-        self.stalls_seen = 0
-        self.stop_reason = ""
-
-    @property
-    def _graph(self) -> CallGraph:
-        if self._graph_cache is None:
-            self._graph_cache = CallGraph(self.repo)
-        return self._graph_cache
-
-    def tier_for(self, failures: int) -> list[str]:
-        """Escalate only when a *verified* failure justifies the extra spend."""
-        if FORCE_MODEL:
-            trace("Solver.tier_for", "out", tier="forced", models=[FORCE_MODEL])
-            return [FORCE_MODEL]
-        index = min(failures, len(LADDER) - 1)
-        capped = self.llm.spent() > COST_TARGET_USD and index > 1
-        if capped:
-            index = 1
-        trace("Solver.tier_for", "out", failures=failures, tier=index, models=LADDER[index],
-              spent=self.llm.spent(), held_back_by_cost=capped)
-        return LADDER[index]
-
-    def solve(self, candidates: Sequence[tuple[str, list[int]]]) -> str:
-        self.checker.candidates = [path for path, _ in candidates]
-        evidence = render_evidence(self.repo, self.instruction, candidates, self.probe)
-        log(f"evidence bundle: {len(evidence)} characters")
-
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content":
-             f"{evidence}\n\n{PromptBuilder.SEPARATOR}\n\n# Response format\n\n{EDIT_PROTOCOL}"},
-        ]
-        # Investigation budget scales with how much the instruction gives us. A
-        # named file needs at most one look around; an unnamed one may need to
-        # trace symptom -> query across several files. Each verified failure
-        # buys one more round, because the failure output is exactly when the
-        # model needs to look at something it had not considered.
-        named_target = bool(self.instruction.edit_only or self.instruction.lint_paths)
-        context_budget = 1 if named_target else 3
-        context_rounds = 0
-        failures = 0
-        rounds = 0
-        stalls = 0
-        # Enough iterations for the largest legitimate path: every context
-        # round, every repair, and a protocol slip or two.
-        slips = 0
-        unverified_retries = 0
-        unmeasured_retries = 0
-        stalled = 0                 # byte-identical edits in a row: the same model will not change its mind
-        last_edit_sig = None
-        max_rounds = MAX_REPAIR_ROUNDS + MAX_CONTEXT_ROUNDS + MAX_GATE_SLIPS + 2
-
-        while failures < MAX_REPAIR_ROUNDS and rounds < max_rounds:
-            rounds += 1
-            if remaining_seconds() < 200:
-                log("stopping: wall-clock budget nearly spent")
-                break
-            try:
-                content, model = self.llm.complete(self.tier_for(failures + stalled), self._trim(messages))
-            except BudgetExhausted as exc:
-                log(f"stopping: {exc}")
-                break
-            except InferenceError as exc:
-                # Permanent only if every model we tried was refused outright.
-                permanent = bool(self.llm.blocked) and self.llm.blocked >= self.llm.unsupported
-                if permanent or stalls >= 2 or remaining_seconds() < 420:
-                    log(f"inference failed, giving up: {exc}")
-                    break
-                stalls += 1
-                pause = 30 * stalls
-                log(f"inference failed (looks transient), retrying the roster in {pause}s: "
-                    f"{truncate(str(exc), 200)}")
-                time.sleep(pause)
-                self.llm.unsupported -= self.llm.blocked   # re-probe the transient ones only
-                continue
-
-            trace("Solver.round", "", round=rounds, model=model,
-                  action=(extract_json(content) or {}).get("action", "edit"),
-                  failures=failures, slips=slips, context_rounds=context_rounds,
-                  stack_chars=sum(len(str(m.get("content", ""))) for m in messages),
-                  seconds_left=remaining_seconds())
-            payload = extract_json(content)
-            if payload is None:
-                messages.append({"role": "assistant", "content": truncate(content, 2000)})
-                messages.append({"role": "user", "content":
-                                 "That reply did not contain a parseable JSON object. "
-                                 "Reply with exactly one JSON object in the documented shape."})
-                continue
-
-            action = (payload.get("action") or "").lower()
-
-            if action == "need_context":
-                if context_rounds >= min(context_budget, MAX_CONTEXT_ROUNDS):
-                    messages.append({"role": "assistant", "content": json.dumps(payload)[:2000]})
-                    messages.append({"role": "user", "content":
-                                     "No investigation rounds remain. Reply with the 'edit' "
-                                     "object using what you already have."})
+        if not calls:
+            blanks += 1
+            if not text.strip() and blanks >= BLANK_REPLY_CEILING:
+                if seat.retire(seat.current()):
+                    say("[LOOP] %d blank replies; changed seats" % blanks)
+                    blanks = 0
+                    cap = transcript_cap_chars(seat.current(),
+                                               allowance.ceiling_usd)
+                    turn += 1
                     continue
-                context_rounds += 1
-                requests = payload.get("requests") or []
-                log(f"model requested context ({context_rounds}/{context_budget}): "
-                    f"{[r.get('kind') for r in requests]}")
-                answers = fulfil_requests(self.repo, self.probe, requests,
-                                          graph=self._graph, checker=self.checker,
-                                          served=self._served)
-                remaining = min(context_budget, MAX_CONTEXT_ROUNDS) - context_rounds
-                self._compact_old_context(messages)
-                messages.append({"role": "assistant", "content": json.dumps(payload)})
-                messages.append({"role": "user", "content":
-                                 f"# Requested context\n\n{truncate(answers, 30000)}\n\n"
-                                 + (f"You may request context {remaining} more time(s), "
-                                    "or reply with the 'edit' object."
-                                    if remaining else "Now reply with the 'edit' object.")})
-                continue
+                say("[LOOP] %d blank replies and no seat left" % blanks)
+                return
+            messages.append({"role": "user", "content":
+                "That reply carried no tool call. Take the next concrete "
+                "step, or call submit if the change is complete."})
+            turn += 1
+            continue
 
-            edits = payload.get("edits") or []
-            if not edits:
-                messages.append({"role": "assistant", "content": truncate(content, 1500)})
-                messages.append({"role": "user", "content":
-                                 "No edits were provided. Reply with an 'edit' object containing "
-                                 "at least one search/replace edit."})
-                continue
+        blanks = 0
+        say("[LOOP] turn %d: %d tool call(s)" % (turn, len(calls)))
 
-            diagnosis = str(payload.get("diagnosis") or "")
-            edit_sig = hashlib.sha1(json.dumps(edits, sort_keys=True, default=str).encode()).hexdigest()
-            repeated = edit_sig == last_edit_sig
-            last_edit_sig = edit_sig
-            self._adopt_constraints(payload.get("constraints"))
-            if not self.instruction.commands:
-                supplied = [c for c in (payload.get("verify") or [])
-                            if isinstance(c, str) and 8 < len(c) < 400]
-                if supplied:
-                    log(f"no checks parsed from the instruction; using the {len(supplied)} "
-                        f"the model extracted: {supplied}")
-                    self.instruction.commands = supplied
-            log(f"attempt {failures + 1} via {model}: {truncate(diagnosis, 300)}")
-            self.attempts += 1
-
-            self.repo.revert_all()
-            changed, errors = apply_edits(self.repo, edits)
-
-            if errors and not changed:
-                messages.append({"role": "assistant", "content": json.dumps(payload)[:4000]})
-                messages.append({"role": "user", "content":
-                                 "None of the edits applied:\n" + "\n".join(errors) +
-                                 "\n\nRe-read the source shown above and reply with corrected edits."})
-                continue
-
-            include_tests = remaining_seconds() > 400
-            checks = self.checker.run_all(changed, include_tests=include_tests)
-
-            # Optimisation is graded on database work. If the model supplied a
-            # probe, measure the scaling it claims to have fixed.
-            if include_tests and all(c.passed for c in checks):
-                supplied = payload.get("measure") or {}
-                measured = (self.checker.measure_query_scaling(supplied)
-                            or self.checker.unmeasured_bounded_work(supplied))
-                if measured is not None:
-                    checks.append(measured)
-                    log(f"query scaling: {measured.detail}")
-            patch = build_patch(self.repo, changed)
-            applies, apply_detail = verify_patch_applies(patch, self.repo)
-            checks.append(CheckResult("patch applies cleanly", applies, apply_detail))
-
-            candidate = Candidate(patch=patch, checks=checks, diagnosis=diagnosis)
-            kept = self.best is None or candidate.score >= self.best.score
-            trace("Candidate", "out", attempt=self.attempts, bytes=len(patch),
-                  score=candidate.score, verified=candidate.verified, clean=candidate.clean,
-                  kept_as_best=kept,
-                  previous_best=self.best.score if self.best else None)
-            if kept:   # ties: the later, better-informed attempt
-                self.best = candidate
-            log("checks:\n" + summarise(checks))
-
-            if self.first_attempt_clean is None:
-                self.first_attempt_clean = candidate.clean
-            if candidate.clean:
-                log("all checks passed (including the task's own tests)")
-                self.final_clean = True
-                return patch
-
-            # Two kinds of not-clean, and they deserve different responses.
-            #   L2, a gate slip: scope, syntax, bounded-method, contract, or the
-            #       patch did not apply. No test ran; the model broke a rule of
-            #       the protocol, not its diagnosis. Same model, tell it the rule,
-            #       do not spend a repair round or escalate.
-            #   L3, a verified failure: the tests or the measurement said the
-            #       fix is wrong. That is real evidence -- switch model family
-            #       and grant another investigation round.
-            runtime_failed = [c for c in checks if not c.passed and c.name.startswith("$ ")
-                              or (not c.passed and c.name == "query scaling")]
-            unverified = not candidate.verified and all(c.passed for c in checks)
-            if unverified:
-                log("WARNING: the change passed every static check but nothing ran it "
-                    "against the database -- no usable test command was found")
-            # Nothing failed, but something the task is judged on went
-            # unmeasured. Not a wrong diagnosis and not a rule violation, so it
-            # buys neither a repair round nor an escalation -- it buys the one
-            # thing the old code threw away, which is the rest of the budget.
-            unmeasured = candidate.unmeasured if not runtime_failed and not unverified else []
-
-            self._compact_old_context(messages)
-            feedback = self._failure_message(errors, checks)
-            messages.append({"role": "assistant", "content": json.dumps(payload)[:4000]})
-            self.repo.revert_all()
-
-            if runtime_failed:
-                failures += 1                       # L3
-                self.failures_seen = failures
-                context_budget += 1                 # the failure is worth investigating
-                messages.append({"role": "user", "content": feedback})
-                continue
-
-            if unmeasured:
-                unmeasured_retries += 1
-                if unmeasured_retries > 1:
-                    log("still unmeasured after one request; adopting the patch as best effort")
-                    return patch
-                names = ", ".join(check.name for check in unmeasured)
-                raised = any("probe itself raised" in check.detail for check in unmeasured)
-                feedback += (
-                    f"\n\nEvery check passed, but {names} could not run, so the database work "
-                    "this change performs was never measured -- and that measurement is what "
-                    "the task is about. " + (
-                        "The probe you supplied is the thing that failed; the detail above "
-                        "names the exception. Send the same edit again with `measure` corrected."
-                        if raised else
-                        "Reply with the same diagnosis and a `measure` probe that reports: "
-                        "`setup` creating the objects the call needs, `call` a single line "
-                        "using N as the selection size.") +
-                    " If the count cannot be reduced further, look again for work the new query "
-                    "makes redundant -- a guard or a lookup the set-based form no longer needs.")
-                messages.append({"role": "user", "content": feedback})
-                continue
-
-            if unverified:
-                # Ask once for a way to verify. If none exists, the patch that
-                # passed every static gate is the answer -- a second and third
-                # request cost calls and change nothing.
-                unverified_retries += 1
-                if unverified_retries > 1:
-                    log("no verification available after one request; adopting the "
-                        "statically clean patch as best effort")
-                    return patch
-                feedback += ("\n\nNo test command was available to exercise this change. Supply "
-                             "the checks the instruction names in `verify`, or name the test "
-                             "module for the code you changed, so the patch can be verified. "
-                             "If the task truly names none, reply with the same edit and an empty verify.")
-                messages.append({"role": "user", "content": feedback})
-                continue
-
-            slips += 1                              # L2
-            self.slips_seen = slips
-            if slips > MAX_GATE_SLIPS:
-                log(f"giving up after {slips} protocol slips without a verified attempt")
-                break
-            if repeated:
-                # At temperature 0 the same model given the same feedback
-                # returns the same bytes. Measured: four identical invalid
-                # edits in a row, twice. Say so, and let the next family try.
-                stalled += 1
-                self.stalls_seen = stalled
-                log(f"identical edit repeated; handing the retry to the next model family (stall {stalled})")
-                feedback += ("\n\nYour reply was byte-identical to the previous one, which failed this "
-                             "same check. Do not resend it: change the construct that the check names.")
-            feedback += ("\n\nThis was a rule violation, not a wrong diagnosis: the tests "
-                         "did not run. Keep your analysis; fix only what the failing check "
-                         "names.")
-            messages.append({"role": "user", "content": feedback})
-
-        return self.best.patch if self.best else ""
-
-    def _adopt_constraints(self, supplied) -> None:
-        """Take the model's reading of the edit boundary when ours found none.
-
-        Deterministic parsing wins whenever it produces anything -- it is exact
-        and gives the same answer every run. This runs only when the instruction
-        named no file, no lint path, no method and no path in prose, which is
-        the case where the scope gate would otherwise fall back to the whole
-        candidate list.
-        """
-        ins = self.instruction
-        if not isinstance(supplied, dict):
-            return
-        static_found = bool(ins.edit_only or ins.lint_paths or ins.named_paths or ins.single_method)
-        if static_found:
-            return
-
-        files = supplied.get("editable_files") or []
-        accepted = []
-        for raw in files if isinstance(files, list) else []:
-            relative = normalize_repo_path(str(raw))
-            if relative and (self.repo.root / relative).is_file():
-                accepted.append(relative)
-        if accepted:
-            ins.edit_only = accepted[:4]
-            self.checker.instruction = ins
-            log(f"scope adopted from the model's reading of the instruction: {ins.edit_only}")
-            trace("adopt_constraints", "out", editable=ins.edit_only, source="the model")
-
-        bound = supplied.get("bounded_to_method")
-        if isinstance(bound, str) and bound.strip():
-            name = bound.strip().split(".")[-1].rstrip("()")
-            # Corroborate: the instruction must actually mention this symbol.
-            # Otherwise a hallucinated bound would gate the model's own fix.
-            if re.search(rf"\b{re.escape(name)}\b", ins.text):
-                ins.single_method = True
-                ins.method_hint = name
-                if "." in bound:
-                    ins.class_hint = bound.strip().split(".")[0]
-                log(f"method bound adopted from the model, corroborated by the instruction: {bound}")
+        turn_growth = len(text)
+        for call, kept in zip(calls, recorded):
+            name, args, arg_err = extract_tool_call(call)
+            if arg_err:
+                result = arg_err
             else:
-                log(f"ignored model-supplied method bound {bound!r}: not mentioned in the instruction")
+                try:
+                    result = kit.run(name, args)
+                except Finished as done:
+                    say("[LOOP] submit at turn %d: %s"
+                        % (turn, str(done)[:200]))
+                    raise
+                except ToolFault as fault:
+                    tool_faults += 1
+                    result = "error: %s" % fault
+                except BaseException as error:
+                    tool_faults += 1
+                    traceback.print_exc()
+                    result = "error: %s: %s" % (type(error).__name__, error)
+                else:
+                    # The Warden counts its own refusals and stands down
+                    # after its share; only an empty hand-in counts here.
+                    if name == "submit" and kit.last_refusal == "empty":
+                        refusals += 1
+            body = clip(str(result), READ_OUTPUT_CAP)
+            turn_growth += len(body)
+            messages.append({"role": "tool", "tool_call_id": kept["id"],
+                             "content": body})
 
-    def _failure_message(self, errors: Sequence[str], checks: Sequence[CheckResult]) -> str:
-        parts = ["The change was applied but did not pass verification."]
-        if errors:
-            parts.append("Edit problems:\n" + "\n".join(errors))
-        failures = [check for check in checks if not check.passed]
-        for check in failures:
-            parts.append(f"## {check.name}\n{truncate(check.detail, 6000, head_ratio=0.3)}")
-        hints = error_hints("\n".join(check.detail for check in failures))
-        if hints:
-            parts.append("## What this output means\n" + "\n".join(f"- {h}" for h in hints))
-        parts.append(
-            "Diagnose what this output says about the database work being done, then reply with "
-            "a corrected 'edit' object. The edits replace the ORIGINAL file contents shown "
-            "earlier -- your previous attempt has been reverted. Do not weaken or edit tests, "
-            "and do not special-case fixture values."
-        )
-        return "\n\n".join(parts)
+        usage = reply.get("_usage") or {}
+        history.append({
+            "growth": turn_growth,
+            "reply_tokens": int(usage.get("completion_tokens") or 1200),
+        })
+        turn += 1
 
-    @staticmethod
-    def _compact_old_context(messages: list[dict]) -> None:
-        """Shrink investigation payloads the model has already read.
+# =========================================================================
+# Part 5: agent_main
+# =========================================================================
 
-        A context round can return 30k characters. Left in place, that is
-        re-sent on every later call: one such round cost $0.0775 on a real task
-        because four payloads rode along on the next three calls. The model's
-        own reply already carries what it learned, so keep a stub.
-        """
-        marker = "# Requested context"
-        saved = 0
-        for message in messages[:-1]:            # never touch the newest turn
-            content = message.get("content") or ""
-            if message.get("role") == "user" and content.startswith(marker) and len(content) > 1200:
-                head = content[:600].rstrip()
-                message["content"] = (f"{head}\n\n[... {len(content) - 600:,} characters of "
-                                      "already-consumed context trimmed; request again if needed]")
-                saved += len(content) - len(message["content"])
-        if saved:
-            trace("compact_old_context", "out", chars_reclaimed=saved,
-                  stack_now=sum(len(str(m.get("content", ""))) for m in messages))
-
-    @staticmethod
-    def _trim(messages: list[dict], keep: int = 6) -> list[dict]:
-        """Keep the system prompt and opening brief, then the recent exchange."""
-        if len(messages) <= keep + 2:
-            return messages
-        trimmed = messages[:2] + messages[-keep:]
-        # Prompt tokens are charged per call, so what this drops is not saved
-        # once -- it is saved on every remaining call in the loop.
-        trace("Solver._trim", "out", turns=f"{len(messages)}->{len(trimmed)}",
-              chars=sum(len(str(m.get("content", ""))) for m in trimmed),
-              dropped=sum(len(str(m.get("content", ""))) for m in messages)
-              - sum(len(str(m.get("content", ""))) for m in trimmed))
-        return trimmed
-
-
-# Translations of failure output the models keep misreading. Each is a fact
-# about SQL or the ORM, not about any task; they only add text to the
-# feedback, so a wrong match costs nothing but a sentence.
-ERROR_HINTS: tuple[tuple[str, str], ...] = (
-    (r"F401 .*imported but unused",
-     "F401: your change stopped using a name the file imports. Where the instruction says to "
-     "keep imports unchanged, removing the import is not an option -- the code you write must "
-     "still use that name."),
-    (r"more than one row returned by a subquery used as an expression",
-     "A correlated subquery used as an annotation must return exactly one row. Aggregate the "
-     "whole correlated set: no GROUP BY on a column that varies per matched row (in the ORM, "
-     "`.values()` before `.annotate(Count)` groups by that column). Group on a constant or "
-     "write the COUNT in SQL."),
-    (r"null value in column .* violates not-null constraint|AssertionError: None != 0",
-     "An aggregate subquery yields NULL when nothing matches. Rows with no matches must get 0: "
-     "COALESCE(..., 0) around the count, using only what the file already imports."),
-    (r"invalid-syntax: Duplicate keyword argument|keyword argument repeated",
-     "The same keyword was passed twice in one call. To put two conditions on one field, "
-     "use separate Q objects joined with & or |, e.g. Q(field__isnull=True) & Q(field=OuterRef(...)), "
-     "or compare with OuterRef/F -- never repeat the keyword."),
-    (r"Cannot resolve keyword '(\w+)' into field",
-     "That field name does not exist on the model; check the model's actual field names in the "
-     "evidence before guessing another."),
-    (r"AttributeError: '(\w+)' object has no attribute '(\w+)'",
-     "That object is one of the application's own classes, not a library client. Find its "
-     "definition (the package map above, `callers`, or grep for `class <Name>`) and call a method "
-     "it actually defines, with the statement format it expects."),
-    (r"NotSupportedError|not supported by this database backend",
-     "The expression is not available on this database engine; use the engine's native "
-     "operators or a RawSQL fallback."),
-)
-
-
-def error_hints(text: str) -> list[str]:
-    hints = []
-    for pattern, hint in ERROR_HINTS:
-        if re.search(pattern, text) and hint not in hints:
-            hints.append(hint)
-    return hints
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-class MissingInstruction(RuntimeError):
-    """No problem statement was supplied -- a bad input, not an agent fault."""
-
-
-HARNESS_INSTRUCTION = Path("/installed-agent/instruction.md")
-
-
-def _instruction_text(payload: dict, root: Path,
-                      harness_copy: Path = HARNESS_INSTRUCTION) -> str:
+def _instruction_text(payload: dict, root: str) -> str:
+    """Where the instruction comes from, in order of preference."""
     for key in ("problem_statement", "instruction", "problem", "task", "prompt"):
-        value = payload.get(key)
+        value = (payload or {}).get(key)
         if isinstance(value, str) and value.strip():
             return value
-    # File fallbacks, for local and manual runs. The harness-written copy comes
-    # first: it can only be this task. A file of the same name inside the
-    # application repository might be the project's own documentation.
-    for location in (harness_copy, root / "instruction.md"):
-        if location.is_file():
+    for location in ("/installed-agent/instruction.md",
+                     os.path.join(root, "instruction.md"),
+                     "/app/instruction.md"):
+        if os.path.isfile(location):
             try:
-                return location.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
+                with open(location, "r", encoding="utf-8",
+                          errors="replace") as fh:
+                    return fh.read()
+            except OSError:
                 continue
-    raise MissingInstruction("no problem statement supplied")
+    return ""
+
+
+def harness_lead(wall: float, anchor: str = ANCHOR_FILE) -> float:
+    """Seconds the harness's clock has been running longer than ours. The
+    harness writes the instruction file the moment its timer starts, then
+    commits a git baseline of the whole tree before we run; that file's age
+    is the lead. An absurd age (a stale file, a clock ahead of the file's)
+    counts as none."""
+    try:
+        age = time.time() - os.stat(anchor).st_mtime
+    except OSError:
+        return 0.0
+    return age if 0.0 < age < wall / 2 else 0.0
+
+
+def tail_budget(allowance: Allowance, share: float, cap: float,
+                floor: float = 3.0) -> float:
+    """Part of what is left before the harness deadline, for one tail step."""
+    return max(floor, min(cap, allowance.hard_left() * share))
 
 
 def agent_main(input: dict) -> str:
-    """Return a unified diff that solves the task described in `input`."""
-    repo: Repository | None = None
-    # Most detailed mode wins: the per-line tracer already reports every call
-    # and return, so installing both would print each of them twice.
-    if TRACE_VARS:
-        install_variable_tracer()
-    elif TRACE_ALL:
-        install_call_tracer()
+    """Every path out of this function returns a patch built from the tree.
+
+    Even a crash returns whatever the model managed to write before it. The
+    only way to return "" is if the tree is genuinely unchanged.
+    """
+    allowance = Allowance()
+    lead = harness_lead(allowance.wall)
+    if lead:
+        allowance.shift(lead)
+        say("[RUN] harness clock started ~%.0fs before this one" % lead)
+    root = workdir()
+    statement = _instruction_text(input or {}, root)
+
+    say("[RUN] workdir=%s budget=$%.3f clock=%.0fs (hard %.0fs)"
+        % (root, allowance.ceiling_usd, allowance.clock_left(),
+           allowance.hard_left()))
+
+    if not statement.strip():
+        say("[RUN] no instruction found; nothing to do")
+        return ""
+
+    # Nothing has been edited yet, so a failure here loses no work; it is
+    # still reported rather than raised so the log says what happened.
     try:
-        root = workdir()
-        text = _instruction_text(input or {}, root)
-        log(f"model={FORCE_MODEL or 'ladder'} workdir={root} timeout={os.getenv('AGENT_TIMEOUT', '?')}s "
-            f"budget=${os.getenv('RIDGES_MAX_COST_USD', DEFAULT_MAX_COST_USD)}")
-
-        trace("agent_main", "in", root=str(root), statement=len(text),
-              timeout=os.getenv("AGENT_TIMEOUT", "unset"),
-              budget=os.getenv("RIDGES_MAX_COST_USD", str(DEFAULT_MAX_COST_USD)),
-              seconds_available=remaining_seconds())
-        instruction = parse_instruction(text, root)
-        log(f"kind={instruction.primary_kind} engine={instruction.engine} "
-            f"single_method={instruction.single_method} commands={len(instruction.commands)}")
-
-        repo = Repository(root)
-        targets = locate_targets(repo, instruction)
-        if not targets:
-            log("no candidate files found; falling back to instruction-named paths")
-            targets = [(path, []) for path in instruction.named_paths]
-
-        probe = DatabaseProbe(repo, instruction)
-        if instruction.engine == "unknown" and probe.available():
-            instruction.engine = probe.targets[0].engine
-            log(f"engine resolved from the live database: {instruction.engine}")
-        llm = LLM()
-        if not FORCE_MODEL:
-            llm.discover_models()
-        solver = Solver(repo, instruction, probe, llm)
-        patch = solver.solve(targets)
-
-        if not patch.strip():
-            log("no patch produced")
-            trace("agent_main", "out", patch_bytes=0, calls=llm.calls, usd=llm.spent(),
-                  seconds_left=remaining_seconds(), outcome="no patch")
-            return ""
-
-        log(f"returning patch: {len(patch)} bytes, "
-            f"{len(re.findall(r'^diff --git', patch, re.MULTILINE))} file(s)")
-        log(llm.report())
-        if TRACE:
-            log(llm.ledger())
-        trace("agent_main", "out", patch_bytes=len(patch),
-              files=len(re.findall(r"^diff --git", patch, re.MULTILINE)),
-              calls=llm.calls, usd=llm.spent(), attempts=solver.attempts,
-              seconds_left=remaining_seconds(),
-              outcome="verified" if solver.final_clean else "best effort")
-        return patch
-    except MissingInstruction as exc:
-        # Nothing to solve. Report it in one line rather than a stack trace, and
-        # still return a string: a raised exception is scored as an agent crash.
-        log(f"no work to do: {exc}")
+        tree = Tree(root)
+        pool = ShellPool(root)
+    except BaseException as error:
+        traceback.print_exc()
+        say("[RUN] snapshot failed: %s: %s" % (type(error).__name__, error))
         return ""
-    except Exception:
-        log("agent failed:\n" + traceback.format_exc())
-        return ""
-    finally:
-        # The checker hashes every file it did not authorise us to change, and
-        # only the patch leaves this container. Leave the checkout pristine.
-        if repo is not None:
-            try:
-                repo.revert_all()
-            except Exception:
-                pass
+    say("[RUN] container: %s" % pool.describe())
 
+    # A copy of the tree as it starts, before anything can touch it, so
+    # restore and revert never depend on what fits in memory.
+    try:
+        tree.make_pristine()
+    except BaseException:
+        traceback.print_exc()
 
-if __name__ == "__main__":
-    statement = sys.stdin.read() if not sys.stdin.isatty() else ""
-    print(agent_main({"problem_statement": statement}))
+    # --- Stage 0: what the instruction itself says ---
+    scope = parse_scope(statement, tree)
+
+    # --- Stage 1: locate the target, unless the instruction named it ---
+    located = {"targets": [], "note": ""}
+    if scope["files"]:
+        region = scope.get("region")
+        located["targets"] = [{
+            "path": path,
+            "symbol": scope["symbol"] if index == 0 else "",
+            "lines": "%d-%d" % region if (index == 0 and region) else "",
+            "why": "named by the instruction",
+            "confidence": "high",
+        } for index, path in enumerate(scope["files"])]
+        say("[LOCATOR] skipped: the instruction names %s" % ", ".join(scope["files"]))
+    else:
+        try:
+            located = run_locator(statement, tree, pool, allowance,
+                                  Beacon("locator"), missing=scope["missing"])
+        except BaseException as error:
+            traceback.print_exc()
+            say("[RUN] locator crashed: %s: %s" % (type(error).__name__, error))
+
+    # --- Stage 2: plan against the target, unless the code is already in hand ---
+    plan_note = ""
+    if scope["files"]:
+        say("[PLANNER] skipped: the driver opens with the named code")
+    else:
+        try:
+            plan_note = run_planner(statement, tree, pool, allowance,
+                                    located.get("targets", []),
+                                    Beacon("planner"))
+        except BaseException as error:
+            traceback.print_exc()
+            say("[RUN] planner crashed: %s: %s" % (type(error).__name__, error))
+
+    # --- Stage 3: driver loop ---
+    warden = Warden(tree, pool, allowance, statement, scope)
+
+    try:
+        drive(statement, tree, pool, allowance, located, plan_note, warden, scope)
+    except Finished as done:
+        say("[RUN] submitted: %s" % str(done)[:200])
+    except Spent as stop:
+        say("[RUN] stopped: %s" % stop)
+    except BaseException as error:
+        traceback.print_exc()
+        say("[RUN] crashed: %s: %s" % (type(error).__name__, error))
+
+    # --- clean up the shell pool ---
+    try:
+        pool.close()
+    except BaseException:
+        pass
+
+    # Every step below takes a share of what is left before the harness
+    # gives up on us, so the sum stays inside it whatever the wall clock is.
+    say("[RUN] tail: %.0fs before the harness deadline" % allowance.hard_left())
+
+    # --- nothing outside the named files may travel ---
+    try:
+        tree.revert_outside(scope["files"], tail_budget(allowance, 0.25, 30.0))
+    except BaseException:
+        traceback.print_exc()
+
+    # --- what the run left on disk, so the patch can be held to it ---
+    edited = {}
+    try:
+        edited = tree.fingerprint()
+    except BaseException:
+        traceback.print_exc()
+
+    # --- the patch is ALWAYS built from the tree ---
+    patch = ""
+    try:
+        patch = tree.diff(tail_budget(allowance, 0.5, 60.0))
+    except BaseException:
+        traceback.print_exc()
+
+    # --- a patch that applies must also rebuild the edited tree ---
+    try:
+        differs = tree.round_trip(patch, edited, tail_budget(allowance, 0.3, 20.0))
+        if differs:
+            say("[PATCH] round trip differs for %s; rebuilding as whole-file hunks"
+                % ", ".join(differs[:6]))
+            patch = tree.diff(tail_budget(allowance, 0.5, 60.0), whole=differs)
+            differs = tree.round_trip(patch, edited, tail_budget(allowance, 0.3, 20.0))
+            if differs:
+                tree.dropped.append("round trip differs for %s" % ", ".join(differs[:6]))
+        if differs == []:
+            say("[PATCH] round trip: %d file(s) reproduced" % len(edited))
+    except BaseException:
+        traceback.print_exc()
+
+    # --- restore the tree for the next run ---
+    try:
+        tree.restore(tail_budget(allowance, 0.6, 60.0))
+    except BaseException:
+        pass
+
+    # --- validate the patch before returning ---
+    usable = None
+    try:
+        usable = tree.applies(patch, tail_budget(allowance, 0.5, 30.0))
+    except BaseException:
+        pass
+
+    if usable is False and patch.strip():
+        try:
+            rescued = tree.salvage(patch, tail_budget(allowance, 0.9, 45.0))
+        except BaseException as error:
+            say("[PATCH] salvage failed: %s" % type(error).__name__)
+            rescued = ""
+        if rescued:
+            patch, usable = rescued, True
+
+    try:
+        patch.encode("utf-8")
+    except UnicodeEncodeError:
+        say("[PATCH] carries bytes that are not UTF-8; replacing them")
+        patch = patch.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+    status = {True: "yes", False: "no"}.get(usable, "unknown")
+    if tree.dropped:
+        say("[PATCH] INCOMPLETE: %d part(s) of the change are not in the "
+            "patch: %s" % (len(tree.dropped), "; ".join(tree.dropped)[:400]))
+        if usable:
+            status = "partial"
+    say("[RUN] done in %.0fs, $%.4f over %d calls (%d quoted by the endpoint), "
+        "%d edits, patch %dB, usable=%s"
+        % (allowance.elapsed(), allowance.spent, allowance.calls,
+           allowance.billed, allowance.edits, len(patch), status))
+    return patch
